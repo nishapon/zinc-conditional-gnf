@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zinc-conditional-gnf"
+version = "0.1.0"
+description = "Conditional node-level graph normalizing flow for ZINC molecules"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "PyYAML",
+    "tqdm",
+    "networkx",
+    "rdkit",
+    "torch",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zinc_gnf*"]
