@@ -1,0 +1,73 @@
+experiment:
+  name: zinc_10k_conditional_gnf
+  seed: 42
+  output_dir: outputs
+
+data:
+  zinc_csv: data/zinc250k.csv
+  split_file: data/zinc_medium_10k_splits.pkl
+  embedding_file: data/property_aware_embeddings.pt
+  maximum_nodes: 38
+  training_molecules: 8000
+  validation_molecules: 1000
+  test_molecules: 1000
+
+  atom_vocab:
+    - C
+    - N
+    - O
+    - F
+    - P
+    - S
+    - Cl
+    - Br
+    - I
+
+  charges: [-1, 0, 1]
+  hydrogen_counts: [0, 1, 2, 3, 4]
+  bond_classes: 4
+
+autoencoder:
+  node_feature_dim: 17
+  node_noise_dim: 8
+  embedding_dim: 64
+  hidden_dim: 128
+  message_steps: 4
+  attention_heads: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  gradient_clip: 5.0
+  qed_loss_weight: 2.0
+
+flow:
+  embedding_dim: 64
+  hidden_dim: 128
+  context_dim: 64
+  attention_heads: 4
+  coupling_blocks: 12
+  maximum_log_scale: 0.25
+  learning_rate: 0.0002
+  weight_decay: 0.000001
+  gradient_clip: 5.0
+  epochs: 15
+  auxiliary_ramp_epochs: 10
+  embedding_noise: 0.01
+
+loss_weights:
+  latent_mean: 1.0
+  latent_variance: 1.0
+  feature_covariance: 1.0
+  cross_node: 1.0
+  qed: 10.0
+  bond_count: 5.0
+  degree_profile: 5.0
+  atom_composition: 5.0
+  charge_composition: 5.0
+  hydrogen_composition: 5.0
+
+generation:
+  batch_size: 64
+  temperature: 1.0
+  samples: 10000
+  qed_tolerance: 0.05
+  empirical_residual_reuse: false
