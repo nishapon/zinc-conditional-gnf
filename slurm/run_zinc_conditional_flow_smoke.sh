@@ -2,8 +2,7 @@
 #SBATCH --job-name=ZINC_flow_smoke
 #SBATCH --output=logs/zinc_flow_smoke_output.log
 #SBATCH --error=logs/zinc_flow_smoke_error.log
-#SBATCH --mail-user=nishauniupdates@gmail.com
-#SBATCH --mail-type=ALL
+#SBATCH --mail-type=NONE
 #SBATCH --partition=STUD
 #SBATCH --gres=gpu:1
 

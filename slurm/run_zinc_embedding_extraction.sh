@@ -2,8 +2,7 @@
 #SBATCH --job-name=ZINC_embeddings
 #SBATCH --output=logs/zinc_embeddings_output.log
 #SBATCH --error=logs/zinc_embeddings_error.log
-#SBATCH --mail-user=nishauniupdates@gmail.com
-#SBATCH --mail-type=ALL
+#SBATCH --mail-type=NONE
 #SBATCH --partition=STUD
 #SBATCH --gres=gpu:1
 

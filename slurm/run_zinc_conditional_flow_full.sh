@@ -2,8 +2,7 @@
 #SBATCH --job-name=ZINC_conditional_flow
 #SBATCH --output=logs/zinc_conditional_flow_output.log
 #SBATCH --error=logs/zinc_conditional_flow_error.log
-#SBATCH --mail-user=nishauniupdates@gmail.com
-#SBATCH --mail-type=ALL
+#SBATCH --mail-type=NONE
 #SBATCH --partition=STUD
 #SBATCH --gres=gpu:1
 

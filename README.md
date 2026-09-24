@@ -19,7 +19,7 @@ git switch refactor/modular-zinc-pipeline
 
 conda create -n zinc_gnf python=3.11 -y
 conda activate zinc_gnf
-pip install -e .
+pip install -e ".[dev]"
 pytest -q
 ```
 
@@ -69,7 +69,30 @@ data/processed/zinc250k/zinc_splits.pkl
 data/processed/zinc250k/condition_scaler.json
 ```
 
-### Step 2: Train the molecular autoencoder
+### Step 2: Inspect the condition distribution
+
+```bash
+sbatch slurm/run_zinc_condition_diagnostic.sh
+```
+
+This CPU-only job must be checked before starting model training. It reports the QED and heavy-atom-count frequencies and their joint distribution.
+
+Expected output:
+
+```text
+outputs/metrics/condition_distribution/
+├── condition_distribution.json
+├── qed_frequency.csv
+├── qed_frequency.png
+├── node_count_frequency.csv
+├── node_count_frequency.png
+├── joint_qed_node_count_frequency.csv
+└── joint_qed_node_count_frequency.png
+```
+
+Review these results before submitting the GPU jobs. In particular, check whether low- or high-QED regions contain too few training molecules.
+
+### Step 3: Train the molecular autoencoder
 
 ```bash
 sbatch slurm/run_zinc_autoencoder_full.sh
@@ -81,7 +104,7 @@ Expected checkpoint:
 outputs/checkpoints/autoencoder/best.pt
 ```
 
-### Step 3: Add QED supervision
+### Step 4: Add QED supervision
 
 ```bash
 sbatch slurm/run_zinc_property_aware_autoencoder.sh
@@ -93,7 +116,7 @@ Expected checkpoint:
 outputs/checkpoints/property_aware_autoencoder/best.pt
 ```
 
-### Step 4: Extract node embeddings
+### Step 5: Extract node embeddings
 
 ```bash
 sbatch slurm/run_zinc_embedding_extraction.sh
@@ -107,7 +130,7 @@ outputs/embeddings/zinc250k/
 
 Embedding normalization statistics are computed from training molecules only.
 
-### Step 5: Smoke-test the conditional flow
+### Step 6: Smoke-test the conditional flow
 
 ```bash
 sbatch slurm/run_zinc_conditional_flow_smoke.sh
@@ -115,7 +138,7 @@ sbatch slurm/run_zinc_conditional_flow_smoke.sh
 
 Run this before the full flow job to catch configuration, memory, or numerical errors.
 
-### Step 6: Train the full conditional flow
+### Step 7: Train the full conditional flow
 
 ```bash
 sbatch slurm/run_zinc_conditional_flow_full.sh
@@ -127,7 +150,7 @@ Expected checkpoint:
 outputs/checkpoints/conditional_flow/best.pt
 ```
 
-### Step 7: Generate and evaluate 10,000 molecules
+### Step 8: Generate and evaluate 10,000 molecules
 
 ```bash
 sbatch slurm/run_zinc_generation_10k.sh
