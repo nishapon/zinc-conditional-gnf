@@ -39,6 +39,8 @@ srun "${PYTHON}" -u scripts/train_flow.py \
     --device cuda \
     --epochs 2 \
     --batch-size 32 \
+    --max-train-batches 100 \
+    --max-validation-batches 20 \
     --learning-rate 0.0001 \
     --gradient-clip 5.0
 

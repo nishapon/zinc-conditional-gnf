@@ -120,6 +120,7 @@ def train_flow_epoch(
     *,
     device: torch.device | str,
     gradient_clip: float | None = 5.0,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     """Train the conditional GNF for one epoch."""
     model.train()
@@ -131,7 +132,17 @@ def train_flow_epoch(
     sigma_minimum = float("inf")
     sigma_maximum = float("-inf")
 
-    for raw_batch in loader:
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError(
+            "max_batches must be positive or None."
+        )
+
+    for batch_index, raw_batch in enumerate(loader):
+        if (
+            max_batches is not None
+            and batch_index >= max_batches
+        ):
+            break
         batch = flow_batch_to_device(
             raw_batch,
             resolved_device,
@@ -203,6 +214,7 @@ def evaluate_flow(
     loader: DataLoader,
     *,
     device: torch.device | str,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     """Evaluate conditional likelihood without changing weights."""
     model.eval()
@@ -214,7 +226,17 @@ def evaluate_flow(
     sigma_minimum = float("inf")
     sigma_maximum = float("-inf")
 
-    for raw_batch in loader:
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError(
+            "max_batches must be positive or None."
+        )
+
+    for batch_index, raw_batch in enumerate(loader):
+        if (
+            max_batches is not None
+            and batch_index >= max_batches
+        ):
+            break
         batch = flow_batch_to_device(
             raw_batch,
             resolved_device,

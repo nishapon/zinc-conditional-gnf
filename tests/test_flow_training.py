@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 
+import pytest
 import torch
 
 from zinc_gnf.data.embeddings import (
@@ -376,3 +377,51 @@ def test_flow_training_and_evaluation(
     assert torch.isfinite(
         losses["loss"]
     )
+
+def test_flow_training_respects_max_batches(
+    tmp_path,
+):
+    root, _, _ = _embedding_root(
+        tmp_path
+    )
+
+    loaders = make_flow_dataloaders(
+        root,
+        batch_size=1,
+        seed=42,
+    )
+
+    model = _flow()
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3,
+    )
+
+    training = train_flow_epoch(
+        model,
+        loaders["train"],
+        optimizer,
+        device="cpu",
+        max_batches=2,
+    )
+
+    validation = evaluate_flow(
+        model,
+        loaders["val"],
+        device="cpu",
+        max_batches=1,
+    )
+
+    assert training["molecules"] == 2.0
+    assert validation["molecules"] == 1.0
+
+    with pytest.raises(
+        ValueError,
+        match="max_batches",
+    ):
+        evaluate_flow(
+            model,
+            loaders["val"],
+            device="cpu",
+            max_batches=0,
+        )

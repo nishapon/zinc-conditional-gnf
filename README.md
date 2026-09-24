@@ -148,7 +148,7 @@ Embedding normalization statistics are computed from training molecules only.
 sbatch slurm/run_zinc_conditional_flow_smoke.sh
 ```
 
-Run this before the full flow job to catch configuration, memory, or numerical errors.
+Run this before the full flow job to catch configuration, memory, or numerical errors. The smoke job uses at most 100 training batches and 20 validation batches per epoch; it does not process complete epochs.
 
 ### Step 7: Train the full conditional flow
 

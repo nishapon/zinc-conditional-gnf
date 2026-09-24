@@ -88,6 +88,22 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
     )
+    parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-epoch training-batch limit for smoke tests."
+        ),
+    )
+    parser.add_argument(
+        "--max-validation-batches",
+        type=int,
+        default=None,
+        help=(
+            "Optional validation-batch limit for smoke tests."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -418,6 +434,20 @@ def main() -> None:
         raise ValueError(
             "learning-rate must be positive."
         )
+    if (
+        arguments.max_train_batches is not None
+        and arguments.max_train_batches <= 0
+    ):
+        raise ValueError(
+            "max-train-batches must be positive."
+        )
+    if (
+        arguments.max_validation_batches is not None
+        and arguments.max_validation_batches <= 0
+    ):
+        raise ValueError(
+            "max-validation-batches must be positive."
+        )
 
     output_directory.mkdir(
         parents=True,
@@ -575,6 +605,8 @@ def main() -> None:
     print("Epoch limit:", epochs)
     print("Starting epoch:", start_epoch)
     print("Learning rate:", learning_rate)
+    print("Maximum train batches:", arguments.max_train_batches)
+    print("Maximum validation batches:", arguments.max_validation_batches)
     print("Objective: conditional NLL")
     print("Test split accessed: no")
 
@@ -613,12 +645,18 @@ def main() -> None:
             gradient_clip=(
                 arguments.gradient_clip
             ),
+            max_batches=(
+                arguments.max_train_batches
+            ),
         )
 
         validation_metrics = evaluate_flow(
             model,
             loaders["val"],
             device=device,
+            max_batches=(
+                arguments.max_validation_batches
+            ),
         )
 
         validation_metric = float(
