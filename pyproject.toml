@@ -16,6 +16,7 @@ dependencies = [
     "PyYAML",
     "tqdm",
     "networkx",
+    "matplotlib",
     "rdkit",
     "torch",
 ]
