@@ -6,11 +6,24 @@
 #SBATCH --partition=STUD
 #SBATCH --gres=gpu:1
 
-PYTHON=/home/${USER}/miniconda3/envs/zinc_gnf/bin/python
-WORKDIR=/home/${USER}/zinc-conditional-gnf
+set -euo pipefail
 
-mkdir -p $WORKDIR/logs
-cd $WORKDIR
+PYTHON="${ZINC_GNF_PYTHON:-${HOME}/miniconda3/envs/zinc_gnf/bin/python}"
+WORKDIR="${SLURM_SUBMIT_DIR:-${HOME}/zinc-conditional-gnf}"
+if [[ ! -x "${PYTHON}" ]]; then
+    echo "ERROR: Python executable not found: ${PYTHON}" >&2
+    echo "Set ZINC_GNF_PYTHON to the zinc_gnf environment Python." >&2
+    exit 1
+fi
+
+if [[ ! -f "${WORKDIR}/pyproject.toml" ]]; then
+    echo "ERROR: Repository not found at ${WORKDIR}" >&2
+    echo "Submit this job from the repository root." >&2
+    exit 1
+fi
+
+mkdir -p "${WORKDIR}/logs"
+cd "${WORKDIR}"
 
 export WANDB_MODE=offline
 
@@ -19,7 +32,7 @@ echo "ZINC property-aware autoencoder training"
 echo "Start time: $(date)"
 echo "=============================================="
 
-srun $PYTHON -u scripts/train_property_aware_autoencoder.py \
+srun "${PYTHON}" -u scripts/train_property_aware_autoencoder.py \
     --config configs/zinc250k.yaml \
     --splits data/processed/zinc250k/zinc_splits.pkl \
     --source-checkpoint outputs/checkpoints/autoencoder/best.pt \

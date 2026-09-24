@@ -42,7 +42,19 @@ Before submitting jobs, check the following fields in `slurm/*.sh`:
 #SBATCH --gres=gpu:1
 ```
 
-Also verify the Python environment and repository path used by the scripts.
+Submit every job from the repository root. The SLURM scripts use `SLURM_SUBMIT_DIR` as the project path.
+
+By default, the scripts expect the environment Python at:
+
+```text
+$HOME/miniconda3/envs/zinc_gnf/bin/python
+```
+
+If the environment is elsewhere, set its Python path before submission:
+
+```bash
+export ZINC_GNF_PYTHON=/absolute/path/to/env/bin/python
+```
 
 Create the log directory:
 
