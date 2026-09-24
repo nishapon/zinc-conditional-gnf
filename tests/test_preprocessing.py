@@ -223,3 +223,31 @@ def test_prepare_small_dataset(tmp_path) -> None:
     )
 
     assert scaler_payload["fit_on"] == "train_only"
+
+
+
+def test_zero_counts_use_all_available_molecules(
+    tmp_path,
+) -> None:
+    csv_path = tmp_path / "zinc.csv"
+
+    pd.DataFrame(
+        {"smiles": MOLECULES}
+    ).to_csv(
+        csv_path,
+        index=False,
+    )
+
+    split_path, _, report = prepare_zinc_dataset(
+        csv_path,
+        tmp_path / "all",
+        target_molecules=0,
+        candidate_count=0,
+        seed=7,
+        train_fraction=0.5,
+        validation_fraction=0.25,
+    )
+
+    assert split_path.name == "zinc_splits.pkl"
+    assert report.candidate_rows == len(MOLECULES)
+    assert report.selected_molecules == len(MOLECULES)

@@ -172,7 +172,7 @@ def read_zinc_csv(csv_path: str | Path) -> pd.DataFrame:
 def encode_unique_molecules(
     smiles_values: Iterable[str],
     *,
-    target_molecules: int,
+    target_molecules: int | None = None,
     max_nodes: int = MAX_NODES,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     """Encode and connectivity-deduplicate candidate molecules."""
@@ -199,10 +199,16 @@ def encode_unique_molecules(
         seen.add(canonical_smiles)
         records.append(record)
 
-        if len(records) == target_molecules:
+        if (
+            target_molecules is not None
+            and len(records) == target_molecules
+        ):
             break
 
-    if len(records) < target_molecules:
+    if (
+        target_molecules is not None
+        and len(records) < target_molecules
+    ):
         raise RuntimeError(
             f"Only {len(records)} eligible molecules were found; "
             f"{target_molecules} were requested."
@@ -380,41 +386,62 @@ def prepare_zinc_dataset(
     csv_path: str | Path,
     output_dir: str | Path,
     *,
-    target_molecules: int = 10_000,
-    candidate_count: int = 12_000,
+    target_molecules: int = 0,
+    candidate_count: int = 0,
     seed: int = 20_260_928,
     max_nodes: int = MAX_NODES,
     train_fraction: float = 0.8,
     validation_fraction: float = 0.1,
 ) -> tuple[Path, Path, PreprocessingReport]:
     """Create scaffold splits and a training-only condition scaler."""
-    if target_molecules <= 0:
+    if target_molecules < 0:
         raise ValueError(
-            "target_molecules must be positive."
+            "target_molecules cannot be negative."
         )
 
-    if candidate_count < target_molecules:
+    if candidate_count < 0:
+        raise ValueError(
+            "candidate_count cannot be negative."
+        )
+
+    if (
+        candidate_count > 0
+        and target_molecules > 0
+        and candidate_count < target_molecules
+    ):
         raise ValueError(
             "candidate_count must be at least target_molecules."
         )
 
     frame = read_zinc_csv(csv_path)
 
-    if len(frame) < candidate_count:
+    effective_candidate_count = (
+        candidate_count
+        if candidate_count > 0
+        else len(frame)
+    )
+
+    if len(frame) < effective_candidate_count:
         raise ValueError(
             f"The CSV has {len(frame)} usable rows, fewer than "
-            f"the requested {candidate_count} candidates."
+            f"the requested {effective_candidate_count} candidates."
         )
 
-    # Candidate selection is reproducible and independent of CSV order.
+    # Reproducibly shuffle every candidate before filtering.
     candidates = frame.sample(
-        n=candidate_count,
+        n=effective_candidate_count,
         random_state=seed,
+    )
+
+    effective_target = (
+        target_molecules
+        if target_molecules > 0
+        else None
     )
 
     records, rejections = encode_unique_molecules(
         candidates["smiles"],
-        target_molecules=target_molecules,
+        target_molecules=effective_target,
         max_nodes=max_nodes,
     )
 
@@ -443,7 +470,7 @@ def prepare_zinc_dataset(
 
     split_path = (
         output_dir
-        / "zinc_medium_10k_splits.pkl"
+        / "zinc_splits.pkl"
     )
     scaler_path = (
         output_dir
@@ -493,9 +520,9 @@ def prepare_zinc_dataset(
     )
 
     report = PreprocessingReport(
-        candidate_rows=candidate_count,
+        candidate_rows=effective_candidate_count,
         eligible_molecules=len(records),
-        selected_molecules=target_molecules,
+        selected_molecules=len(records),
         train_molecules=len(splits["train"]),
         validation_molecules=len(splits["val"]),
         test_molecules=len(splits["test"]),

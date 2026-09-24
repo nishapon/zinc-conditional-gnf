@@ -26,12 +26,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-molecules",
         type=int,
-        default=10_000,
+        default=0,
+        help="Eligible molecules to retain; 0 retains all.",
     )
     parser.add_argument(
         "--candidate-count",
         type=int,
-        default=12_000,
+        default=0,
+        help="CSV rows to examine; 0 examines all.",
     )
     parser.add_argument(
         "--seed",

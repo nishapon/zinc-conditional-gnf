@@ -1,0 +1,75 @@
+name: zinc250k_conditional_gnf
+seed: 42
+
+data:
+  csv_path: data/raw/zinc250k.csv
+  processed_dir: data/processed/zinc250k
+  target_molecules: 0
+  candidate_count: 0
+  max_nodes: 38
+  train_fraction: 0.80
+  validation_fraction: 0.10
+  split: murcko_scaffold
+  conditions:
+    - qed
+    - log1p_n_node
+
+autoencoder:
+  batch_size: 32
+  epochs: 30
+  learning_rate: 0.001
+  node_noise_dim: 8
+  embedding_dim: 64
+  hidden_dim: 256
+  message_passing_steps: 6
+  attention_heads: 4
+  bond_class_weight: 5.0
+  patience: 8
+
+property_head:
+  warmup_epochs: 5
+  joint_epochs: 25
+  learning_rate: 0.0002
+  loss_weight: 1.0
+  patience: 8
+
+flow:
+  batch_size: 32
+  epochs: 40
+  learning_rate: 0.0001
+  coupling_blocks: 12
+  hidden_dim: 128
+  context_dim: 64
+  attention_heads: 4
+  max_log_scale: 0.25
+  patience: 10
+
+generation:
+  samples: 10000
+  batch_size: 64
+  temperature: 1.0
+  seeds:
+    - 11
+    - 22
+    - 33
+  target_quantiles:
+    - 0.25
+    - 0.50
+    - 0.75
+  target_tolerance: 0.05
+
+evaluation:
+  decoding_methods:
+    - raw
+    - constrained
+  metrics:
+    - validity
+    - connectivity
+    - uniqueness
+    - novelty
+    - qed_mae
+    - qed_rmse
+    - requested_actual_correlation
+    - target_hit_rate
+    - internal_diversity
+    - scaffold_diversity
