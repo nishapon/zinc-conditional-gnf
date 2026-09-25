@@ -18,6 +18,9 @@ from torch.utils.data import (
 from zinc_gnf.data.embeddings import (
     unpack_molecule_embedding,
 )
+from zinc_gnf.data.sampling import (
+    make_capped_qed_sampler,
+)
 
 
 def _torch_load(
@@ -181,6 +184,33 @@ class EmbeddingShardDataset(Dataset):
 
     def __len__(self) -> int:
         return self.cumulative_molecules[-1]
+
+    def qed_values(self) -> torch.Tensor:
+        values = []
+
+        for shard_index, metadata in enumerate(
+            self.shards
+        ):
+            shard = self._load_shard(
+                shard_index
+            )
+            shard_values = torch.as_tensor(
+                shard["qed"],
+                dtype=torch.float64,
+            ).flatten()
+
+            expected = int(
+                metadata["molecules"]
+            )
+
+            if shard_values.numel() != expected:
+                raise ValueError(
+                    "QED count does not match shard metadata."
+                )
+
+            values.append(shard_values)
+
+        return torch.cat(values, dim=0)
 
     def _load_shard(
         self,
@@ -421,6 +451,10 @@ def make_flow_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = False,
     cache_size: int = 2,
+    qed_balanced_sampling: bool = False,
+    qed_balance_bins: int = 20,
+    qed_balance_power: float = 0.5,
+    qed_balance_max_weight: float = 4.0,
 ) -> dict[str, DataLoader]:
     """Build train/validation flow loaders; never load test data."""
     if batch_size <= 0:
@@ -457,12 +491,29 @@ def make_flow_dataloaders(
         "pin_memory": bool(pin_memory),
     }
 
-    train_loader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        generator=generator,
-        **common,
-    )
+    if qed_balanced_sampling:
+        sampler = make_capped_qed_sampler(
+            train_dataset.qed_values(),
+            bins=qed_balance_bins,
+            power=qed_balance_power,
+            max_weight=qed_balance_max_weight,
+            generator=generator,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=False,
+            sampler=sampler,
+            generator=generator,
+            **common,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            generator=generator,
+            **common,
+        )
     validation_loader = DataLoader(
         validation_dataset,
         shuffle=False,

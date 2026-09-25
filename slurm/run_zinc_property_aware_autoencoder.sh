@@ -41,6 +41,10 @@ srun "${PYTHON}" -u scripts/train_property_aware_autoencoder.py \
     --warmup-epochs 5 \
     --joint-epochs 25 \
     --qed-loss-weight 1.0 \
+    --qed-balanced-sampling \
+    --qed-balance-bins 20 \
+    --qed-balance-power 0.5 \
+    --qed-balance-max-weight 4.0 \
     --gradient-clip 5.0
 
 echo "=============================================="

@@ -40,6 +40,10 @@ srun "${PYTHON}" -u scripts/train_flow.py \
     --epochs 40 \
     --batch-size 32 \
     --learning-rate 0.0001 \
+    --qed-balanced-sampling \
+    --qed-balance-bins 20 \
+    --qed-balance-power 0.5 \
+    --qed-balance-max-weight 4.0 \
     --gradient-clip 5.0
 
 echo "=============================================="

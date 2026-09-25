@@ -104,6 +104,26 @@ def parse_args() -> argparse.Namespace:
             "Optional validation-batch limit for smoke tests."
         ),
     )
+    parser.add_argument(
+        "--qed-balanced-sampling",
+        action="store_true",
+        help="Use capped inverse-frequency QED sampling for training.",
+    )
+    parser.add_argument(
+        "--qed-balance-bins",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--qed-balance-power",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--qed-balance-max-weight",
+        type=float,
+        default=4.0,
+    )
     return parser.parse_args()
 
 
@@ -465,6 +485,18 @@ def main() -> None:
         num_workers=arguments.num_workers,
         pin_memory=(device.type == "cuda"),
         cache_size=arguments.cache_size,
+        qed_balanced_sampling=(
+            arguments.qed_balanced_sampling
+        ),
+        qed_balance_bins=(
+            arguments.qed_balance_bins
+        ),
+        qed_balance_power=(
+            arguments.qed_balance_power
+        ),
+        qed_balance_max_weight=(
+            arguments.qed_balance_max_weight
+        ),
     )
 
     model = build_flow_from_config(
@@ -607,6 +639,16 @@ def main() -> None:
     print("Learning rate:", learning_rate)
     print("Maximum train batches:", arguments.max_train_batches)
     print("Maximum validation batches:", arguments.max_validation_batches)
+    print(
+        "QED-balanced sampling:",
+        arguments.qed_balanced_sampling,
+    )
+    print(
+        "QED balance bins/power/cap:",
+        arguments.qed_balance_bins,
+        arguments.qed_balance_power,
+        arguments.qed_balance_max_weight,
+    )
     print("Objective: conditional NLL")
     print("Test split accessed: no")
 

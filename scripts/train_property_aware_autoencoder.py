@@ -104,6 +104,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
     )
+    parser.add_argument(
+        "--qed-balanced-sampling",
+        action="store_true",
+        help="Use capped inverse-frequency QED sampling for training.",
+    )
+    parser.add_argument(
+        "--qed-balance-bins",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--qed-balance-power",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--qed-balance-max-weight",
+        type=float,
+        default=4.0,
+    )
     return parser.parse_args()
 
 
@@ -412,6 +432,18 @@ def main() -> None:
         num_workers=arguments.num_workers,
         include_test=False,
         pin_memory=(device.type == "cuda"),
+        qed_balanced_sampling=(
+            arguments.qed_balanced_sampling
+        ),
+        qed_balance_bins=(
+            arguments.qed_balance_bins
+        ),
+        qed_balance_power=(
+            arguments.qed_balance_power
+        ),
+        qed_balance_max_weight=(
+            arguments.qed_balance_max_weight
+        ),
     )
 
     autoencoder = build_autoencoder_from_config(
@@ -573,6 +605,16 @@ def main() -> None:
     print("Warm-up epochs:", warmup_epochs)
     print("Joint epochs:", joint_epochs)
     print("QED loss weight:", qed_loss_weight)
+    print(
+        "QED-balanced sampling:",
+        arguments.qed_balanced_sampling,
+    )
+    print(
+        "QED balance bins/power/cap:",
+        arguments.qed_balance_bins,
+        arguments.qed_balance_power,
+        arguments.qed_balance_max_weight,
+    )
     print("Test split accessed: no")
 
     training_started = time.time()

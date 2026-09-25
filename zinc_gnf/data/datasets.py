@@ -12,6 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from zinc_gnf.data.sampling import (
+    make_capped_qed_sampler,
+)
+
 from zinc_gnf.constants import (
     CHARGE_TO_INDEX,
     HYDROGEN_TO_INDEX,
@@ -351,6 +355,10 @@ def make_dataloaders(
     num_workers: int = 0,
     include_test: bool = False,
     pin_memory: bool = True,
+    qed_balanced_sampling: bool = False,
+    qed_balance_bins: int = 20,
+    qed_balance_power: float = 0.5,
+    qed_balance_max_weight: float = 4.0,
 ) -> dict[str, DataLoader]:
     """Create reproducible train/validation/test loaders."""
     if batch_size < 1:
@@ -374,15 +382,44 @@ def make_dataloaders(
         "persistent_workers": num_workers > 0,
     }
 
-    loaders = {
-        "train": DataLoader(
-            ZincDataset(splits["train"]),
+    train_dataset = ZincDataset(
+        splits["train"]
+    )
+    validation_dataset = ZincDataset(
+        splits["val"]
+    )
+
+    if qed_balanced_sampling:
+        sampler = make_capped_qed_sampler(
+            [
+                float(record["qed"])
+                for record in splits["train"]
+            ],
+            bins=qed_balance_bins,
+            power=qed_balance_power,
+            max_weight=qed_balance_max_weight,
+            generator=generator,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=False,
+            sampler=sampler,
+            generator=generator,
+            **common_options,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
             shuffle=True,
             generator=generator,
             **common_options,
-        ),
+        )
+
+    loaders = {
+        "train": train_loader,
         "val": DataLoader(
-            ZincDataset(splits["val"]),
+            validation_dataset,
             shuffle=False,
             **common_options,
         ),
