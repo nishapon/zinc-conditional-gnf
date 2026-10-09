@@ -1,33 +1,110 @@
-# Conditional Graph Normalizing Flow for ZINC
+# Conditional Graph Normalizing Flow for ZINC250K
 
-Conditional molecular graph generation using a property-aware graph
-autoencoder and a node-level graph normalizing flow.
+A conditional molecular graph generator for ZINC250K, benchmarked against
+MoFlow (Zang & Wang, 2020). Extends the Liu et al. 2019 Graph Normalizing
+Flow with Feature-wise Linear Modulation (FiLM) conditioning on
+`(heavy-atom count N, standardized QED)`, a conditional Gaussian prior
+parameterized by a small MLP, and a chemistry-aware categorical decoder
+with valence-aware greedy bond construction.
 
-## Conditions
-
-The model is conditioned on:
-
-- Molecular QED
-- Heavy-atom count
+This repository is the ZINC250K side of a 4-person student research
+project. Teammates handle QM9 in a separate repository.
 
 ## Pipeline
 
-1. Preprocess ZINC molecules.
-2. Train the bond-aware molecular autoencoder.
-3. Fine-tune embeddings with QED supervision.
-4. Extract and normalize node embeddings.
-5. Train the conditional node-level GNF.
-6. Generate molecules from the conditional prior.
-7. Decode using raw and valence-aware constrained decoding.
-8. Evaluate validity, uniqueness, novelty and QED control.
+Six stages, each in its own module and script. Each stage writes
+checkpoints and metrics that the next stage reads.
 
-## Current experiment
+1. **Preprocess** ZINC250K SMILES into `(atom_types, bond_matrix)` graphs,
+   with a scaffold-free random 80/10/10 split and a condition scaler fit
+   on the training split only.
+2. **Train** a bond-aware molecular autoencoder (atom + bond
+   reconstruction, iterative bond refinement with soft remaining
+   valence).
+3. **Extract** per-molecule node embeddings and compute embedding
+   mean/std from the training split only.
+4. **Train** a conditional node-level graph normalizing flow with FiLM
+   conditioning and a conditional Gaussian prior
+   `z ~ N(μ(y), diag(σ(y))² · I)`.
+5. **Generate** molecules by sampling the conditional prior, running the
+   inverse flow, and decoding with valence-aware constrained bond
+   assembly.
+6. **Evaluate** against MoFlow metrics (validity / uniqueness / novelty /
+   N.U.V. / reconstruction) and QED-specific metrics (requested-vs-actual
+   correlation, MAE, target-hit rate).
 
-The current pilot uses a scaffold-disjoint subset of 10,000 molecules:
+## Install
 
-- 8,000 training molecules
-- 1,000 validation molecules
-- 1,000 untouched test molecules
+Clone, create a Python 3.11 environment, install editable:
 
-This repository contains source code and configurations only.
-Datasets, checkpoints and generated outputs are excluded from Git.
+```bash
+git clone https://github.com/nishapon/zinc-conditional-gnf.git
+cd zinc-conditional-gnf
+git switch rewrite/zinc250k-pipeline
+
+conda create -n zinc_gnf python=3.11 -y
+conda activate zinc_gnf
+pip install -e .[dev]
+```
+
+Verify:
+
+```bash
+python -c "import zinc_gnf; print(zinc_gnf.__version__)"
+pytest -q
+```
+
+## Cluster
+
+All compute jobs run via SLURM. Nothing runs on the login node.
+
+- Training jobs land on `--partition=STUD --gres=gpu:1`.
+- CPU-only jobs (preprocessing, QED histogram, final metric aggregation)
+  land on a CPU partition.
+- Every trainer checkpoints frequently and supports `--resume last.pt`
+  so no job needs to approach the 24 h limit.
+- Each SLURM script picks the Python interpreter via
+  `ZINC_GNF_PYTHON`, defaulting to `$HOME/miniconda3/envs/zinc_gnf/bin/python`.
+
+## Repository layout
+
+```text
+configs/zinc250k.yaml        Full experiment configuration (hyperparameters)
+zinc_gnf/
+  constants.py               Atom/bond vocab and valence table
+  chemistry.py               SMILES ↔ graph; valence-aware bond decoder
+  preprocessing.py           Encode CSV → splits + condition scaler
+  dataset.py                 PyTorch Dataset + padded batching
+  encoder.py                 Bond-aware self-attention encoder
+  decoder.py                 Atom + bond heads, iterative bond refinement
+  autoencoder.py             Encoder + decoder wrapper + losses
+  embeddings.py              Embedding extraction and normalization
+  flow.py                    Conditional node GNF + conditional prior
+  flow_dataset.py            Sharded embedding dataset for flow training
+  trainer_autoencoder.py     Autoencoder train/eval loop
+  trainer_flow.py            Flow train/eval loop
+  generator.py               Sample from prior, inverse flow, decode
+  metrics.py                 MoFlow metrics + QED-specific metrics
+  utils/                     Config, seed, checkpointing, logging
+scripts/                     CLI entry points, one per stage
+slurm/                       SLURM wrappers for each stage
+tests/                       Unit tests for chemistry and shapes
+outputs/                     Checkpoints, embeddings, metrics, figures
+```
+
+## Status
+
+In active development. See the branch `rewrite/zinc250k-pipeline` for
+the current implementation and `main` for the stable skeleton.
+
+## References
+
+1. Liu, Kumar, Ba, Kiros, Swersky — Graph Normalizing Flows, NeurIPS
+   2019. <https://arxiv.org/abs/1905.13177>
+2. Zang, Wang — MoFlow: An Invertible Flow Model for Generating
+   Molecular Graphs, KDD 2020. <https://arxiv.org/abs/2006.10137>
+3. Perez, Strub, de Vries, Dumoulin, Courville — FiLM: Visual Reasoning
+   with a General Conditioning Layer, AAAI 2018.
+   <https://arxiv.org/abs/1709.07871>
+4. Dinh, Sohl-Dickstein, Bengio — Density estimation using Real NVP,
+   ICLR 2017. <https://arxiv.org/abs/1605.08803>
