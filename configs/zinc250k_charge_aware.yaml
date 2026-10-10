@@ -34,6 +34,18 @@ data:
   processed_dir: data/processed/zinc250k_charge_aware
   metrics_dir: outputs/metrics/preprocessing_charge_aware
 
+  # PRIMARY-experiment dataset: MoFlow's official held-out indices as the test
+  # set, validation carved only from the remaining pool, scaler refit on the
+  # new train subset. Derived from the records above (no re-encoding) by
+  # scripts/01d_derive_moflow_split.py; the random-split directory is untouched.
+  moflow_fixed_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  moflow_fixed_metrics_dir: outputs/metrics/split_moflow_fixed
+  moflow_fixed_validation_fraction: 0.10
+  # MoFlow's published ZINC250K counts (its README); the derivation refuses to
+  # run if the files on disk do not reproduce them.
+  moflow_reference_train_count: 224568
+  moflow_reference_heldout_count: 24887
+
   # Splitting. `random_80_10_10` is the baseline's seeded shuffle. The
   # alternative `moflow_fixed` is only usable after the MoFlow files have been
   # copied to the login node and verified row-for-row against our CSV (see
