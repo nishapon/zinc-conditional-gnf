@@ -33,6 +33,22 @@ checkpoints and metrics that the next stage reads.
    N.U.V. / reconstruction) and QED-specific metrics (requested-vs-actual
    correlation, MAE, target-hit rate).
 
+## Molecular representations
+
+Two representations coexist; outputs live in separate directories.
+
+| | Baseline (neutral-only) | Charge-aware |
+|---|---|---|
+| Version | `zinc250k_neutral_kekule_v1` | `zinc250k_charge_aware_kekule_v2` |
+| Atom types | 9 elements | 17 = 9 elements + 8 measured charge types |
+| ZINC250K coverage | 168,129 / 249,455 (67.40%) | 249,454 / 249,455 (one phosphine-oxide limitation) |
+| Code | `constants.py`, `chemistry.py`, `preprocessing.py` | `constants_charge_aware.py`, `chemistry_charge_aware.py`, `preprocessing_charge_aware.py` |
+| Data | `data/processed/zinc250k/` | `data/processed/zinc250k_charge_aware/` |
+| Run | `slurm/01_preprocess.sh` | `slurm/01b_preprocess_charge_aware.sh` (see `slurm/README_charge_aware.md`) |
+
+Model code should read vocabulary size and valence from
+`zinc_gnf.representations.get_representation(...)`, not from `constants.py`.
+
 ## Install
 
 Clone, create a Python 3.11 environment, install editable:
