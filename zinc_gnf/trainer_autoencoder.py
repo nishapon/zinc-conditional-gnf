@@ -50,7 +50,7 @@ from zinc_gnf.utils.logging import JobLogger
 from zinc_gnf.utils.runtime import StopFlag, atomic_write_json, current_rss_mb, format_duration
 from zinc_gnf.utils.seed import set_seed
 
-SELECTION_KEYS = ("exact_molecule_constrained", "val_loss")
+SELECTION_KEYS = ("exact_molecule_constrained", "exact_molecule_degree", "val_loss")
 VALIDATION_SUBSET_SEED = 12345       # fixed so runs with different training seeds are comparable
 
 
@@ -116,7 +116,8 @@ def selection_key_value(metrics: dict[str, Any], mode: str) -> tuple[float, floa
     loss = float(metrics["val_mean_loss"])
     if mode == "val_loss":
         return (-loss, -loss)
-    exact = metrics.get("val_exact_molecule_constrained")
+    exact = metrics.get("val_exact_molecule_degree" if mode == "exact_molecule_degree"
+                        else "val_exact_molecule_constrained")
     exact = -1.0 if exact is None or math.isnan(exact) else float(exact)
     return (exact, -loss)
 
@@ -141,6 +142,8 @@ def validation_metrics(
         "val_exact_graph_constrained": decoded["constrained"]["exact_graph_match"],
         "val_validity_constrained": decoded["constrained"]["validity"],
         "val_exact_molecule_raw": decoded["raw"]["exact_molecule_match"],
+        "val_exact_molecule_degree": decoded.get("degree", {}).get("exact_molecule_match"),
+        "val_degree_accuracy": decoded.get("degree_accuracy"),
         "val_validity_raw": decoded["raw"]["validity"],
         "val_equivariant_ceiling": decoded.get("equivariant_exact_ceiling"),
         "val_atom_sequence_exact": decoded["atom_sequence_exact"],
@@ -150,8 +153,12 @@ def validation_metrics(
 
 class AutoencoderTrainer:
     def __init__(self, model_config: AutoencoderConfig, train_config: TrainConfig,
-                 logger: JobLogger | None = None) -> None:
+                 logger: JobLogger | None = None,
+                 datasets: tuple[MolecularGraphDataset, MolecularGraphDataset, dict[str, Any]] | None = None) -> None:
+        """`datasets=(train, val, fingerprint)` lets controlled experiments train on a
+        filtered or in-memory subset instead of reading `train_config.data_dir`."""
         train_config.validate()
+        self._preloaded = datasets
         self.model_config, self.config = model_config, train_config
         self.output_dir = Path(train_config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -160,14 +167,17 @@ class AutoencoderTrainer:
 
     # ------------------------------------------------------------------
     def _load_data(self) -> None:
-        train_records, val_records, fingerprint = load_training_splits(self.config.data_dir)
-        if self.config.max_train_molecules:
-            train_records = train_records[: self.config.max_train_molecules]
-        if self.config.max_val_molecules:
-            val_records = val_records[: self.config.max_val_molecules]
-        self.train_set = MolecularGraphDataset(train_records)
-        self.val_set = MolecularGraphDataset(val_records)
-        del train_records, val_records
+        if self._preloaded is not None:
+            self.train_set, self.val_set, fingerprint = self._preloaded
+        else:
+            train_records, val_records, fingerprint = load_training_splits(self.config.data_dir)
+            if self.config.max_train_molecules:
+                train_records = train_records[: self.config.max_train_molecules]
+            if self.config.max_val_molecules:
+                val_records = val_records[: self.config.max_val_molecules]
+            self.train_set = MolecularGraphDataset(train_records)
+            self.val_set = MolecularGraphDataset(val_records)
+            del train_records, val_records
         fingerprint = dict(fingerprint)
         fingerprint["used"] = {"train": len(self.train_set), "val": len(self.val_set)}
         self.data_fingerprint = fingerprint
@@ -348,7 +358,13 @@ class AutoencoderTrainer:
         problems = []
         if checkpoint.get("vocabulary_fingerprint") != vocabulary_fingerprint():
             problems.append("atom vocabulary differs")
-        if checkpoint.get("model_config") != self.model_config.to_dict():
+        # Compare after filling defaults, so checkpoints written before a new
+        # optional setting existed still resume under the same effective model.
+        try:
+            saved_model = AutoencoderConfig.from_dict(checkpoint.get("model_config", {})).to_dict()
+        except (TypeError, ValueError):
+            saved_model = None
+        if saved_model != self.model_config.to_dict():
             problems.append("autoencoder configuration differs")
         saved_data = checkpoint.get("data_fingerprint", {})
         if saved_data.get("counts_digest") != self.data_fingerprint["counts_digest"] \

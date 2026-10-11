@@ -48,7 +48,10 @@ from zinc_gnf.constants_charge_aware import (
 )
 from zinc_gnf.dataset import MolecularBatch, MolecularGraphDataset, iter_eval_batches
 from zinc_gnf.decoder import BondAwareDecoder
-from zinc_gnf.decoding_charge_aware import valence_aware_bond_decode_typed
+from zinc_gnf.decoding_charge_aware import (
+    degree_constrained_bond_decode,
+    valence_aware_bond_decode_typed,
+)
 from zinc_gnf.encoder import BondAwareEncoder
 from zinc_gnf.symmetry import is_decodable
 
@@ -72,6 +75,10 @@ class AutoencoderConfig:
     bond_class_weight: float = 5.0
     num_bond_refine_steps: int = 1
     symmetry_noise_dim: int = 0                     # 0 = pure one-hot identity (decision 2)
+    bond_head_layers: int | None = None             # None = num_mlp_layers (teammates' value)
+    position_features: bool = False                 # EXPERIMENTAL diagnostic, see encoder.py
+    degree_head: bool = False                       # per-atom heavy-degree head (symmetry tie-breaker)
+    degree_loss_weight: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,11 +106,13 @@ class GraphAutoencoder(nn.Module):
             attn_concat_heads_output_dim=c.attn_concat_heads_output_dim,
             weight_sharing=c.weight_sharing, residual=c.residual,
             symmetry_noise_dim=c.symmetry_noise_dim,
+            position_features=c.position_features,
         )
         self.decoder = BondAwareDecoder(
             num_atom_types=c.num_atom_types, num_bond_types=c.num_bond_types,
             node_embedding_dim=c.node_embedding_dim, latent_dim=c.latent_dim,
             num_mlp_layers=c.num_mlp_layers, num_bond_refine_steps=c.num_bond_refine_steps,
+            bond_head_layers=c.bond_head_layers, degree_head=c.degree_head,
             valence_caps=tuple(ATOM_VALENCE),
         )
 
@@ -125,11 +134,19 @@ class GraphAutoencoder(nn.Module):
         return outputs
 
     def reconstruction_loss(self, batch: MolecularBatch, outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return reconstruction_loss(batch, outputs, bond_class_weight=self.config.bond_class_weight)
+        return reconstruction_loss(batch, outputs, bond_class_weight=self.config.bond_class_weight,
+                                   degree_loss_weight=self.config.degree_loss_weight)
+
+
+def true_degrees(batch: MolecularBatch) -> torch.Tensor:
+    """Heavy-atom degree of every atom (number of bonded neighbours), clipped to the head's range."""
+    from zinc_gnf.decoder import MAX_DEGREE_CLASS
+    degree = ((batch.bond_types > 0) & batch.pair_mask).sum(-1)
+    return degree.clamp(max=MAX_DEGREE_CLASS)
 
 
 def reconstruction_loss(batch: MolecularBatch, outputs: dict[str, torch.Tensor], *,
-                        bond_class_weight: float) -> dict[str, torch.Tensor]:
+                        bond_class_weight: float, degree_loss_weight: float = 1.0) -> dict[str, torch.Tensor]:
     atom_logits, bond_logits = outputs["atom_logits"], outputs["bond_logits"]
     node_mask, pair_mask = batch.node_mask, batch.pair_mask
     n_real = node_mask.sum().clamp(min=1).to(atom_logits.dtype)
@@ -153,12 +170,25 @@ def reconstruction_loss(batch: MolecularBatch, outputs: dict[str, torch.Tensor],
         pair_total = pair_mask.sum().clamp(min=1)
         real_total = real_bond.sum().clamp(min=1)
 
-    total = atom_loss + bond_loss
+    degree_loss = torch.zeros((), device=atom_logits.device, dtype=atom_logits.dtype)
+    degree_accuracy = torch.full((), float("nan"), device=atom_logits.device, dtype=atom_logits.dtype)
+    if "degree_logits" in outputs:
+        target = true_degrees(batch)
+        degree_ce = F.cross_entropy(outputs["degree_logits"].reshape(-1, outputs["degree_logits"].shape[-1]),
+                                    target.reshape(-1), reduction="none").view_as(target)
+        degree_loss = float(degree_loss_weight) * (degree_ce * node_mask).sum()
+        with torch.no_grad():
+            degree_accuracy = ((outputs["degree_logits"].argmax(-1) == target) & node_mask).sum().to(
+                atom_logits.dtype) / n_real
+
+    total = atom_loss + bond_loss + degree_loss
     return {
         "total_loss": total,
         "mean_loss": total / n_real,
         "atom_loss": atom_loss,
         "bond_loss": bond_loss,
+        "degree_loss": degree_loss,
+        "degree_accuracy": degree_accuracy,
         "atom_accuracy": atom_correct.to(total.dtype) / n_real,
         "bond_accuracy": bond_correct_mask.sum().to(total.dtype) / pair_total,
         "real_bond_accuracy": (bond_correct_mask & real_bond).sum().to(total.dtype) / real_total,
@@ -196,6 +226,7 @@ def evaluate_reconstruction(
     batch_size: int = 128,
     compute_ceiling: bool = True,
     decode_molecules: bool = True,
+    eval_seed: int | None = 0,
 ) -> dict[str, Any]:
     """Teacher-forced loss plus free-running reconstruction metrics.
 
@@ -206,23 +237,36 @@ def evaluate_reconstruction(
     model.eval()
     started = time.perf_counter()
     order = list(range(len(dataset))) if indices is None else [int(i) for i in indices]
+    # Models with symmetry-noise channels are stochastic; a seeded generator on
+    # the model's device makes evaluation reproducible.
+    generator = None
+    if eval_seed is not None and model.config.symmetry_noise_dim > 0:
+        generator = torch.Generator(device=device).manual_seed(int(eval_seed))
 
     sums = {"total_loss": 0.0, "atom_loss": 0.0, "bond_loss": 0.0, "n_nodes": 0.0,
             "atom_correct": 0.0, "bond_correct": 0.0, "bond_total": 0.0,
             "real_bond_correct": 0.0, "real_bond_total": 0.0}
+    has_degree = model.config.degree_head
+    decoders = ("raw", "constrained") + (("degree",) if has_degree else ())
     groups = {name: {"valid": 0, "sanitizable": 0, "graph_exact": 0, "molecule_exact": 0}
-              for name in ("raw", "constrained")}
+              for name in decoders}
+    degree_correct = degree_total = degree_fallbacks = 0
+    strata_keys = ("n", "constrained", "raw", "degree")
     constrained_connected = 0
     atom_sequence_exact = 0
     ceiling_flags: list[bool] = []
     exact_given_decodable = [0, 0]
+    strata = {"decodable": {k: 0 for k in strata_keys},
+              "non_decodable": {k: 0 for k in strata_keys}}
     n_molecules = 0
 
     for batch in iter_eval_batches(dataset, batch_size, order):
         batch_indices = order[n_molecules:n_molecules + batch.batch_size]
         batch = batch.to(device)
 
-        outputs = model(batch, teacher_forcing=True)
+        nodes = model.encode(batch, generator=generator)
+        outputs = model.decode(nodes, batch, teacher_forcing=True)
+        outputs["nodes"] = nodes
         losses = model.reconstruction_loss(batch, outputs)
         n = float(losses["n_nodes"])
         sums["total_loss"] += float(losses["total_loss"])
@@ -248,6 +292,8 @@ def evaluate_reconstruction(
             atoms_np = atom_pred.cpu().numpy()
             raw_np = bond_pred.cpu().numpy()
             probs_np = bond_probs.cpu().numpy()
+            if has_degree:
+                degree_np = free["degree_logits"].argmax(-1).cpu().numpy()
             for b, dataset_index in enumerate(batch_indices):
                 n_b = int(batch.n_node[b])
                 true_atoms, true_bonds = dataset.true_graph(dataset_index)
@@ -266,7 +312,20 @@ def evaluate_reconstruction(
                 constrained, info = valence_aware_bond_decode_typed(atoms, probs_np[b, :n_b, :n_b])
                 constrained_connected += int(info["connected"])
 
-                for name, bonds in (("raw", raw_bonds), ("constrained", constrained)):
+                stratum = None
+                if compute_ceiling:
+                    stratum = strata["decodable" if ceiling_flags[-1] else "non_decodable"]
+                    stratum["n"] += 1
+                candidates = [("raw", raw_bonds), ("constrained", constrained)]
+                if has_degree:
+                    predicted_degree = degree_np[b, :n_b]
+                    degree_bonds, degree_info = degree_constrained_bond_decode(
+                        atoms, probs_np[b, :n_b, :n_b], predicted_degree)
+                    degree_fallbacks += int(degree_info.get("fallback", False))
+                    degree_correct += int((predicted_degree == (true_bonds > 0).sum(1).clip(max=6)).sum())
+                    degree_total += n_b
+                    candidates.append(("degree", degree_bonds))
+                for name, bonds in candidates:
                     mol, sanitizable, single = _to_mol(atoms, bonds)
                     g = groups[name]
                     g["sanitizable"] += int(sanitizable)
@@ -275,6 +334,8 @@ def evaluate_reconstruction(
                     g["graph_exact"] += int(graph_exact)
                     molecule_exact = bool(sanitizable and single and _canonical(mol) == reference)
                     g["molecule_exact"] += int(molecule_exact)
+                    if stratum is not None:
+                        stratum[name] += int(molecule_exact)
                     if name == "constrained" and compute_ceiling:
                         exact_given_decodable[1] += int(ceiling_flags[-1])
                         exact_given_decodable[0] += int(ceiling_flags[-1] and molecule_exact)
@@ -299,6 +360,9 @@ def evaluate_reconstruction(
     }
     if decode_molecules:
         result["atom_sequence_exact"] = rate(atom_sequence_exact, n_molecules)
+        if has_degree:
+            result["degree_accuracy"] = rate(degree_correct, degree_total)
+            result["degree_decode_fallback_rate"] = rate(degree_fallbacks, n_molecules)
         result["constrained_connected"] = rate(constrained_connected, n_molecules)
         for name, g in groups.items():
             result[name] = {
@@ -312,6 +376,15 @@ def evaluate_reconstruction(
         if decode_molecules:
             result["constrained_exact_molecule_given_decodable"] = rate(
                 exact_given_decodable[0], exact_given_decodable[1])
+            result["exact_molecule_by_symmetry"] = {
+                name: {"molecules": v["n"],
+                       "constrained_exact": rate(v["constrained"], v["n"]),
+                       "raw_exact": rate(v["raw"], v["n"])}
+                for name, v in strata.items()
+            }
+            if has_degree:
+                for name, v in strata.items():
+                    result["exact_molecule_by_symmetry"][name]["degree_exact"] = rate(v["degree"], v["n"])
     return result
 
 

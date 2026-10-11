@@ -113,4 +113,91 @@ def valence_aware_bond_decode_typed(
     }
 
 
-__all__ = ["valence_aware_bond_decode_typed"]
+
+
+def degree_constrained_bond_decode(
+    atom_types: Sequence[int] | np.ndarray,
+    bond_probabilities: np.ndarray,
+    degrees: Sequence[int] | np.ndarray,
+    valence_caps: Sequence[int] = ATOM_VALENCE,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Assemble bonds so that every atom has its PREDICTED number of heavy neighbours.
+
+    Chooses the bond SET maximising the summed log-odds of "bonded" subject to
+    `degree(atom) == degrees[atom]` (an exact integer program), then gives every chosen
+    pair its most probable order and enforces valence by demotion. When two atoms are
+    symmetry-equivalent the model cannot say which of two identical partners is bonded;
+    the degree constraint still forces the right NUMBER of bonds, and since equivalent
+    partners give the same molecule, any consistent choice is correct.
+
+    Falls back to the greedy valence-aware decoder (`info["fallback"] = True`) if the
+    degrees are infeasible, the solver is unavailable, or the result is not connected.
+    """
+    atoms = np.asarray(atom_types, dtype=np.int64).reshape(-1)
+    probs = np.asarray(bond_probabilities, dtype=np.float64)
+    n = int(atoms.shape[0])
+    wanted = np.asarray(degrees, dtype=np.int64).reshape(-1)
+
+    def fallback(reason: str):
+        bonds, info = valence_aware_bond_decode_typed(atoms, probs, valence_caps)
+        info = dict(info, fallback=True, fallback_reason=reason)
+        return bonds, info
+
+    if wanted.shape[0] != n or n < 2:
+        return fallback("bad_degrees")
+    try:
+        from scipy.optimize import Bounds, LinearConstraint, milp
+    except ImportError:                                       # pragma: no cover
+        return fallback("no_solver")
+
+    symmetric = 0.5 * (probs + probs.transpose(1, 0, 2))
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    bonded = np.clip(np.array([1.0 - symmetric[i, j, 0] for i, j in pairs]), 1e-9, 1 - 1e-9)
+    gain = np.log(bonded) - np.log1p(-bonded)
+    incidence = np.zeros((n, len(pairs)))
+    for k, (i, j) in enumerate(pairs):
+        incidence[i, k] = incidence[j, k] = 1.0
+    if wanted.sum() % 2 != 0 or (wanted < 0).any() or (wanted > n - 1).any():
+        return fallback("infeasible_degrees")
+    result = milp(c=-gain, constraints=LinearConstraint(incidence, wanted, wanted),
+                  integrality=np.ones(len(pairs)), bounds=Bounds(0, 1))
+    if result.x is None:
+        return fallback("infeasible_degrees")
+
+    bond = np.zeros((n, n), dtype=np.int64)
+    for k, (i, j) in enumerate(pairs):
+        if result.x[k] > 0.5:
+            bond[i, j] = bond[j, i] = int(np.argmax(symmetric[i, j, 1:])) + 1
+
+    # Valence: demote the least confident multiple bonds on an over-full atom.
+    caps = np.asarray([valence_caps[int(a)] for a in atoms])
+    for _ in range(4 * n):
+        over = np.where(bond.sum(1) > caps)[0]
+        if len(over) == 0:
+            break
+        i = int(over[0])
+        partners = [j for j in range(n) if bond[i, j] > 1]
+        if not partners:
+            return fallback("valence_unfixable")
+        j = min(partners, key=lambda q: symmetric[i, q, bond[i, q]])
+        bond[i, j] = bond[j, i] = bond[i, j] - 1
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if bond[i, j]:
+                parent[find(i)] = find(j)
+    connected = len({find(i) for i in range(n)}) == 1
+    if not connected:
+        return fallback("not_connected")
+    return bond, {"connected": True, "rescue_edges": 0, "valence_used": int(bond.sum()), "fallback": False}
+
+
+__all__ = ["degree_constrained_bond_decode", "valence_aware_bond_decode_typed"]

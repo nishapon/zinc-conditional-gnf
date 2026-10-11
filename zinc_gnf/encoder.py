@@ -128,15 +128,22 @@ class BondAwareEncoder(nn.Module):
         weight_sharing: bool = True,
         residual: bool = False,
         symmetry_noise_dim: int = 0,
+        position_features: bool = False,
+        max_nodes: int = 38,
     ) -> None:
         super().__init__()
         self.num_atom_types = num_atom_types
         self.num_bond_types = num_bond_types
         self.symmetry_noise_dim = int(symmetry_noise_dim)
+        # EXPERIMENTAL, off by default: one-hot of the atom's position in the
+        # (canonical SMILES) atom order. This is deterministic but NOT
+        # permutation-equivariant, and a flow that generates embeddings cannot
+        # supply consistent positions; use only as a reconstruction diagnostic.
+        self.position_dim = int(max_nodes) if position_features else 0
         self.residual = bool(residual)
         self.num_processing_steps = int(num_processing_steps)
-        self.embed = make_mlp(num_atom_types + self.symmetry_noise_dim, latent_dim,
-                              node_embedding_dim, num_mlp_layers)
+        self.embed = make_mlp(num_atom_types + self.symmetry_noise_dim + self.position_dim,
+                              latent_dim, node_embedding_dim, num_mlp_layers)
 
         def block() -> BondAwareAttentionBlock:
             return BondAwareAttentionBlock(
@@ -165,6 +172,11 @@ class BondAwareEncoder(nn.Module):
             noise = torch.randn(batch, width, self.symmetry_noise_dim, device=features.device,
                                 generator=generator)
             features = torch.cat([features, noise * node_mask.unsqueeze(-1)], dim=-1)
+        if self.position_dim > 0:
+            position = F.one_hot(torch.arange(width, device=features.device).clamp(max=self.position_dim - 1),
+                                 self.position_dim).to(features.dtype)
+            position = position.unsqueeze(0).expand(batch, -1, -1) * node_mask.unsqueeze(-1)
+            features = torch.cat([features, position], dim=-1)
 
         # Attention graph: bonds plus a self-loop on every node (padding
         # included, so no softmax row is empty). Self-loops carry type 0.

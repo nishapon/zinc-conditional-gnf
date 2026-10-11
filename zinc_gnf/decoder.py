@@ -28,6 +28,7 @@ from zinc_gnf.constants_charge_aware import ATOM_VALENCE
 from zinc_gnf.encoder import make_mlp
 
 BOND_ORDER = (0.0, 1.0, 2.0, 3.0)      # class index -> valence consumed
+MAX_DEGREE_CLASS = 6                   # heavy-atom degree is clipped to 0..6 (ZINC250K maximum is 6)
 
 
 class BondAwareDecoder(nn.Module):
@@ -40,6 +41,9 @@ class BondAwareDecoder(nn.Module):
         latent_dim: int,
         num_mlp_layers: int,
         num_bond_refine_steps: int = 1,
+        bond_head_layers: int | None = None,
+        degree_head: bool = False,
+        max_degree: int = MAX_DEGREE_CLASS,
         valence_caps: tuple[int, ...] = tuple(ATOM_VALENCE),
     ) -> None:
         super().__init__()
@@ -49,7 +53,13 @@ class BondAwareDecoder(nn.Module):
             raise ValueError(f"expected {len(BOND_ORDER)} bond classes, got {num_bond_types}")
         self.num_bond_refine_steps = int(num_bond_refine_steps)
         self.atom_head = make_mlp(node_embedding_dim, latent_dim, num_atom_types, num_mlp_layers)
-        self.bond_head = make_mlp(3 * node_embedding_dim, latent_dim, num_bond_types, num_mlp_layers)
+        self.bond_head = make_mlp(3 * node_embedding_dim, latent_dim, num_bond_types,
+                                  bond_head_layers or num_mlp_layers)
+        # Optional per-atom heavy-atom DEGREE head (number of bonded heavy atoms). Degree is a
+        # permutation-equivariant node property, so it can be predicted from deterministic
+        # embeddings; it lets the assembler break ties between symmetric partners.
+        self.degree_head = (make_mlp(node_embedding_dim, latent_dim, max_degree + 1, num_mlp_layers)
+                            if degree_head else None)
         self.update_mlps = nn.ModuleList([
             make_mlp(node_embedding_dim + 1, latent_dim, node_embedding_dim, num_mlp_layers)
             for _ in range(max(0, self.num_bond_refine_steps - 1))
@@ -87,7 +97,10 @@ class BondAwareDecoder(nn.Module):
             current = current + update(torch.cat([current, remaining], dim=-1)) * mask
             bond_logits = self.bond_logits(current)
 
-        return {"atom_logits": atom_logits, "bond_logits": bond_logits, "atoms_used": atoms_used}
+        outputs = {"atom_logits": atom_logits, "bond_logits": bond_logits, "atoms_used": atoms_used}
+        if self.degree_head is not None:
+            outputs["degree_logits"] = self.degree_head(nodes)
+        return outputs
 
 
 __all__ = ["BOND_ORDER", "BondAwareDecoder"]

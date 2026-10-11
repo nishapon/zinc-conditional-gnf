@@ -63,3 +63,41 @@ or the build matching the cluster's driver). It fails fast, with that hint, if
   told apart by the decoder. Exact-match rates should be read against this
   ceiling, and `--symmetry-noise-dim` (default 0) adds noise channels *next to*
   the identity features as an explicit ablation.
+
+## Same-budget reconstruction ablation (baseline vs degree head)
+
+Evidence so far is CPU-only, 30,000 training molecules, 4,000 steps, 1,000
+validation molecules (validation split only; the test split is never loaded).
+Single runs have about +-4 points of run-to-run noise, so judge arms by paired
+differences over seeds.
+
+| Arm | Exact reconstruction (mean over seeds) |
+|---|---|
+| baseline (greedy valence-aware decoding) | 56.5 +- 2.0 % |
+| noise4 (symmetry noise; stochastic, experimental) | 71.3 +- 0.9 % |
+| degree head + degree-constrained assembly | 90.8 +- 0.9 % |
+
+Recommended architecture: deterministic one-hot encoder (unchanged) + per-atom
+heavy-degree head (`degree_head=True`) + `degree_constrained_bond_decode`.
+When training the full autoencoder use `--selection-key exact_molecule_degree`.
+
+Run (the user submits; nothing here is submitted automatically):
+
+```
+cd ~/zinc-conditional-gnf && git pull origin rewrite/zinc250k-pipeline && git log --oneline -1
+sbatch slurm/03_ae_ablation_baseline_gpu.sh     # STUD, gpu:1, 4 CPU, 16G, 1:30:00 (~25 min)
+sbatch slurm/03_ae_ablation_degree_gpu.sh       # same budget, separate output dir
+sbatch slurm/03c_summarize_ablation.sh          # CPU, after both finish
+```
+
+Outputs: `outputs/ablation/ae_<variant>/seed_<n>/{result.json,train.log,last.pt,best.pt}`,
+`outputs/ablation/summary/ablation_summary.{json,txt}`,
+`outputs/logs/zinc_ae_<variant>_<jobid>.log/.err`. A seed with an existing
+`result.json` is skipped, never overwritten. `03_ae_ablation_noise4_gpu.sh` is
+optional and not recommended. `03_analyze_reconstruction.sh` (CPU) analyses a
+checkpoint (`CHECKPOINT`, `OUT` env vars).
+
+Success criteria for the degree arm: headline exact better than baseline in
+3/3 seeds with mean paired gain >= 15 points; degree accuracy >= 99.5%;
+fallback to greedy <= 10%; validity >= 98%; embedding statistics within
+about 15% of baseline with zero noise fraction.
