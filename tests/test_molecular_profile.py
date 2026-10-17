@@ -54,6 +54,34 @@ def test_atom_bond_and_ring_statistics_are_hand_countable():
     assert profile["molecules_with_formal_charge"] == pytest.approx(0.0)
 
 
+def test_aromatic_ring_fraction_separates_connectivity_from_bond_orders():
+    """A ring that exists but is not aromatic is a bond-order failure, not a missing ring."""
+    profile = profile_molecules(["c1ccccc1", "C1CCCCC1"], name="rings")
+    assert profile["rings"]["mean"] == pytest.approx(1.0)          # both have a ring
+    assert profile["molecules_with_ring"] == pytest.approx(1.0)
+    assert profile["aromatic_rings"]["mean"] == pytest.approx(0.5)  # only benzene's is aromatic
+    assert profile["aromatic_ring_fraction"] == pytest.approx(0.5)
+    # benzene's six ring bonds are aromatic, cyclohexane's six are single
+    assert profile["ring_bond_fractions"]["aromatic"] == pytest.approx(0.5)
+    assert profile["ring_bond_fractions"]["single"] == pytest.approx(0.5)
+
+    acyclic = profile_molecules(["CCO", "CCN(CC)CC"], name="acyclic")
+    assert acyclic["rings"]["mean"] == pytest.approx(0.0)
+    assert acyclic["molecules_with_ring"] == pytest.approx(0.0)
+    assert math.isnan(acyclic["aromatic_ring_fraction"])           # no rings to divide by
+    assert acyclic["ring_bond_fractions"] == {}
+
+
+def test_comparison_reports_the_ring_and_aromatic_differences():
+    reference = profile_molecules(["c1ccccc1", "CC(=O)Nc1ccccc1"], name="real_validation")
+    rings_but_not_aromatic = profile_molecules(["C1CCCCC1", "C1CCCCC1C"], name="generated")
+    comparison = compare_profiles([reference, rings_but_not_aromatic])
+    difference = comparison["differences_vs_reference"]["generated"]
+    assert difference["aromatic_rings_mean"] < 0                   # aromaticity lost
+    assert difference["aromatic_ring_fraction"] == pytest.approx(-1.0)
+    assert difference["rings_mean"] == pytest.approx(0.0)          # but the rings are still there
+
+
 def test_qed_statistics_and_the_zero_point_seven_threshold():
     profile = profile_molecules(SIMPLE + DRUG_LIKE, name="four")
     assert profile["qed_molecules"] == 4

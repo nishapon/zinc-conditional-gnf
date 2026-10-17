@@ -15,6 +15,12 @@ Reported per population: molecule counts and structural validity, QED (mean, med
 quartiles, and the fraction at or above 0.7 and 0.5, which is the threshold the later
 QED-conditioned model has to hit), ring counts, aromaticity, atom and formal-charge
 composition, bond-order composition, heavy-atom counts and scaffold diversity.
+
+`aromatic_ring_fraction` (aromatic rings / all rings) and `ring_bond_fractions` separate
+the two ways aromaticity can disappear: the ring never formed (a connectivity failure),
+or the ring formed but its bond orders are not an alternating kekule pattern (a
+bond-order failure). Our representation has no aromatic atom type, so aromaticity is
+perceived by RDKit from the kekule orders and these two failures need telling apart.
 """
 
 from __future__ import annotations
@@ -84,7 +90,9 @@ def profile_molecules(smiles: Iterable[str | None], *, name: str = "population",
     charges: Counter = Counter()
     bonds: Counter = Counter()
     molecules_with_aromatic_ring = 0
+    molecules_with_ring = 0
     molecules_with_charge = 0
+    ring_bonds: Counter = Counter()
     scaffold_smiles: list[str] = []
 
     for item, molecule in parsed:
@@ -99,6 +107,7 @@ def profile_molecules(smiles: Iterable[str | None], *, name: str = "population",
             if all(molecule.GetAtomWithIdx(i).GetIsAromatic() for i in ring))
         aromatic_rings.append(aromatic_ring_count)
         molecules_with_aromatic_ring += int(aromatic_ring_count > 0)
+        molecules_with_ring += int(ring_info.NumRings() > 0)
         heavy = molecule.GetNumHeavyAtoms()
         heavy_atoms.append(int(heavy))
         aromatic_atoms = sum(1 for atom in molecule.GetAtoms() if atom.GetIsAromatic())
@@ -111,7 +120,10 @@ def profile_molecules(smiles: Iterable[str | None], *, name: str = "population",
             charged += int(charge != 0)
         molecules_with_charge += int(charged > 0)
         for bond in molecule.GetBonds():
-            bonds[BOND_NAMES.get(bond.GetBondType(), str(bond.GetBondType()))] += 1
+            bond_name = BOND_NAMES.get(bond.GetBondType(), str(bond.GetBondType()))
+            bonds[bond_name] += 1
+            if bond.IsInRing():
+                ring_bonds[bond_name] += 1
         if scaffolds:
             try:
                 with rdBase.BlockLogs():
@@ -137,6 +149,11 @@ def profile_molecules(smiles: Iterable[str | None], *, name: str = "population",
         "aromatic_rings": _quantiles(aromatic_rings),
         "aromatic_atom_fraction": _quantiles(aromatic_fraction),
         "molecules_with_aromatic_ring": (molecules_with_aromatic_ring / len(parsed)) if parsed else float("nan"),
+        "molecules_with_ring": (molecules_with_ring / len(parsed)) if parsed else float("nan"),
+        # Separates the two ways aromaticity can be lost: no ring at all (connectivity),
+        # or a ring whose bond orders do not form an alternating kekule pattern (orders).
+        "aromatic_ring_fraction": (sum(aromatic_rings) / sum(rings)) if sum(rings) else float("nan"),
+        "ring_bond_fractions": _fractions(ring_bonds, sum(ring_bonds.values())),
         "molecules_with_formal_charge": (molecules_with_charge / len(parsed)) if parsed else float("nan"),
         "heavy_atoms": _quantiles(heavy_atoms),
         "atom_fractions": _fractions(atoms, total_atoms),
@@ -168,6 +185,8 @@ def compare_profiles(profiles: Sequence[dict[str, Any]]) -> dict[str, Any]:
             ("qed_median", lambda p: p["qed"]["median"]),
             ("qed_at_least_0p7", lambda p: p["qed_at_least_0p7"]),
             ("rings_mean", lambda p: p["rings"]["mean"]),
+            ("aromatic_rings_mean", lambda p: p["aromatic_rings"]["mean"]),
+            ("aromatic_ring_fraction", lambda p: p["aromatic_ring_fraction"]),
             ("aromatic_atom_fraction_mean", lambda p: p["aromatic_atom_fraction"]["mean"]),
             ("heavy_atoms_mean", lambda p: p["heavy_atoms"]["mean"]),
             ("bonds_per_atom", lambda p: p["bonds_per_atom"]),
@@ -192,6 +211,8 @@ def format_comparison(comparison: dict[str, Any]) -> str:
         ("QED >= 0.5", [f"{p['qed_at_least_0p5']:.4f}" for p in profiles]),
         ("rings mean", [f"{p['rings']['mean']:.3f}" for p in profiles]),
         ("aromatic rings mean", [f"{p['aromatic_rings']['mean']:.3f}" for p in profiles]),
+        ("aromatic / all rings", [f"{p['aromatic_ring_fraction']:.4f}" for p in profiles]),
+        ("with any ring", [f"{p['molecules_with_ring']:.4f}" for p in profiles]),
         ("aromatic atom frac", [f"{p['aromatic_atom_fraction']['mean']:.4f}" for p in profiles]),
         ("with aromatic ring", [f"{p['molecules_with_aromatic_ring']:.4f}" for p in profiles]),
         ("with formal charge", [f"{p['molecules_with_formal_charge']:.4f}" for p in profiles]),
@@ -201,6 +222,9 @@ def format_comparison(comparison: dict[str, Any]) -> str:
     for key in ("single", "double", "triple", "aromatic"):
         rows.append((f"bond frac {key}",
                      [f"{p['bond_fractions'].get(key, 0.0):.4f}" for p in profiles]))
+    for key in ("single", "double", "aromatic"):
+        rows.append((f"RING bond frac {key}",
+                     [f"{p['ring_bond_fractions'].get(key, 0.0):.4f}" for p in profiles]))
     for element in ("C", "N", "O", "S", "F", "Cl"):
         rows.append((f"atom frac {element}",
                      [f"{p['atom_fractions'].get(element, 0.0):.4f}" for p in profiles]))
