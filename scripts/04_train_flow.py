@@ -11,6 +11,11 @@ The autoencoder is never modified: it is loaded in eval mode with gradients
 disabled, and its file SHA-256 is written into config.json and every
 checkpoint. Resuming against a different encoder is refused.
 
+`--pause-at N` stops cleanly at step N while keeping `--max-steps` as the
+target: `summary.json` records `paused: true` with `completed: false`, so the
+seed still counts as unfinished and resubmitting resumes at step N+1. Use it to
+sample from a mid-run checkpoint before spending the rest of the GPU budget.
+
 Settings come from `configs/zinc250k_flow_uncond.yaml`; command-line flags
 override them for smoke tests.
 
@@ -63,6 +68,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-molecules", type=int, default=None)
     parser.add_argument("--statistics-molecules", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None, help="early stopping, in evaluations")
+    parser.add_argument("--pause-at", type=int, default=None,
+                        help="stop cleanly at this step WITHOUT completing the run, keeping "
+                             "--max-steps as the target; resubmit the same command to resume. "
+                             "A pause point already passed is ignored.")
     parser.add_argument("--max-train-molecules", type=int, default=None, help="smoke tests only")
     parser.add_argument("--ae-seen-only", action="store_true",
                         help="train only on the molecules the autoencoder itself saw")
@@ -89,6 +98,7 @@ def build_configs(arguments: argparse.Namespace) -> tuple[FlowConfig, FlowTrainC
         "val_molecules": arguments.val_molecules,
         "statistics_molecules": arguments.statistics_molecules,
         "early_stopping_patience": arguments.patience,
+        "pause_at_step": arguments.pause_at,
         "max_train_molecules": arguments.max_train_molecules,
     }
     train_values.update({k: v for k, v in overrides_train.items() if v is not None})
@@ -137,7 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # noqa: BLE001
         logger.error("FATAL: unexpected error\n" + traceback.format_exc())
         return 1
-    return 0 if result["completed"] or result["early_stopped"] else 130
+    # A pause is a planned, successful stop, so it must exit 0 and not look like a failure
+    # to the cluster script; the run is still recorded as unfinished in summary.json.
+    if result["completed"] or result["early_stopped"] or result.get("paused"):
+        return 0
+    return 130
 
 
 if __name__ == "__main__":

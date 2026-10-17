@@ -472,3 +472,130 @@ def test_a_sane_threshold_does_not_warn(tmp_path):
     trainer.train(resume="none")
     assert trainer.config.log_det_warn_threshold == 50.0
     assert "exceeds" not in (output / "train.log").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Pausing a run at an intermediate step, then resuming it exactly.
+# ---------------------------------------------------------------------------
+def test_pause_stops_the_run_without_completing_it(tmp_path):
+    data = write_dataset(tmp_path / "data")
+    trainer, result = run_trainer(tmp_path, data, max_steps=8, pause_at_step=4,
+                                  eval_every=4, save_every=4)
+    assert result["paused"] is True and result["paused_at_step"] == 4
+    assert result["final_step"] == 4
+    assert result["completed"] is False          # the seed must NOT look finished
+    assert result["early_stopped"] is False
+    assert result["interrupted_by"] is None
+    assert result["max_steps"] == 8              # the target is unchanged by the pause
+    summary = json.loads((Path(trainer.config.output_dir) / "summary.json").read_text())
+    assert summary["paused"] and not summary["completed"] and not summary["early_stopped"]
+
+
+def test_the_cluster_skip_rule_resumes_a_paused_seed(tmp_path):
+    """The exact expression the SLURM script evaluates must classify a pause as resumable."""
+    data = write_dataset(tmp_path / "data")
+    trainer, _ = run_trainer(tmp_path, data, max_steps=8, pause_at_step=4,
+                             eval_every=4, save_every=4)
+    summary = json.loads((Path(trainer.config.output_dir) / "summary.json").read_text())
+    state = ("done" if summary.get("completed") or summary.get("early_stopped")
+             else ("paused" if summary.get("paused") else "unfinished"))
+    assert state == "paused"                     # i.e. resumed, not skipped
+
+    finished, _ = run_trainer(tmp_path / "finished", data, max_steps=4, eval_every=4, save_every=4)
+    done = json.loads((Path(finished.config.output_dir) / "summary.json").read_text())
+    assert (done.get("completed") or done.get("early_stopped")) and not done.get("paused")
+
+
+def test_paused_checkpoint_carries_optimizer_rng_and_schedule_state(tmp_path):
+    data = write_dataset(tmp_path / "data")
+    trainer, _ = run_trainer(tmp_path, data, max_steps=8, pause_at_step=4,
+                             eval_every=4, save_every=4)
+    checkpoint = torch.load(Path(trainer.config.output_dir) / "last.pt", map_location="cpu",
+                            weights_only=False)
+    assert checkpoint["step"] == 4
+    assert checkpoint["optimizer_state_dict"] is not None
+    assert checkpoint["optimizer_state_dict"]["state"]                 # Adam moments exist
+    assert checkpoint["torch_rng_state"] is not None
+    assert checkpoint["numpy_rng_state"] is not None
+    assert checkpoint["noise_generator_state"] is not None             # smoothing-noise stream
+    assert checkpoint["batcher"]["position"] or checkpoint["batcher"]["epoch"]
+    assert checkpoint["embedding_statistics"]["molecules"] == 20
+    # the learning-rate schedule is a pure function of the step, so restoring the step
+    # restores the schedule exactly; there is no separate scheduler object to lose
+    assert trainer._learning_rate(checkpoint["step"]) == pytest.approx(
+        trainer._learning_rate(4))
+
+
+def test_resume_after_pause_is_bitwise_identical_to_an_uninterrupted_run(tmp_path):
+    data = write_dataset(tmp_path / "data")
+    autoencoder = tiny_autoencoder()
+    straight, straight_result = run_trainer(tmp_path / "straight", data, autoencoder=autoencoder,
+                                            max_steps=8, eval_every=4, save_every=4)
+    paused, paused_result = run_trainer(tmp_path / "paused", data, autoencoder=autoencoder,
+                                        max_steps=8, pause_at_step=4, eval_every=4, save_every=4)
+    assert paused_result["paused"] and not straight_result["paused"]
+    # resume with the pause flag STILL SET: it is behind us and must be ignored
+    resumed = FlowTrainer(FlowConfig(**FLOW),
+                          train_config(tmp_path / "paused", data, max_steps=8, pause_at_step=4,
+                                       eval_every=4, save_every=4),
+                          logger=null_logger(), autoencoder=autoencoder)
+    result = resumed.train(resume="auto")
+    assert result["completed"] and result["final_step"] == 8 and not result["paused"]
+
+    one = torch.load(Path(straight.config.output_dir) / "last.pt", map_location="cpu",
+                     weights_only=False)
+    two = torch.load(Path(resumed.config.output_dir) / "last.pt", map_location="cpu",
+                     weights_only=False)
+    assert one["step"] == two["step"] == 8
+    assert one["batcher"] == two["batcher"]
+    for key, value in one["model_state_dict"].items():
+        assert torch.equal(value, two["model_state_dict"][key]), key
+    for key, state in one["optimizer_state_dict"]["state"].items():
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                assert torch.equal(value, two["optimizer_state_dict"]["state"][key][name]), (key, name)
+    assert one["best_loss"] == pytest.approx(two["best_loss"])
+
+
+def test_a_pause_point_already_passed_is_ignored(tmp_path):
+    data = write_dataset(tmp_path / "data")
+    autoencoder = tiny_autoencoder()
+    run_trainer(tmp_path, data, autoencoder=autoencoder, max_steps=6, eval_every=3, save_every=3)
+    # the run already reached step 6; asking to pause at 4 must not stop it again
+    trainer = FlowTrainer(FlowConfig(**FLOW),
+                          train_config(tmp_path, data, max_steps=10, pause_at_step=4,
+                                       eval_every=3, save_every=3),
+                          logger=null_logger(), autoencoder=autoencoder)
+    result = trainer.train(resume="auto")
+    assert result["final_step"] == 10 and result["completed"] and not result["paused"]
+
+
+def test_the_paused_checkpoint_can_be_generated_from_before_resuming(tmp_path):
+    from zinc_gnf.generation import NodeCountSampler, generate_molecules
+
+    data = write_dataset(tmp_path / "data")
+    autoencoder = tiny_autoencoder()
+    trainer, _ = run_trainer(tmp_path, data, autoencoder=autoencoder, max_steps=8,
+                             pause_at_step=4, eval_every=4, save_every=4)
+    paused_checkpoint = Path(trainer.config.output_dir) / "last.pt"
+    flow, probe = load_flow(paused_checkpoint, device="cpu")
+    assert probe["step"] == 4 and bool(flow.statistics_set)
+    sampled = generate_molecules(flow, autoencoder, count=4,
+                                 node_counts=NodeCountSampler([6, 7]), seed=0, batch_size=4)
+    assert len(sampled["records"]) == 4
+    assert sampled["settings"]["latent_round_trip_relative_error"] < 1e-3
+    # sampling must not disturb the checkpoint the resume will read
+    assert torch.load(paused_checkpoint, map_location="cpu", weights_only=False)["step"] == 4
+
+
+@pytest.mark.parametrize("bad", [
+    {"pause_at_step": 0}, {"pause_at_step": -1}, {"pause_at_step": 11, "max_steps": 10},
+])
+def test_pause_configuration_is_validated(bad):
+    with pytest.raises(ValueError, match="pause_at_step"):
+        FlowTrainConfig(**bad).validate()
+
+
+def test_pause_defaults_to_off():
+    assert FlowTrainConfig().pause_at_step is None
+    FlowTrainConfig(pause_at_step=10_000, max_steps=50_000).validate()

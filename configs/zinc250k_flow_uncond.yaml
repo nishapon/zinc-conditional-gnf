@@ -61,6 +61,10 @@ training:
   save_every: 1000              # resume granularity; the walltime estimate is not a promise
   val_molecules: 5000           # fixed seeded validation subset, fixed noise seed
   statistics_molecules: 20000   # training molecules used for the embedding mean/std
+  pause_at_step: null           # null = train straight through. An integer stops cleanly at
+                                # that step with completed=false, so the seed stays unfinished
+                                # and resubmitting resumes exactly; used for a mid-run
+                                # generation check (see slurm/README_flow.md).
   early_stopping_patience: 10   # in evaluations
   ae_seen_only: false           # see slurm/README_flow.md: the autoencoder was fitted on
                                 # 100,000 of the 202,111 training molecules, but its

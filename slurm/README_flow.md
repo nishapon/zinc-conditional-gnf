@@ -153,3 +153,49 @@ log-determinant.
 | A constant embedding dimension (dead encoder unit) | accepted, not rejected: `whiten_std_floor` bounds both the whitening divisor and the smoothing-noise scale, and `floored_dimensions` is logged and stored in `config.json` |
 | Walltime kill / interrupt | `SIGTERM`/`SIGINT` save `last.pt` and exit 130; a checkpoint also lands every 1,000 steps. Resume restores step, batch position, RNG **and** the smoothing-noise stream (tested: 3+3 steps equal 6 bitwise) |
 | Missing MILP solver | both the CPU job's preflight and `scripts/05_generate.py` fail loudly, because without `scipy.optimize.milp` every molecule would silently fall back to greedy decoding and the "degree" column would not be the degree decoder |
+
+## Mid-run generation check (pausing at 10,000 steps)
+
+Validation NLL keeps improving by filling in the thin noise directions of the
+latent, which says little about generation quality. So the run can be paused
+once, sampled from, and then resumed, without giving up the 50,000-step target.
+
+```
+# 1. train to step 10,000 and stop there (the run stays UNFINISHED on purpose)
+sbatch --export=ALL,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh
+
+# 2. sample from the paused checkpoint, into its OWN directory (CPU job)
+sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh
+
+# 3. resume to 50,000 (leaving PAUSE_AT set is safe: a passed pause point is ignored)
+sbatch slurm/04_flow_uncond_gpu.sh
+```
+
+How the pause stays safe:
+
+* `--pause-at N` does **not** change `--max-steps`. `summary.json` records
+  `paused: true`, `paused_at_step: N`, `completed: false`, `early_stopped:
+  false`, and `max_steps: 50000`.
+* The finished-seed check therefore reports `paused` and **resumes** instead of
+  skipping. Only `completed` or `early_stopped` skips a seed.
+* The pause step always gets a validation pass and a checkpoint write, so
+  `last.pt` (and `best.pt`, if it improved) are current at the pause.
+* `last.pt` carries model, optimizer (Adam moments), batcher position, torch /
+  numpy RNG and the smoothing-noise stream. The learning-rate schedule is a
+  pure function of the step, so there is no separate scheduler state to lose.
+  Resume is bitwise identical to an uninterrupted run (tested).
+* A pause point already behind the current step is ignored and logged, so
+  resubmitting with `PAUSE_AT` still exported cannot stall the run.
+* A pause exits 0: it is a planned stop, not a failure.
+* Intermediate samples go to `SAMPLES_ROOT`, never to
+  `outputs/samples/flow_uncond`, and the job prints a notice that the run is an
+  intermediate check. Nothing is overwritten and the frozen autoencoder is
+  untouched (read-only, SHA-256 verified as always).
+
+**What to decide at the pause.** Compare the degree-decoder fallback rate
+against the 75-80% seen in the 300-step smoke run. A large drop means the
+samples are landing closer to the real-embedding manifold and the run should
+continue. A fallback rate still near 75% means more steps will not fix it, and
+the target should change instead (raising `noise_sigma` from 0.05 to 0.10, for
+which 90.45% reconstruction was measured, or replacing the diagonal whitening
+with a full ZCA) - both need approval and neither is implemented here.

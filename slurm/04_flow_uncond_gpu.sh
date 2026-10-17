@@ -31,10 +31,16 @@
 # is skipped.
 #
 #   SEEDS="1"           which flow seeds to train, in order (e.g. SEEDS="1 2 3 4 5")
-#   MAX_STEPS=50000     training steps per seed
+#   MAX_STEPS=50000     training steps per seed (the target; unchanged by a pause)
+#   PAUSE_AT=10000      stop cleanly at this step WITHOUT finishing the run, so the paused
+#                       checkpoint can be sampled from before the rest of the budget is spent.
+#                       The seed stays "unfinished", so resubmitting resumes at the next step.
+#                       Leaving PAUSE_AT set on the resubmission is safe: a pause point that
+#                       has already been passed is ignored.
 #   ZINC_GNF_AE=...     a different frozen autoencoder (not for the main results)
 #
 #     sbatch slurm/04_flow_uncond_gpu.sh
+#     sbatch --export=ALL,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh     # pause at 10k
 #     sbatch --export=ALL,SEEDS="1 2 3 4 5" slurm/04_flow_uncond_gpu.sh
 #
 # Never run this file with `bash` directly on the master node.
@@ -88,6 +94,9 @@ AE_CHECKPOINT="${ZINC_GNF_AE:-outputs/ablation/ae_degree/seed_3/last.pt}"
 ROOT="outputs/checkpoints/flow_uncond"
 SEEDS="${SEEDS:-1}"
 MAX_STEPS="${MAX_STEPS:-50000}"
+PAUSE_AT="${PAUSE_AT:-}"
+PAUSE_ARGS=()
+if [[ -n "${PAUSE_AT}" ]]; then PAUSE_ARGS=(--pause-at "${PAUSE_AT}"); fi
 mkdir -p outputs/logs "${ROOT}"
 
 echo "=============================================="
@@ -102,6 +111,7 @@ echo "CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES:-}'"
 echo "Git commit:       $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "Autoencoder:      ${AE_CHECKPOINT} (read-only, frozen)"
 echo "Seeds:            ${SEEDS}    steps per seed: ${MAX_STEPS}"
+echo "Pause at step:    ${PAUSE_AT:-none (train straight through)}"
 echo "Output root:      ${ROOT}"
 echo "=============================================="
 "${PYTHON}" -V
@@ -130,12 +140,19 @@ PYCHECK
 for SEED in ${SEEDS}; do
     OUT="${ROOT}/seed_${SEED}"
     if [[ -f "${OUT}/summary.json" ]]; then
-        STATE=$("${PYTHON}" -c "import json,sys;d=json.load(open(sys.argv[1]));print('done' if d.get('completed') or d.get('early_stopped') else 'unfinished')" "${OUT}/summary.json")
+        # A PAUSED run is deliberately neither complete nor early-stopped, so it reports
+        # "paused" here and is resumed rather than skipped.
+        STATE=$("${PYTHON}" -c "import json,sys;d=json.load(open(sys.argv[1]));print('done' if d.get('completed') or d.get('early_stopped') else ('paused' if d.get('paused') else 'unfinished'))" "${OUT}/summary.json")
         if [[ "${STATE}" == "done" ]]; then
             echo "seed ${SEED}: already finished (${OUT}/summary.json), skipping"
             continue
         fi
-        echo "seed ${SEED}: unfinished run found, resuming from ${OUT}/last.pt"
+        if [[ "${STATE}" == "paused" ]]; then
+            PAUSED_AT=$("${PYTHON}" -c "import json,sys;print(json.load(open(sys.argv[1])).get('paused_at_step'))" "${OUT}/summary.json")
+            echo "seed ${SEED}: paused at step ${PAUSED_AT}, resuming from ${OUT}/last.pt"
+        else
+            echo "seed ${SEED}: unfinished run found, resuming from ${OUT}/last.pt"
+        fi
     fi
     echo
     echo "---- unconditional flow, seed ${SEED} ($(date -u +%H:%M:%SZ)) ----"
@@ -147,6 +164,7 @@ for SEED in ${SEEDS}; do
         --device cuda \
         --seed "${SEED}" \
         --max-steps "${MAX_STEPS}" \
+        "${PAUSE_ARGS[@]+${PAUSE_ARGS[@]}}" \
         --resume auto
 done
 
@@ -159,5 +177,8 @@ done
 echo
 echo "Per-seed: ${ROOT}/seed_<n>/{train.log,metrics.jsonl,summary.json,best.pt,last.pt}"
 echo "If summary.json says completed=false, resubmit this same command to continue."
-echo "When a seed has finished: sbatch slurm/05_generate_uncond.sh"
+echo
+echo "If this run PAUSED, sample from the paused checkpoint into its own directory first:"
+echo "  sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh"
+echo "then resubmit this job to resume. When a seed has FINISHED: sbatch slurm/05_generate_uncond.sh"
 echo "=============================================="

@@ -20,6 +20,14 @@ distribution is singular and its likelihood is unbounded. Validation uses a
 FIXED noise seed, so the validation number is a deterministic function of the
 model.
 
+`pause_at_step` stops a run cleanly at an intermediate step while KEEPING
+`max_steps` as the target: the summary records `paused: true` with
+`completed: false`, so the cluster script's finished-seed check still sees an
+unfinished run and resubmitting resumes from exactly that step. It exists so
+the paused checkpoint can be sampled from (a mid-run generation check) before
+committing GPU hours to the rest of the run. A pause point that has already
+been passed is ignored, so leaving the flag set on the resubmission is safe.
+
 Embedding statistics (mean and per-dimension std) are measured once on a
 seeded subset of the training split, stored in the model as buffers, and
 reused on resume and at generation time. They are never recomputed from
@@ -81,6 +89,7 @@ class FlowTrainConfig:
     save_every: int = 1000
     val_molecules: int | None = 5000       # fixed seeded validation subset
     statistics_molecules: int = 20_000     # training molecules used for mean/std
+    pause_at_step: int | None = None       # stop cleanly at this step WITHOUT finishing the run
     log_det_warn_threshold: float = 50.0   # |log|det J||/node above this is logged as a warning
     early_stopping_patience: int | None = 10       # in evaluations; None = off
     max_train_molecules: int | None = None         # smoke tests only
@@ -98,6 +107,9 @@ class FlowTrainConfig:
                 raise ValueError(f"{name} must be >= 1")
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps must be >= 0")
+        if self.pause_at_step is not None and not 1 <= self.pause_at_step <= self.max_steps:
+            raise ValueError(f"pause_at_step must lie in 1..max_steps "
+                             f"({self.pause_at_step} vs max_steps={self.max_steps})")
         if self.ae_seen_only and self.ae_subset_seed is None:
             raise ValueError("ae_seen_only needs ae_subset_seed (the autoencoder run's seed)")
 
@@ -390,7 +402,18 @@ class FlowTrainer:
         started = time.perf_counter()
         step_started, window = time.perf_counter(), []
         stopped_early = False
+        paused = False
         interrupted = None
+        # A pause point already behind us must never stop the run again, otherwise
+        # resubmitting the same command with PAUSE_AT still set would spin forever.
+        pause_at = cfg.pause_at_step
+        if pause_at is not None and step >= pause_at:
+            log.info(f"pause point {pause_at} already passed (resumed at step {step}); "
+                     f"continuing to max_steps={cfg.max_steps}")
+            pause_at = None
+        elif pause_at is not None:
+            log.info(f"will PAUSE at step {pause_at} of {cfg.max_steps} (the run stays "
+                     f"unfinished; resubmit to resume)")
         flow.train()
 
         while step < cfg.max_steps:
@@ -444,7 +467,10 @@ class FlowTrainer:
                              f"growing, lower max_log_scale or the learning rate.")
                 window, step_started = [], time.perf_counter()
 
-            do_eval = step % cfg.eval_every == 0 or step == cfg.max_steps
+            reached_pause = pause_at is not None and step >= pause_at
+            # Always validate and checkpoint at the pause step, so the paused last.pt /
+            # best.pt are current and can be generated from immediately.
+            do_eval = step % cfg.eval_every == 0 or step == cfg.max_steps or reached_pause
             if do_eval:
                 metrics = self.validate(flow)
                 improved = self.best_loss is None or metrics["val_loss"] < self.best_loss
@@ -469,6 +495,13 @@ class FlowTrainer:
 
             if step % cfg.save_every == 0 or do_eval:
                 self._save("last.pt", flow, optimizer, {**self._state(step), "history": history})
+            if reached_pause:
+                paused = True
+                log.info(f"PAUSED at step {step} of {cfg.max_steps} as requested. The run is "
+                         f"NOT complete: optimizer, batcher, RNG and noise-stream state are in "
+                         f"{self.output_dir / 'last.pt'}. Sample from it for a mid-run check, "
+                         f"then resubmit the same job to resume at step {step + 1}.")
+                break
             if stopped_early:
                 break
             if stop_flag.requested:
@@ -481,6 +514,10 @@ class FlowTrainer:
         result = {
             "completed": step >= cfg.max_steps and interrupted is None,
             "interrupted_by": interrupted, "early_stopped": stopped_early,
+            # A pause is neither completion nor early stopping: the cluster script's
+            # finished-seed check must still treat this seed as unfinished.
+            "paused": paused, "paused_at_step": step if paused else None,
+            "max_steps": cfg.max_steps,
             "final_step": step, "best_step": self.best_step, "best_val_loss": self.best_loss,
             "last_validation": history[-1] if history else None,
             "seconds": time.perf_counter() - started,
@@ -492,7 +529,8 @@ class FlowTrainer:
         }
         atomic_write_json(result, self.output_dir / "summary.json")
         log.info(f"finished step {step}; best step {self.best_step} "
-                 f"(val nll/node {self.best_loss}); completed={result['completed']}")
+                 f"(val nll/node {self.best_loss}); completed={result['completed']} "
+                 f"paused={result['paused']}")
         return result
 
     # ------------------------------------------------------------------

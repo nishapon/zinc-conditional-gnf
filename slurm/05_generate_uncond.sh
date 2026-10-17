@@ -25,9 +25,16 @@
 #   SEEDS="1"                     flow seeds to sample from
 #   COUNT=10000                   molecules per temperature
 #   TEMPERATURES="0.7,0.85,1.0"   comma-separated
+#   CHECKPOINT_NAME=best.pt       which flow checkpoint to sample (last.pt for a paused run)
+#   SAMPLES_ROOT=...              where to write. Point an intermediate (mid-run) check at its
+#                                 own directory so it can never be mistaken for, or overwrite,
+#                                 the final evaluation outputs.
 #
 #     sbatch slurm/05_generate_uncond.sh
 #     sbatch --export=ALL,COUNT=2000,TEMPERATURES="0.6,0.7,0.85,1.0" slurm/05_generate_uncond.sh
+#
+# Mid-run check on a PAUSED training run (separate output directory, last.pt):
+#     sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh
 #
 # Choose ONE temperature from this sweep and report every metric at it; never
 # quote validity from one temperature and uniqueness from another. The test
@@ -73,7 +80,7 @@ export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 DATA_DIR="data/processed/zinc250k_charge_aware_moflow_fixed"
 AE_CHECKPOINT="${ZINC_GNF_AE:-outputs/ablation/ae_degree/seed_3/last.pt}"
 ROOT="outputs/checkpoints/flow_uncond"
-SAMPLES="outputs/samples/flow_uncond"
+SAMPLES="${SAMPLES_ROOT:-outputs/samples/flow_uncond}"
 SEEDS="${SEEDS:-1}"
 COUNT="${COUNT:-10000}"
 TEMPERATURES="${TEMPERATURES:-0.7,0.85,1.0}"
@@ -91,6 +98,7 @@ echo "Git commit:       $(git rev-parse --short HEAD 2>/dev/null || echo unknown
 echo "Seeds:            ${SEEDS}"
 echo "Molecules:        ${COUNT} per temperature; temperatures ${TEMPERATURES}"
 echo "Checkpoint:       ${CHECKPOINT_NAME}"
+echo "Samples root:     ${SAMPLES}"
 echo "=============================================="
 "${PYTHON}" -V
 
@@ -139,6 +147,11 @@ echo "=============================================="
 echo "Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Per seed/temperature: ${SAMPLES}/seed_<n>/T<temp>/{metrics.json,metrics.txt,valid_smiles.txt,samples.jsonl}"
 echo "Across seeds:         ${SAMPLES}/generation_summary.{json,txt}"
+if [[ "${CHECKPOINT_NAME}" != "best.pt" || -n "${SAMPLES_ROOT:-}" ]]; then
+    echo
+    echo "NOTE: this is an INTERMEDIATE check (checkpoint ${CHECKPOINT_NAME}, root ${SAMPLES})."
+    echo "It is not a final result and must not be reported as one."
+fi
 echo
 echo "Read the three validity numbers separately: 'raw' is the decoder's argmax"
 echo "with no chemistry, 'constrained' is greedy valence-aware assembly, 'degree'"

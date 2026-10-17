@@ -371,3 +371,73 @@ def test_cpu_generation_job_checks_its_dependencies():
     source = text("05_generate_uncond.sh")
     assert "scipy.optimize" in source and "milp" in source
     assert "fall back to greedy" in source
+
+
+# ---------------------------------------------------------------------------
+# The pause mechanism, through the script and the SLURM jobs.
+# ---------------------------------------------------------------------------
+def test_training_script_pauses_and_then_resumes_to_the_target(tiny_setup, tmp_path):
+    data, autoencoder = tiny_setup
+    output = tmp_path / "paused_run"
+    # --max-steps stays the target; --pause-at stops short of it
+    assert run_training(tmp_path, data, autoencoder, output=output,
+                        extra=("--max-steps", "8", "--pause-at", "4")) == 0   # a pause exits 0
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["paused"] and summary["paused_at_step"] == 4
+    assert summary["completed"] is False and summary["max_steps"] == 8
+    configuration = json.loads((output / "config.json").read_text())
+    assert configuration["training"]["pause_at_step"] == 4
+    assert configuration["training"]["max_steps"] == 8
+
+    # generation from the paused checkpoint, into its own directory
+    script = load_script("05_generate.py")
+    intermediate = tmp_path / "samples_pause"
+    assert script.main(["--flow-checkpoint", str(output / "last.pt"),
+                        "--ae-checkpoint", str(autoencoder), "--data-dir", str(data),
+                        "--output-dir", str(intermediate), "--count", "4",
+                        "--temperature", "0.85", "--batch-size", "4", "--device", "cpu"]) == 0
+    assert (intermediate / "T0.85" / "metrics.json").exists()
+
+    # resuming with the pause flag still set reaches the target
+    assert run_training(tmp_path, data, autoencoder, output=output,
+                        extra=("--max-steps", "8", "--pause-at", "4")) == 0
+    finished = json.loads((output / "summary.json").read_text())
+    assert finished["completed"] and finished["final_step"] == 8 and not finished["paused"]
+
+
+def test_training_script_rejects_an_impossible_pause(tiny_setup, tmp_path):
+    data, autoencoder = tiny_setup
+    assert run_training(tmp_path, data, autoencoder, output=tmp_path / "bad",
+                        extra=("--max-steps", "4", "--pause-at", "9")) == 4
+
+
+def test_training_job_wires_the_pause_without_changing_the_target():
+    source = text("04_flow_uncond_gpu.sh")
+    code = code_lines(source)
+    assert 'PAUSE_AT="${PAUSE_AT:-}"' in code                  # off unless asked for
+    assert "--pause-at" in code and "PAUSE_ARGS" in code
+    assert 'MAX_STEPS="${MAX_STEPS:-50000}"' in code            # target still 50,000
+    assert "--max-steps \"${MAX_STEPS}\"" in code
+    # a paused seed is resumed, never skipped
+    assert "'paused' if d.get('paused')" in code
+    assert 'if [[ "${STATE}" == "paused" ]]' in code
+    assert "resuming from" in source
+    assert "PAUSE_AT=10000" in source                           # the documented example
+
+
+def test_generation_job_can_write_intermediate_results_elsewhere():
+    source = text("05_generate_uncond.sh")
+    code = code_lines(source)
+    assert 'SAMPLES="${SAMPLES_ROOT:-outputs/samples/flow_uncond}"' in code
+    assert 'CHECKPOINT_NAME="${CHECKPOINT_NAME:-best.pt}"' in code     # final default unchanged
+    assert "INTERMEDIATE check" in source                              # labelled as not final
+    assert "flow_uncond_pause" in source                               # the documented example
+
+
+def test_pause_configuration_knob_is_documented_in_the_shipped_config():
+    configuration = load_config(REPOSITORY / CONFIG)
+    assert "pause_at_step" in configuration["training"]
+    assert configuration["training"]["pause_at_step"] is None          # off by default
+    training = FlowTrainConfig.from_dict(configuration["training"])
+    training.validate()
+    assert training.max_steps == 50_000
