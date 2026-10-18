@@ -199,3 +199,110 @@ continue. A fallback rate still near 75% means more steps will not fix it, and
 the target should change instead (raising `noise_sigma` from 0.05 to 0.10, for
 which 90.45% reconstruction was measured, or replacing the diagonal whitening
 with a full ZCA) - both need approval and neither is implemented here.
+
+## Arm A vs Arm B: the node-autoregressive coupling
+
+**Why.** The shuffled-node control (job 332841) reproduced the flow's failure almost
+exactly by keeping the identical multiset of real node embeddings and destroying only
+which nodes belong together:
+
+| | Real | Shuffled | Flow T=0.85 |
+|---|---:|---:|---:|
+| Mean P(no bond) | 0.9039 | 0.9983 | 0.9940 |
+| Aromatic rings / molecule | 1.830 | 0.027 | 0.012 |
+| Mean QED | 0.7314 | 0.2598 | 0.2376 |
+| QED >= 0.7 | 65.95% | 1.45% | 0.62% |
+| Degree fallback | 4.4% | 71.9% | 79.1% |
+
+With ~23 atoms a molecule has ~253 pairs and ~24 bonds, so a calibrated bond head should
+report 1 - 24/253 = 0.905 — and on real embeddings it reports 0.9039. On shuffled and
+flow embeddings it reports 0.994-0.998, i.e. about half a predicted bond per molecule.
+Meanwhile the flow's pooled participation ratio already matches the real one (6.27 vs
+6.14). The 300-step flow is therefore, to measurement precision, i.i.d. draws from the
+correct per-node marginal: the marginal is learned, the joint is not.
+
+**Arm B** adds exactly one mechanism per block:
+
+```
+ActNorm -> invertible per-node linear
+        -> channel coupling (swap=False)     unchanged
+        -> channel coupling (swap=True)      unchanged
+        -> node-autoregressive coupling      NEW
+```
+
+`y_i = x_i * exp(s_i) + t_i` with `(s_i, t_i) = g(x_1 .. x_{i-1})`: every channel of node
+*i* is transformed given the FULL vectors of the preceding nodes. The Jacobian is block
+lower triangular, so `log|det J|` is the masked sum of `s` — exact, like the channel
+couplings. Density evaluation is one parallel pass; inversion is N sequential passes.
+Alternate blocks reverse the real-node order so information travels both ways.
+
+Why this rather than whitening, prior variance, sigma or depth: the flow's per-node
+marginal geometry is **already** correct (participation ratio 6.27 vs 6.14) and the prior
+is healthy (sigma 1.000 -> 0.997, z-norm 7.8), so those levers address what already
+works. An autoregressive conditioner can *copy* an already-placed vector, which is what
+symmetry-equivalent atoms need: after smoothing they must sit about
+`sigma*sqrt(2*64) = 0.57` whitened units apart while unrelated atoms sit about 11.3
+apart — a 20x concentration, not an infinite one.
+
+**Measured cost** (full-size config, CPU, 4 threads; not an estimate):
+
+| | Arm A | Arm B |
+|---|---:|---:|
+| Parameters | 1,535,360 | 2,573,696 (**+67.6%**) |
+| Training step (batch 128 x 38) | 0.359 s | 0.424 s (x1.18) |
+| Sampling 128 molecules | 0.09 s | 1.78 s (x19.3) |
+| 10,000 samples (flow part only) | ~0.1 min | **~2.3 min** |
+
+Sampling stays well inside the CPU generation job's limit, where the degree-constrained
+MILP (~10 ms/molecule, ~2 min per 10,000) dominates anyway. **Arm B has 67.6% more
+parameters**, so a positive result is "mechanism + capacity"; if the comparison is
+ambiguous the follow-up is a capacity-matched arm (baseline with widened channel
+couplings), not a guess.
+
+### Running the comparison
+
+```
+cd ~/zinc-conditional-gnf && git pull origin rewrite/zinc250k-pipeline
+
+sbatch --export=ALL,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh          # arm A
+sbatch --export=ALL,ARM=b,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh    # arm B
+
+# mid-run samples go to their OWN roots, never the final evaluation directories
+sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh
+sbatch --export=ALL,ARM=b,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_ar_pause slurm/05_generate_uncond.sh
+sbatch slurm/08_embedding_populations.sh    # reference populations + both arms' embeddings
+```
+
+Arm A writes `outputs/checkpoints/flow_uncond/` and `outputs/samples/flow_uncond/`; Arm B
+writes `*_ar/`. Neither touches the frozen autoencoder, the smoke run or any diagnostic
+output. Both pause at 10,000 steps with `completed: false`, so nothing continues to
+50,000 without a decision.
+
+### Success criteria at the 10,000-step pause
+
+Arm B at initialisation *is* Arm A (zero-initialised heads), the target space, sigma,
+whitening and prior are identical, so **validation NLL is directly comparable between
+the arms** — but it is a secondary metric. The primary endpoints are generation-side.
+
+| Metric | Real | Shuffled / Flow now | Arm B target |
+|---|---:|---:|---:|
+| **Mean P(no bond)**, pre-assembly | 0.9039 | 0.998 / 0.994 | **<= 0.93** |
+| Expected bonds per atom | ~2.1 | ~0.04 | >= 1.5 |
+| Raw strict validity (argmax, no chemistry) | — | 0% | > 5% |
+| Aromatic rings / molecule | 1.830 | 0.027 / 0.012 | **>= 1.0** |
+| Molecules with an aromatic ring | 93.4% | 2.5% | >= 60% |
+| Aromatic / all rings | **0.631** | ~0.02 | >= 0.45 |
+| Mean QED | 0.7314 | 0.2598 / 0.2376 | **>= 0.60** |
+| **Fraction QED >= 0.7** | 65.95% | 1.45% / 0.62% | **>= 30%** |
+| Degree-decoder fallback | 4.4% | 71.9% / 79.1% | **<= 25%** |
+| Degree-decoder strict validity | — | — | >= 90% |
+| Uniqueness / novelty (10,000 samples) | — | — | >= 95% / >= 95% |
+| Internal diversity, scaffolds | ~0.9 | — | no collapse |
+| Secondary | — | — | val NLL, `log_det - sum log sigma`, within/between distance ratio and near-identical-pair rate against **real_smoothed** |
+
+The aromatic/all-rings reference is **0.631** as measured on our validation split, not
+the ~0.98 quoted in an earlier discussion.
+
+Decision rule: Arm B wins only if P(no bond), aromatic rings and the QED >= 0.7 fraction
+all improve materially at equal step count. A better NLL alone does not count. If Arm A
+also clears the gates, the architecture was adequate and only training time was missing.

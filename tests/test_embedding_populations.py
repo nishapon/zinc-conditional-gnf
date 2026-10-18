@@ -268,3 +268,46 @@ def test_decode_population_respects_a_missing_degree_head(real):
     records = decode_population(plain, real, device="cpu", batch_size=3)
     assert all("degree" not in r for r in records)
     assert all("constrained" in r for r in records)
+
+
+# ---------------------------------------------------------------------------
+# The smoothed reference: the distribution the flow is actually trained against.
+# ---------------------------------------------------------------------------
+def test_smoothed_population_adds_the_training_noise_and_keeps_the_sizes(real):
+    from zinc_gnf.embedding_populations import smoothed_population
+
+    per_dimension_std = real.pooled.std(0)
+    smoothed = smoothed_population(real, per_dimension_std=per_dimension_std, sigma=0.05, seed=0)
+    assert smoothed.counts == real.counts
+    assert smoothed.pooled.shape == real.pooled.shape
+    assert smoothed.name == "real_smoothed_sigma0.05"
+    assert not torch.equal(smoothed.pooled, real.pooled)
+    # the displacement is sigma times the (floored) per-dimension std
+    scale = per_dimension_std.clamp(min=0.01)
+    displacement = (smoothed.pooled - real.pooled) / scale
+    assert float(displacement.std()) == pytest.approx(0.05, rel=0.25)
+    again = smoothed_population(real, per_dimension_std=per_dimension_std, sigma=0.05, seed=0)
+    assert torch.equal(smoothed.pooled, again.pooled)
+    unchanged = smoothed_population(real, per_dimension_std=per_dimension_std, sigma=0.0)
+    assert torch.equal(unchanged.pooled, real.pooled)
+    with pytest.raises(ValueError):
+        smoothed_population(real, per_dimension_std=per_dimension_std, sigma=-1.0)
+    with pytest.raises(ValueError):
+        smoothed_population(real, per_dimension_std=torch.ones(3), sigma=0.05)
+
+
+def test_smoothing_separates_symmetry_equivalent_embeddings_by_a_finite_amount(real):
+    """The flow must bring equivalent atoms within about sigma*sqrt(2*D), not to 0."""
+    from zinc_gnf.embedding_populations import smoothed_population
+
+    per_dimension_std = real.pooled.std(0)
+    scale = float(per_dimension_std.clamp(min=0.01).mean())
+    real_statistics = embedding_population_statistics(real, reference_scale=scale)
+    smoothed = smoothed_population(real, per_dimension_std=per_dimension_std, sigma=0.05, seed=1)
+    smoothed_statistics = embedding_population_statistics(smoothed, reference_scale=scale)
+    # exact ties become near-ties, so the minimum within-molecule distance grows
+    assert smoothed_statistics["within_molecule_min_distance_mean"] > \
+        real_statistics["within_molecule_min_distance_mean"]
+    # but they stay far closer than unrelated atoms
+    assert smoothed_statistics["within_molecule_min_distance_mean"] < \
+        smoothed_statistics["between_molecule_mean_distance"]

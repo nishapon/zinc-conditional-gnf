@@ -428,7 +428,8 @@ def test_training_job_wires_the_pause_without_changing_the_target():
 def test_generation_job_can_write_intermediate_results_elsewhere():
     source = text("05_generate_uncond.sh")
     code = code_lines(source)
-    assert 'SAMPLES="${SAMPLES_ROOT:-outputs/samples/flow_uncond}"' in code
+    assert 'SAMPLES="${SAMPLES_ROOT:-${DEFAULT_SAMPLES}}"' in code     # override still available
+    assert 'DEFAULT_SAMPLES="outputs/samples/flow_uncond"' in code     # arm A default unchanged
     assert 'CHECKPOINT_NAME="${CHECKPOINT_NAME:-best.pt}"' in code     # final default unchanged
     assert "INTERMEDIATE check" in source                              # labelled as not final
     assert "flow_uncond_pause" in source                               # the documented example
@@ -441,3 +442,55 @@ def test_pause_configuration_knob_is_documented_in_the_shipped_config():
     training = FlowTrainConfig.from_dict(configuration["training"])
     training.validate()
     assert training.max_steps == 50_000
+
+
+# ---------------------------------------------------------------------------
+# Arm A / Arm B separation (the controlled comparison).
+# ---------------------------------------------------------------------------
+def test_training_job_selects_an_arm_and_keeps_their_directories_apart():
+    code = code_lines(text("04_flow_uncond_gpu.sh"))
+    assert 'ARM="${ARM:-a}"' in code                                  # baseline by default
+    assert 'ROOT="outputs/checkpoints/flow_uncond"' in code
+    assert 'ROOT="outputs/checkpoints/flow_uncond_ar"' in code        # arm B writes elsewhere
+    assert "--node-autoregressive" in code
+    assert "ARM_ARGS" in code and "exit 4" in code                    # an unknown arm is refused
+    # the arms differ ONLY in the arm flag: same data, config, budget and schedule
+    assert 'DATA_DIR="data/processed/zinc250k_charge_aware_moflow_fixed"' in code
+    assert "configs/zinc250k_flow_uncond.yaml" in code
+    assert 'MAX_STEPS="${MAX_STEPS:-50000}"' in code
+    assert "--pause-at" in code                                       # both arms can pause
+
+
+def test_generation_job_keeps_the_arms_apart_too():
+    code = code_lines(text("05_generate_uncond.sh"))
+    assert 'ARM="${ARM:-a}"' in code
+    assert 'DEFAULT_SAMPLES="outputs/samples/flow_uncond"' in code
+    assert 'DEFAULT_SAMPLES="outputs/samples/flow_uncond_ar"' in code
+    assert 'ROOT="outputs/checkpoints/flow_uncond_ar"' in code
+    assert "exit 4" in code
+
+
+def test_neither_job_can_touch_the_frozen_autoencoder_or_earlier_results():
+    for name in ("04_flow_uncond_gpu.sh", "05_generate_uncond.sh"):
+        code = code_lines(text(name))
+        assert not re.search(r"(rm|mv|cp|chmod|truncate)[^\n]*(ae_degree|flow_smoke|"
+                             r"latent_diagnostics|embedding_populations)", code), name
+        assert "outputs/checkpoints/flow_smoke" not in code, name
+
+
+def test_the_training_script_exposes_the_arm_flag():
+    script = load_script("04_train_flow.py")
+    arguments = script.parse_args(["--node-autoregressive"])
+    assert arguments.node_autoregressive is True
+    assert script.parse_args([]).node_autoregressive is None          # left to the config
+    flow_config, _ = script.build_configs(script.parse_args(
+        ["--config", str(REPOSITORY / CONFIG), "--node-autoregressive"]))
+    assert flow_config.node_autoregressive is True
+    baseline, _ = script.build_configs(script.parse_args(["--config", str(REPOSITORY / CONFIG)]))
+    assert baseline.node_autoregressive is False                      # arm A is the default
+
+
+def test_the_shipped_config_defaults_to_arm_a():
+    configuration = load_config(REPOSITORY / CONFIG)
+    assert configuration["flow"]["node_autoregressive"] is False
+    assert FlowConfig.from_dict(configuration["flow"]).node_autoregressive is False

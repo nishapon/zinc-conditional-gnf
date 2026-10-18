@@ -25,6 +25,15 @@ flow:
                                 # output layer is zero-initialized, so the flow starts
                                 # as the identity with log|det J| = 0
   actnorm: true
+  node_autoregressive: false    # false = ARM A (the committed baseline). true = ARM B: one
+                                # extra coupling per block transforming every channel of
+                                # node i given the FULL vectors of the preceding nodes.
+                                # Targets the demonstrated weakness (the shuffled-node
+                                # control reproduced the flow's failure, so what is missing
+                                # is inter-node dependence, not per-node marginals). Its
+                                # heads are zero-initialised, so at init Arm B IS Arm A.
+                                # NOTE: Arm B is node-ORDER dependent and has more
+                                # parameters than Arm A (reported in train.log).
   invertible_linear: true       # per-node LU linear; the latent has a participation
                                 # ratio of about 5 of 64 dimensions, so mixing beyond
                                 # the fixed half-split matters

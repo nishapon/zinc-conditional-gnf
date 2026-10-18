@@ -11,6 +11,11 @@ The autoencoder is never modified: it is loaded in eval mode with gradients
 disabled, and its file SHA-256 is written into config.json and every
 checkpoint. Resuming against a different encoder is refused.
 
+`--node-autoregressive` selects ARM B (one node-autoregressive coupling per block,
+targeting inter-node dependence). Without it the run is ARM A, the committed baseline.
+The two arms share every other setting, and Arm B's new couplings are identity at
+initialisation, so both arms start from the same density.
+
 `--pause-at N` stops cleanly at step N while keeping `--max-steps` as the
 target: `summary.json` records `paused: true` with `completed: false`, so the
 seed still counts as unfinished and resubmitting resumes at step N+1. Use it to
@@ -77,6 +82,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="train only on the molecules the autoencoder itself saw")
     parser.add_argument("--noise-sigma", type=float, default=None,
                         help="smoothing noise in per-dimension std units (default 0.05)")
+    parser.add_argument("--node-autoregressive", dest="node_autoregressive",
+                        action="store_true", default=None,
+                        help="ARM B: add one node-autoregressive coupling per block")
     parser.add_argument("--num-blocks", type=int, default=None)
     parser.add_argument("--max-log-scale", type=float, default=None)
     parser.add_argument("--resume", default="auto",
@@ -106,7 +114,7 @@ def build_configs(arguments: argparse.Namespace) -> tuple[FlowConfig, FlowTrainC
         train_values["ae_seen_only"] = True
     if arguments.grad_clip_norm is not None:
         train_values["grad_clip_norm"] = arguments.grad_clip_norm or None
-    for name in ("noise_sigma", "num_blocks", "max_log_scale"):
+    for name in ("noise_sigma", "num_blocks", "max_log_scale", "node_autoregressive"):
         value = getattr(arguments, name)
         if value is not None:
             flow_values[name] = value

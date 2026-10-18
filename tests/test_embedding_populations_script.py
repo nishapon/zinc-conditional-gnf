@@ -82,13 +82,20 @@ def test_script_compares_real_shuffled_and_flow(setup, tmp_path):
                "--temperature", "0.85,1.0") == 0
     result = json.loads((tmp_path / "pop" / "embedding_populations.json").read_text())
     names = [row["name"] for row in result["embedding_statistics"]]
-    assert names == ["real", "shuffled", "flow_T0.85", "flow_T1"]
+    # the smoothed reference is the flow's ACTUAL target and is on by default
+    assert names == ["real", "shuffled", "real_smoothed_sigma0.05", "flow_T0.85", "flow_T1"]
+    assert result["settings"]["noise_sigma"] == pytest.approx(0.05)
 
     # all populations share the same molecules and sizes
     assert {row["molecules"] for row in result["embedding_statistics"]} == {8}
     assert {row["nodes"] for row in result["embedding_statistics"]} == \
         {result["embedding_statistics"][0]["nodes"]}
 
+    # the smoothed reference keeps the sizes and widens the marginals a little
+    smoothed = result["embedding_statistics"][2]
+    assert smoothed["molecules"] == result["embedding_statistics"][0]["molecules"]
+    assert smoothed["per_dimension_std_mean"] >= \
+        result["embedding_statistics"][0]["per_dimension_std_mean"]
     # shuffling preserves every per-node statistic exactly
     real, shuffled = result["embedding_statistics"][0], result["embedding_statistics"][1]
     assert shuffled["mean_norm"] == pytest.approx(real["mean_norm"], rel=1e-9)
@@ -123,8 +130,16 @@ def test_the_control_runs_without_any_flow(setup, tmp_path):
     data, autoencoder, _ = setup
     assert run(tmp_path, data, autoencoder) == 0
     result = json.loads((tmp_path / "pop" / "embedding_populations.json").read_text())
-    assert [row["name"] for row in result["embedding_statistics"]] == ["real", "shuffled"]
+    assert [row["name"] for row in result["embedding_statistics"]] == \
+        ["real", "shuffled", "real_smoothed_sigma0.05"]
     assert result["flow"] == {}
+
+
+def test_the_smoothed_reference_can_be_switched_off(setup, tmp_path):
+    data, autoencoder, _ = setup
+    assert run(tmp_path, data, autoencoder, "--noise-sigma", "0", output="nosmooth") == 0
+    result = json.loads((tmp_path / "nosmooth" / "embedding_populations.json").read_text())
+    assert [row["name"] for row in result["embedding_statistics"]] == ["real", "shuffled"]
 
 
 def test_a_foreign_autoencoder_is_refused_unless_allowed(setup, tmp_path):

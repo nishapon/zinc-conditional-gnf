@@ -30,6 +30,9 @@
 # completed; a seed whose summary.json already says completed or early-stopped
 # is skipped.
 #
+#   ARM="a"|"b"         a = the committed baseline; b = adds one node-autoregressive
+#                       coupling per block (targets inter-node dependence). The two arms
+#                       write to SEPARATE directories and never overwrite each other.
 #   SEEDS="1"           which flow seeds to train, in order (e.g. SEEDS="1 2 3 4 5")
 #   MAX_STEPS=50000     training steps per seed (the target; unchanged by a pause)
 #   PAUSE_AT=10000      stop cleanly at this step WITHOUT finishing the run, so the paused
@@ -40,7 +43,8 @@
 #   ZINC_GNF_AE=...     a different frozen autoencoder (not for the main results)
 #
 #     sbatch slurm/04_flow_uncond_gpu.sh
-#     sbatch --export=ALL,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh     # pause at 10k
+#     sbatch --export=ALL,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh              # arm A to 10k
+#     sbatch --export=ALL,ARM=b,PAUSE_AT=10000 slurm/04_flow_uncond_gpu.sh        # arm B to 10k
 #     sbatch --export=ALL,SEEDS="1 2 3 4 5" slurm/04_flow_uncond_gpu.sh
 #
 # Never run this file with `bash` directly on the master node.
@@ -91,7 +95,15 @@ export WANDB_MODE=offline
 
 DATA_DIR="data/processed/zinc250k_charge_aware_moflow_fixed"
 AE_CHECKPOINT="${ZINC_GNF_AE:-outputs/ablation/ae_degree/seed_3/last.pt}"
-ROOT="outputs/checkpoints/flow_uncond"
+ARM="${ARM:-a}"
+case "${ARM}" in
+    a) ROOT="outputs/checkpoints/flow_uncond"; ARM_ARGS=()
+       SAMPLES_PAUSE_ROOT="outputs/samples/flow_uncond_pause" ;;
+    b) ROOT="outputs/checkpoints/flow_uncond_ar"; ARM_ARGS=(--node-autoregressive)
+       SAMPLES_PAUSE_ROOT="outputs/samples/flow_uncond_ar_pause" ;;
+    *) echo "ERROR: ARM must be 'a' (baseline) or 'b' (node-autoregressive), got '${ARM}'" >&2
+       exit 4 ;;
+esac
 SEEDS="${SEEDS:-1}"
 MAX_STEPS="${MAX_STEPS:-50000}"
 PAUSE_AT="${PAUSE_AT:-}"
@@ -110,6 +122,7 @@ echo "Walltime limit:   ${SBATCH_TIMELIMIT:-see --time in this file} (resubmit t
 echo "CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES:-}'"
 echo "Git commit:       $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "Autoencoder:      ${AE_CHECKPOINT} (read-only, frozen)"
+echo "Arm:              ${ARM}  ($([[ "${ARM}" == "b" ]] && echo "node-autoregressive" || echo "baseline"))"
 echo "Seeds:            ${SEEDS}    steps per seed: ${MAX_STEPS}"
 echo "Pause at step:    ${PAUSE_AT:-none (train straight through)}"
 echo "Output root:      ${ROOT}"
@@ -164,6 +177,7 @@ for SEED in ${SEEDS}; do
         --device cuda \
         --seed "${SEED}" \
         --max-steps "${MAX_STEPS}" \
+        "${ARM_ARGS[@]+${ARM_ARGS[@]}}" \
         "${PAUSE_ARGS[@]+${PAUSE_ARGS[@]}}" \
         --resume auto
 done
@@ -179,6 +193,6 @@ echo "Per-seed: ${ROOT}/seed_<n>/{train.log,metrics.jsonl,summary.json,best.pt,l
 echo "If summary.json says completed=false, resubmit this same command to continue."
 echo
 echo "If this run PAUSED, sample from the paused checkpoint into its own directory first:"
-echo "  sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh"
+echo "  sbatch --export=ALL,ARM=${ARM},CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=${SAMPLES_PAUSE_ROOT} slurm/05_generate_uncond.sh"
 echo "then resubmit this job to resume. When a seed has FINISHED: sbatch slurm/05_generate_uncond.sh"
 echo "=============================================="

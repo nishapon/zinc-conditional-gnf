@@ -126,6 +126,31 @@ def shuffle_population(population: EmbeddingPopulation, *, seed: int = 0,
                       "seed": int(seed)}
 
 
+def smoothed_population(population: EmbeddingPopulation, *, per_dimension_std: torch.Tensor,
+                        sigma: float, floor: float = 0.01, seed: int = 0,
+                        name: str | None = None) -> EmbeddingPopulation:
+    """Real embeddings plus the SAME Gaussian smoothing the flow is trained against.
+
+    This is the honest reference for every "how close must two embeddings be" question:
+    the flow's target is not the deterministic embedding set but its convolution with
+    `sigma * per-dimension std` (floored exactly as the whitening floors it). Two
+    originally identical vectors of symmetry-equivalent atoms end up about
+    `sigma * sqrt(2) * sqrt(D)` apart in whitened units, not 0, so comparing a flow
+    against unsmoothed real embeddings overstates what it has to achieve.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be >= 0")
+    scale = per_dimension_std.to(population.pooled.dtype).clamp(min=float(floor))
+    if scale.shape[0] != population.dimension:
+        raise ValueError(f"per_dimension_std has {scale.shape[0]} entries, "
+                         f"expected {population.dimension}")
+    generator = torch.Generator().manual_seed(int(seed))
+    noise = torch.randn(population.pooled.shape, generator=generator)
+    return EmbeddingPopulation(name=name or f"real_smoothed_sigma{sigma:g}",
+                               counts=list(population.counts),
+                               pooled=population.pooled + float(sigma) * scale * noise)
+
+
 @torch.no_grad()
 def flow_population(flow, counts: Sequence[int], *, temperature: float = 1.0, seed: int = 0,
                     device: str | torch.device = "cpu", batch_size: int = 128,
@@ -436,4 +461,5 @@ __all__ = [
     "format_prediction_statistics",
     "real_population",
     "shuffle_population",
+    "smoothed_population",
 ]

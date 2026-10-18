@@ -54,6 +54,24 @@ reasons for each deviation:
     models the smoothed density, the same reasoning that makes dequantization
     necessary for image flows.
 
+`node_autoregressive` (default False, i.e. ARM A) adds ONE extra coupling per block
+that transforms every channel of node i conditioned on the FULL vectors of the
+preceding nodes (`NodeAutoregressiveCoupling`). It exists because the shuffled-node
+control showed that the failure of 300-step samples is the absence of inter-node
+dependence, not of per-node marginal structure: the pooled marginal geometry already
+matches the real embeddings (participation ratio 6.27 vs 6.14) while the pre-assembly
+bond head reports P(no bond) = 0.994 against 0.904 on real embeddings, i.e. "these atoms
+are unrelated". A channel-split coupling can only pass half of each other node's
+coordinates through an attention context that the law of large numbers flattens; an
+autoregressive conditioner can instead copy an already-placed vector, which is exactly
+what symmetry-equivalent atoms need (after smoothing they must sit about 0.57 whitened
+units apart while unrelated atoms sit about 11.3 apart).
+
+The new coupling is NODE-ORDER DEPENDENT: it models the distribution of ordered node
+tuples in the dataset's atom order, so the model is no longer exchangeable. Decoding is
+order-agnostic, so a generated tuple still yields a molecule. Its heads are
+zero-initialized, so at initialization Arm B is exactly Arm A.
+
 Conditioning is wired in from the start but switched off by default:
 `FlowConfig.condition_features = ()` gives an unconditional flow with a single
 global learned prior and no FiLM parameters. Setting it to `("n",)` or
@@ -91,6 +109,7 @@ class FlowConfig:
     max_log_scale: float = 1.0              # tanh clamp on the coupling log-scale
     actnorm: bool = True
     invertible_linear: bool = True
+    node_autoregressive: bool = False       # ARM B: add one node-autoregressive coupling per block
     prior_min_sigma: float = 0.1            # [teammates] softplus floor
     prior_init_sigma: float = 1.0           # [teammates] sigma at initialization
     prior_hidden_dim: int = 64              # [teammates] conditional prior MLP width
@@ -347,8 +366,163 @@ class AffineCoupling(nn.Module):
         return self._join(source, original)
 
 
+def real_node_reversal_index(mask: torch.Tensor) -> torch.Tensor:
+    """Index that reverses the REAL nodes of every molecule and leaves padding in place.
+
+    Applying the gather twice is the identity (the permutation is an involution), so the
+    same index inverts the reordering. A permutation has |det| = 1 and therefore adds
+    nothing to the log-determinant.
+    """
+    batch, width = mask.shape
+    counts = mask.sum(-1, keepdim=True)
+    positions = torch.arange(width, device=mask.device).unsqueeze(0).expand(batch, width)
+    flipped = (counts - 1 - positions).clamp(min=0)
+    return torch.where(positions < counts, flipped, positions)
+
+
+def _apply_node_permutation(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    return torch.gather(x, 1, index.unsqueeze(-1).expand_as(x))
+
+
+class CausalNodeAttention(nn.Module):
+    """Multi-head attention in which position i may attend to positions <= i only.
+
+    Separate from `MaskedSelfAttention` on purpose: Arm A's module must stay byte for
+    byte the same, and this one needs a full [N, N] mask rather than a key mask.
+    """
+
+    def __init__(self, dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.num_heads, self.head_dim = int(num_heads), dim // int(num_heads)
+        self.query = nn.Linear(dim, dim, bias=False)
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        for layer in (self.query, self.key, self.value, self.output):
+            nn.init.xavier_uniform_(layer.weight)
+
+    def forward(self, x: torch.Tensor, key_valid: torch.Tensor) -> torch.Tensor:
+        """`x [B, N, D]`; `key_valid [B, N]` marks usable key positions."""
+        batch, width, _ = x.shape
+        shape = (batch, width, self.num_heads, self.head_dim)
+        queries = self.query(x).view(shape).transpose(1, 2)
+        keys = self.key(x).view(shape).transpose(1, 2)
+        values = self.value(x).view(shape).transpose(1, 2)
+        logits = queries @ keys.transpose(-1, -2) / math.sqrt(self.head_dim)
+        causal = torch.ones((width, width), dtype=torch.bool, device=x.device).tril()
+        allowed = causal.unsqueeze(0) & key_valid.unsqueeze(1)          # [B, N, N]
+        # position 0 always keeps its own key, so no row can be fully masked
+        allowed = allowed | torch.eye(width, dtype=torch.bool, device=x.device).unsqueeze(0)
+        logits = logits.masked_fill(~allowed.unsqueeze(1), float("-inf"))
+        attended = torch.softmax(logits, dim=-1) @ values
+        merged = attended.transpose(1, 2).reshape(batch, width, -1)
+        return self.output(merged)
+
+
+class NodeAutoregressiveCoupling(nn.Module):
+    """`y_i = x_i * exp(s_i) + t_i` with `(s_i, t_i) = g(x_1 .. x_{i-1})` (ARM B).
+
+    Every channel of node i is transformed, conditioned on the FULL vectors of the
+    preceding nodes. The conditioner is fed the sequence shifted by one and a learned
+    start token, so its output at position i is a function of `x_{<i}` and cannot see
+    `x_i` - the standard decoder-only construction, and the property the causality test
+    checks by gradient.
+
+    Ordering the coordinates by node index makes the Jacobian block lower triangular with
+    diagonal blocks `diag(exp(s_i))`, so
+
+        log|det J| = sum over real nodes and channels of s
+
+    exactly as for the channel couplings. Density evaluation is ONE parallel pass;
+    inversion is N sequential passes (the MAF orientation: cheap training, sequential
+    sampling), which is why training cost barely changes and sampling costs N conditioner
+    passes per block.
+
+    `reverse=True` reverses the real nodes of every molecule before and after, so
+    alternating blocks let information travel in both directions along the order. The
+    reversal is a permutation and contributes nothing to the log-determinant.
+    """
+
+    def __init__(self, config: FlowConfig, *, reverse: bool = False) -> None:
+        super().__init__()
+        dim = config.node_embedding_dim
+        self.reverse = bool(reverse)
+        self.max_log_scale = float(config.max_log_scale)
+        self.input_projection = nn.Linear(dim, config.attention_dim)
+        self.start_token = nn.Parameter(torch.zeros(config.attention_dim))
+        self.attention = CausalNodeAttention(config.attention_dim, config.num_heads)
+        self.hidden = nn.Linear(2 * config.attention_dim, config.hidden_dim)
+        self.film = (nn.Linear(config.condition_dim, 2 * config.hidden_dim)
+                     if config.condition_dim else None)
+        self.scale_head = nn.Linear(config.hidden_dim, dim)
+        self.translation_head = nn.Linear(config.hidden_dim, dim)
+        nn.init.xavier_uniform_(self.input_projection.weight)
+        nn.init.zeros_(self.input_projection.bias)
+        nn.init.xavier_uniform_(self.hidden.weight)
+        nn.init.zeros_(self.hidden.bias)
+        for head in (self.scale_head, self.translation_head):
+            nn.init.zeros_(head.weight)          # identity at initialization: Arm B == Arm A
+            nn.init.zeros_(head.bias)
+        if self.film is not None:
+            nn.init.zeros_(self.film.weight)
+            nn.init.zeros_(self.film.bias)
+
+    def _scale_and_translation(self, x: torch.Tensor, mask: torch.Tensor,
+                               condition: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, width, _ = x.shape
+        projected = self.input_projection(x) * mask.unsqueeze(-1).to(x.dtype)
+        shifted = torch.cat([self.start_token.expand(batch, 1, -1), projected[:, :-1]], dim=1)
+        # key position j carries node j-1 (position 0 carries the start token)
+        previous_valid = torch.cat([torch.ones((batch, 1), dtype=torch.bool, device=x.device),
+                                    mask[:, :-1]], dim=1)
+        attended = self.attention(shifted, previous_valid)
+        hidden = self.hidden(torch.cat([shifted, attended], dim=-1))
+        if self.film is not None:
+            if condition is None:
+                raise ValueError("this coupling is conditional but no condition was given")
+            gamma, beta = self.film(condition).unsqueeze(1).chunk(2, dim=-1)
+            hidden = hidden * (1.0 + gamma) + beta
+        hidden = F.relu(hidden)
+        zeros = mask.unsqueeze(-1).to(x.dtype)
+        bound = self.max_log_scale
+        scale = bound * torch.tanh(self.scale_head(hidden) / bound) * zeros
+        return scale, self.translation_head(hidden) * zeros
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                condition: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        index = real_node_reversal_index(mask) if self.reverse else None
+        if index is not None:
+            x = _apply_node_permutation(x, index)
+        scale, translation = self._scale_and_translation(x, mask, condition)
+        y = (x * torch.exp(scale) + translation) * mask.unsqueeze(-1).to(x.dtype)
+        log_det = (scale * mask.unsqueeze(-1).to(x.dtype)).sum(dim=(1, 2))
+        if index is not None:
+            y = _apply_node_permutation(y, index)       # involution: restores the order
+        return y, log_det
+
+    def inverse(self, y: torch.Tensor, mask: torch.Tensor,
+                condition: torch.Tensor | None) -> torch.Tensor:
+        index = real_node_reversal_index(mask) if self.reverse else None
+        if index is not None:
+            y = _apply_node_permutation(y, index)
+        floats = mask.unsqueeze(-1).to(y.dtype)
+        x = torch.zeros_like(y)
+        # Node i needs (s_i, t_i), which depend only on x_{<i}; those are already
+        # recovered, and the zeros still sitting at positions >= i cannot influence
+        # position i because the conditioner is causal.
+        for position in range(y.shape[1]):
+            scale, translation = self._scale_and_translation(x, mask, condition)
+            recovered = (y[:, position] - translation[:, position]) * torch.exp(-scale[:, position])
+            x = torch.cat([x[:, :position], (recovered * floats[:, position]).unsqueeze(1),
+                           x[:, position + 1:]], dim=1)
+        x = x * floats
+        if index is not None:
+            x = _apply_node_permutation(x, index)
+        return x
+
+
 class FlowBlock(nn.Module):
-    """ActNorm -> invertible linear -> two affine couplings."""
+    """ActNorm -> invertible linear -> two affine couplings (-> node-autoregressive coupling)."""
 
     def __init__(self, config: FlowConfig, generator: torch.Generator | None = None) -> None:
         super().__init__()
@@ -357,6 +531,12 @@ class FlowBlock(nn.Module):
         self.linear = InvertiblePointwiseLinear(dim, generator) if config.invertible_linear else None
         self.couplings = nn.ModuleList([AffineCoupling(config, swap=False),
                                         AffineCoupling(config, swap=True)])
+        # Attached in a SECOND pass by NodeFlow so the shared modules above consume the
+        # random-number stream in exactly the same order as Arm A.
+        self.node_coupling: NodeAutoregressiveCoupling | None = None
+
+    def add_node_autoregressive(self, config: FlowConfig, *, reverse: bool) -> None:
+        self.node_coupling = NodeAutoregressiveCoupling(config, reverse=reverse)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 condition: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -370,10 +550,15 @@ class FlowBlock(nn.Module):
         for coupling in self.couplings:
             x, term = coupling(x, mask, condition)
             log_det = log_det + term
+        if self.node_coupling is not None:
+            x, term = self.node_coupling(x, mask, condition)
+            log_det = log_det + term
         return x, log_det
 
     def inverse(self, y: torch.Tensor, mask: torch.Tensor,
                 condition: torch.Tensor | None) -> torch.Tensor:
+        if self.node_coupling is not None:
+            y = self.node_coupling.inverse(y, mask, condition)
         for coupling in reversed(self.couplings):
             y = coupling.inverse(y, mask, condition)
         if self.linear is not None:
@@ -495,6 +680,12 @@ class NodeFlow(nn.Module):
         c = self.config
         generator = torch.Generator().manual_seed(int(init_seed))
         self.blocks = nn.ModuleList([FlowBlock(c, generator) for _ in range(c.num_blocks)])
+        if c.node_autoregressive:
+            # Second pass on purpose: every module Arm A also has is already built, so the
+            # shared weights of Arm A and Arm B are identical for the same seed, and the
+            # new couplings only consume random numbers afterwards.
+            for index, block in enumerate(self.blocks):
+                block.add_node_autoregressive(c, reverse=index % 2 == 1)
         self.condition_embedding = (
             ConditionEmbedding(c.condition_features, c.condition_embedding_dim, c.condition_hidden_dim)
             if c.conditional else None)
@@ -656,6 +847,9 @@ def node_mask_from_counts(n_node: Sequence[int] | torch.Tensor, *, max_nodes: in
 __all__ = [
     "ActNorm",
     "AffineCoupling",
+    "CausalNodeAttention",
+    "NodeAutoregressiveCoupling",
+    "real_node_reversal_index",
     "CONDITION_FEATURES",
     "ConditionEmbedding",
     "CouplingNetwork",

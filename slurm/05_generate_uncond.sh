@@ -22,6 +22,9 @@
 # TRAINING set, N.U.V., internal diversity, scaffold counts and the decoder
 # fallback rate.
 #
+#   ARM="a"|"b"                   which arm to sample: a = baseline, b = node-autoregressive.
+#                                 Selects both the checkpoint root and the samples root, so
+#                                 the two arms can never overwrite each other's results.
 #   SEEDS="1"                     flow seeds to sample from
 #   COUNT=10000                   molecules per temperature
 #   TEMPERATURES="0.7,0.85,1.0"   comma-separated
@@ -34,7 +37,14 @@
 #     sbatch --export=ALL,COUNT=2000,TEMPERATURES="0.6,0.7,0.85,1.0" slurm/05_generate_uncond.sh
 #
 # Mid-run check on a PAUSED training run (separate output directory, last.pt):
+# Mid-run check on a PAUSED training run. Give it its OWN samples root so an
+# intermediate result can never land in, or be mistaken for, the final evaluation
+# directory of that arm (flow_uncond_pause / flow_uncond_ar_pause):
 #     sbatch --export=ALL,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_pause slurm/05_generate_uncond.sh
+#     sbatch --export=ALL,ARM=b,CHECKPOINT_NAME=last.pt,COUNT=2000,SAMPLES_ROOT=outputs/samples/flow_uncond_ar_pause slurm/05_generate_uncond.sh
+#
+# Sampling Arm B costs N sequential conditioner passes per block, so it is slower than
+# Arm A; the measured overhead is in slurm/README_flow.md.
 #
 # Choose ONE temperature from this sweep and report every metric at it; never
 # quote validity from one temperature and uniqueness from another. The test
@@ -79,8 +89,14 @@ export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 
 DATA_DIR="data/processed/zinc250k_charge_aware_moflow_fixed"
 AE_CHECKPOINT="${ZINC_GNF_AE:-outputs/ablation/ae_degree/seed_3/last.pt}"
-ROOT="outputs/checkpoints/flow_uncond"
-SAMPLES="${SAMPLES_ROOT:-outputs/samples/flow_uncond}"
+ARM="${ARM:-a}"
+case "${ARM}" in
+    a) ROOT="outputs/checkpoints/flow_uncond"; DEFAULT_SAMPLES="outputs/samples/flow_uncond" ;;
+    b) ROOT="outputs/checkpoints/flow_uncond_ar"; DEFAULT_SAMPLES="outputs/samples/flow_uncond_ar" ;;
+    *) echo "ERROR: ARM must be 'a' (baseline) or 'b' (node-autoregressive), got '${ARM}'" >&2
+       exit 4 ;;
+esac
+SAMPLES="${SAMPLES_ROOT:-${DEFAULT_SAMPLES}}"
 SEEDS="${SEEDS:-1}"
 COUNT="${COUNT:-10000}"
 TEMPERATURES="${TEMPERATURES:-0.7,0.85,1.0}"
@@ -97,6 +113,7 @@ echo "CPUs / memory:    ${SLURM_CPUS_PER_TASK:-?} / ${SLURM_MEM_PER_NODE:-?} MB"
 echo "Git commit:       $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "Seeds:            ${SEEDS}"
 echo "Molecules:        ${COUNT} per temperature; temperatures ${TEMPERATURES}"
+echo "Arm:              ${ARM}  (checkpoints ${ROOT})"
 echo "Checkpoint:       ${CHECKPOINT_NAME}"
 echo "Samples root:     ${SAMPLES}"
 echo "=============================================="

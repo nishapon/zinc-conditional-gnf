@@ -9,11 +9,14 @@ that pattern.
 
 Three populations with IDENTICAL molecule sizes:
 
-  real        the autoencoder's embeddings of validation molecules
-  shuffled    the same node vectors, globally permuted and re-partitioned into molecules
-              of the original sizes, so every per-node marginal, the covariance and the
-              principal components are preserved EXACTLY and only the grouping changes
-  flow_T*     embeddings sampled from a trained flow checkpoint for the same sizes
+  real          the autoencoder's embeddings of validation molecules
+  shuffled      the same node vectors, globally permuted and re-partitioned into molecules
+                of the original sizes, so every per-node marginal, the covariance and the
+                principal components are preserved EXACTLY and only the grouping changes
+  real_smoothed real embeddings plus the SAME Gaussian smoothing the flow trains against
+                (--noise-sigma, default 0.05) - the flow's actual target, and the honest
+                reference for "how close must symmetry-equivalent embeddings be"
+  flow_T*       embeddings sampled from a trained flow checkpoint for the same sizes
 
 For each population it reports
   * embedding geometry: norms, marginals, covariance spectrum, participation ratio,
@@ -64,6 +67,7 @@ from zinc_gnf.dataset import (  # noqa: E402
 )
 from zinc_gnf.embedding_populations import (  # noqa: E402
     decode_population,
+    smoothed_population,
     decoder_prediction_statistics,
     embedding_population_statistics,
     flow_population,
@@ -119,6 +123,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--flow-checkpoint", default=None,
                         help="a trained flow; omit to run the shuffled control alone")
     parser.add_argument("--temperature", default="0.85,1.0")
+    parser.add_argument("--noise-sigma", type=float, default=0.05,
+                        help="add a 'real + Gaussian smoothing' reference population using the "
+                             "flow's own sigma (0 disables it)")
     parser.add_argument("--molecules", type=int, default=2000,
                         help="VALIDATION molecules; every population uses these same sizes")
     parser.add_argument("--reference-molecules", type=int, default=20000,
@@ -177,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
                                                device=device, batch_size=arguments.batch_size)
         reference_summary, _, reference_eigenvectors = covariance_spectrum(reference_embeddings)
         reference_scale = reference_summary["per_dimension_std_mean"]
+        # per-dimension std of the TRAINING embeddings: the scale the flow's smoothing uses
+        reference_std = reference_embeddings.to(torch.float64).std(0).to(torch.float32)
         del reference_embeddings
 
         # The validation molecules every population shares.
@@ -188,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
                                        batch_size=arguments.batch_size, name="real")]
         shuffled, shuffle_report = shuffle_population(populations[0], seed=arguments.seed)
         populations.append(shuffled)
+        if arguments.noise_sigma > 0:
+            # The flow's actual target: real embeddings convolved with the training noise.
+            populations.append(smoothed_population(
+                populations[0], per_dimension_std=reference_std, sigma=arguments.noise_sigma,
+                seed=arguments.seed))
+            logger.info(f"[pop] real_smoothed: sigma={arguments.noise_sigma} of the per-dimension "
+                        f"training std (the distribution the flow is trained against)")
         logger.info(f"[pop] shuffled: {shuffle_report['permuted_nodes']:,} node vectors permuted; "
                     f"{shuffle_report['fraction_back_in_their_own_molecule']:.4f} landed back in "
                     f"their own molecule")
@@ -226,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
                          "reference_molecules": len(reference_indices),
                          "temperatures": temperatures, "seed": arguments.seed,
                          "device": str(device),
-                         "reference_basis_split": "train", "population_split": "validation"},
+                         "reference_basis_split": "train", "population_split": "validation",
+                         "noise_sigma": arguments.noise_sigma},
             "shuffle": shuffle_report,
             "reference_spectrum": {k: reference_summary[k] for k in
                                    ("participation_ratio", "effective_rank_99",
