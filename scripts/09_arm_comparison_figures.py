@@ -84,11 +84,36 @@ def load_arm(path: Path, label: str) -> dict[str, Any]:
             "samples_path": str(samples_path) if records else None}
 
 
+def number(value: Any) -> float:
+    """Coerce to float, mapping missing / null / non-numeric to NaN.
+
+    A metric can be genuinely UNDEFINED rather than zero: uniqueness divides by the
+    number of valid molecules, so an arm with no raw-valid samples stores
+    `"uniqueness": {"value": null}`. Such a metric must stay undefined all the way to
+    the figure and the summary, where it is shown as N/A - never as 0 or 1.
+    """
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def rate(block: Any) -> float:
-    """metrics.json stores rates either bare or as {'value': ...}."""
+    """metrics.json stores rates either bare or as {'value': ...}, possibly null."""
     if isinstance(block, dict):
-        return float(block.get("value", float("nan")))
-    return float("nan") if block is None else float(block)
+        return number(block.get("value"))
+    return number(block)
+
+
+def undefined(value: Any) -> bool:
+    return value is None or (isinstance(value, float) and np.isnan(value))
+
+
+def show(value: Any, template: str = "{:.4f}", missing: str = "N/A") -> str:
+    """Format a metric for display, as N/A when it is undefined."""
+    return missing if undefined(value) else template.format(float(value))
 
 
 def decoder_numbers(arm: dict[str, Any]) -> dict[str, Any]:
@@ -105,11 +130,11 @@ def decoder_numbers(arm: dict[str, Any]) -> dict[str, Any]:
             "sanitizable": rate(block.get("sanitizable")),
             "uniqueness": rate(block.get("uniqueness")),
             "novelty_vs_train": rate(block.get("novelty_vs_train")),
-            "nuv": float(block.get("nuv")) if block.get("nuv") is not None else float("nan"),
+            "nuv": number(block.get("nuv")),
             "fallback_rate": rate(block.get("fallback_rate")),
-            "internal_diversity": float((block.get("diversity") or {}).get(
-                "internal_diversity", float("nan"))),
-            "qed_mean": float((block.get("qed") or {}).get("mean", float("nan"))),
+            "internal_diversity": number((block.get("diversity") or {}).get(
+                "internal_diversity")),
+            "qed_mean": number((block.get("qed") or {}).get("mean")),
             "qed_at_least_0p7": rate(block.get("qed_at_least_0p7")),
         }
     # Fractions that only the per-sample records can give.
@@ -150,16 +175,16 @@ def load_references(paths: list[Path]) -> dict[str, dict[str, float]]:
                 continue
             label = wanted[name]
             references.setdefault(label, {
-                "qed_mean": float(profile["qed"]["mean"]),
-                "qed_at_least_0p7": float(profile["qed_at_least_0p7"]),
-                "aromatic_rings_mean": float(profile["aromatic_rings"]["mean"]),
-                "aromatic_ring_fraction": float(profile.get("aromatic_ring_fraction", float("nan"))),
+                "qed_mean": number((profile.get("qed") or {}).get("mean")),
+                "qed_at_least_0p7": number(profile.get("qed_at_least_0p7")),
+                "aromatic_rings_mean": number((profile.get("aromatic_rings") or {}).get("mean")),
+                "aromatic_ring_fraction": number(profile.get("aromatic_ring_fraction")),
                 "source": str(path),
             })
         if "degree_fallback_rate" in str(payload):
             for name, profile in profiles.items():
                 if name in wanted and "degree_fallback_rate" in profile:
-                    references[wanted[name]]["degree_fallback_rate"] = float(
+                    references[wanted[name]]["degree_fallback_rate"] = number(
                         profile["degree_fallback_rate"])
     return references
 
@@ -185,7 +210,8 @@ def comparison_figure(arms: list[dict[str, Any]], numbers: list[dict[str, Any]],
         bars = axis.bar(positions + offset, values, width, label=f"Arm {arm['label']}",
                         color=ARM_COLOURS[arm["label"]])
         for bar, value in zip(bars, values):
-            axis.annotate(f"{value:.3f}", (bar.get_x() + bar.get_width() / 2, value),
+            axis.annotate(show(value, "{:.3f}"),
+                          (bar.get_x() + bar.get_width() / 2, 0.0 if undefined(value) else value),
                           textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
     axis.set_xticks(positions)
     axis.set_xticklabels([DECODER_LABELS[d] for d in present], fontsize=8)
@@ -200,19 +226,23 @@ def comparison_figure(arms: list[dict[str, Any]], numbers: list[dict[str, Any]],
     labels = [f"Arm {a['label']}" for a in arms]
     values = [n[n["headline_decoder"]]["qed_mean"] for n in numbers]
     bars = axis.bar(labels, values, color=[ARM_COLOURS[a["label"]] for a in arms], width=0.5)
-    for bar, value, number in zip(bars, values, numbers):
-        fraction = number[number["headline_decoder"]]["qed_at_least_0p7"]
-        axis.annotate(f"{value:.3f}\nQED>=0.7: {fraction:.1%}",
-                      (bar.get_x() + bar.get_width() / 2, value), textcoords="offset points",
-                      xytext=(0, 4), ha="center", fontsize=8)
+    for bar, value, entry in zip(bars, values, numbers):
+        fraction = entry[entry["headline_decoder"]]["qed_at_least_0p7"]
+        axis.annotate(f"{show(value, '{:.3f}')}\nQED>=0.7: {show(fraction, '{:.1%}')}",
+                      (bar.get_x() + bar.get_width() / 2, 0.0 if undefined(value) else value),
+                      textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
+    drawn_reference = False
     for style, (label, reference) in zip(("--", ":"), sorted(references.items())):
+        if undefined(reference.get("qed_mean")):
+            continue
         axis.axhline(reference["qed_mean"], linestyle=style, color="black", linewidth=1,
                      label=f"{label}: {reference['qed_mean']:.3f} "
-                           f"(QED>=0.7 {reference['qed_at_least_0p7']:.1%})")
+                           f"(QED>=0.7 {show(reference.get('qed_at_least_0p7'), '{:.1%}')})")
+        drawn_reference = True
     axis.set_ylabel("mean QED of valid molecules")
     axis.set_title("B. Drug-likeness (headline decoder)", fontsize=10)
     axis.set_ylim(0, 1.0)
-    if references:
+    if drawn_reference:
         axis.legend(fontsize=7, loc="upper left")
     axis.grid(axis="y", alpha=0.3)
 
@@ -220,18 +250,19 @@ def comparison_figure(arms: list[dict[str, Any]], numbers: list[dict[str, Any]],
     axis = axes[1][0]
     values = [n[n["headline_decoder"]].get("fallback_rate", float("nan")) for n in numbers]
     bars = axis.bar(labels, values, color=[ARM_COLOURS[a["label"]] for a in arms], width=0.5)
-    for bar, value, number in zip(bars, values, numbers):
-        head = number[number["headline_decoder"]]
+    for bar, value, entry in zip(bars, values, numbers):
+        head = entry[entry["headline_decoder"]]
         extra = ""
-        if not np.isnan(head.get("validity_among_solved", float("nan"))):
+        if not undefined(head.get("validity_among_solved")):
             extra = f"\nvalidity when solved: {head['validity_among_solved']:.3f}"
-        axis.annotate(f"{value:.3f}{extra}", (bar.get_x() + bar.get_width() / 2, value),
+        axis.annotate(f"{show(value, '{:.3f}')}{extra}",
+                      (bar.get_x() + bar.get_width() / 2, 0.0 if undefined(value) else value),
                       textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
     for style, (label, reference) in zip(("--", ":"), sorted(references.items())):
-        if "degree_fallback_rate" in reference:
+        if not undefined(reference.get("degree_fallback_rate")):
             axis.axhline(reference["degree_fallback_rate"], linestyle=style, color="black",
                          linewidth=1, label=f"{label}: {reference['degree_fallback_rate']:.3f}")
-            axis.legend(fontsize=7)
+            axis.legend(fontsize=7, loc="upper right")
     axis.set_ylabel("fraction of samples falling back to greedy")
     axis.set_title("C. Degree-constrained program infeasible (lower is better)", fontsize=10)
     axis.set_ylim(0, 1.05)
@@ -249,9 +280,9 @@ def comparison_figure(arms: list[dict[str, Any]], numbers: list[dict[str, Any]],
         bars = axis.bar(positions + offset, values, width, label=f"Arm {arm['label']}",
                         color=ARM_COLOURS[arm["label"]])
         for bar, value in zip(bars, values):
-            if not np.isnan(value):
-                axis.annotate(f"{value:.3f}", (bar.get_x() + bar.get_width() / 2, value),
-                              textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
+            axis.annotate(show(value, "{:.3f}"),
+                          (bar.get_x() + bar.get_width() / 2, 0.0 if undefined(value) else value),
+                          textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
     axis.set_xticks(positions)
     axis.set_xticklabels([label for _, label in keys], fontsize=8)
     axis.set_ylabel("fraction")
@@ -357,14 +388,10 @@ def results_summary(arms, numbers, references, *, subtitle: str, chosen_count: i
     labels = [a["label"] for a in arms]
 
     def row(name: str, key: str, template: str = "{:.4f}") -> str:
-        values = []
-        for number in numbers:
-            value = number[number["headline_decoder"]].get(key, float("nan"))
-            values.append("n/a" if value is None or (isinstance(value, float) and np.isnan(value))
-                          else template.format(value))
+        values = [show(entry[entry["headline_decoder"]].get(key), template) for entry in numbers]
         reference = ""
         for label, block in sorted(references.items()):
-            if key in block and not np.isnan(block[key]):
+            if key in block and not undefined(block[key]):
                 reference = f"{block[key]:.4f} ({label})"
                 break
         return f"| {name} | {values[0]} | {values[1]} | {reference or '—'} |"
@@ -386,17 +413,23 @@ def results_summary(arms, numbers, references, *, subtitle: str, chosen_count: i
         "",
         "## Validity: three different quantities",
         "",
-        "| Decoder | Arm A | Arm B | What it measures |",
-        "|---|---:|---:|---|",
+        "Uniqueness is shown beside each validity because it divides by the number of valid "
+        "molecules: a decoder that produced none has an **undefined** uniqueness (N/A), not a "
+        "uniqueness of zero.",
+        "",
+        "| Decoder | Validity A | Validity B | Uniqueness A | Uniqueness B | What it measures |",
+        "|---|---:|---:|---:|---:|---|",
     ]
     for name in DECODERS:
         if not all(name in n for n in numbers):
             continue
-        values = [f"{n[name]['strict_validity']:.4f}" for n in numbers]
+        values = [show(n[name]["strict_validity"]) for n in numbers]
+        unique = [show(n[name].get("uniqueness")) for n in numbers]
         meaning = {"raw": "argmax bond matrix, no chemistry applied",
                    "constrained": "greedy valence-aware assembly with a connectivity pass",
                    "degree": "degree-constrained integer program, greedy fallback when infeasible"}
-        lines.append(f"| {name} | {values[0]} | {values[1]} | {meaning[name]} |")
+        lines.append(f"| {name} | {values[0]} | {values[1]} | {unique[0]} | {unique[1]} | "
+                     f"{meaning[name]} |")
     lines += [
         "",
         "**Raw validity is the only one that reflects the model's own bond predictions.** The "
@@ -434,7 +467,11 @@ def results_summary(arms, numbers, references, *, subtitle: str, chosen_count: i
         ("internal diversity", delta("internal_diversity")),
     ]
     for name, value in improvements:
-        if np.isnan(value):
+        if undefined(value):
+            # Undefined is reported, not silently dropped: a metric that divides by the
+            # number of valid molecules has no value when an arm produced none.
+            lines.append(f"- **{name}**: N/A (undefined for at least one arm, e.g. no "
+                         f"valid molecules to divide by).")
             continue
         direction = "better" if (value > 0) != name.endswith("(negative is better)") else "worse"
         lines.append(f"- **{name}**: {value:+.4f} for Arm B ({direction}).")
@@ -451,14 +488,30 @@ def results_summary(arms, numbers, references, *, subtitle: str, chosen_count: i
         "atom order and is no longer exchangeable. Decoding is order-agnostic, so this does "
         "not affect the molecules, but the density is not a set density.",
     ]
+    undefined_metrics = sorted(
+        key for key in ("uniqueness", "novelty_vs_train", "internal_diversity", "qed_mean",
+                        "qed_at_least_0p7", "nuv")
+        if undefined(head_a.get(key)) or undefined(head_b.get(key)))
+    if undefined_metrics:
+        lines.append("- Shown as **N/A** because they are undefined for at least one arm "
+                     "(their denominator is the number of valid molecules, which was zero): "
+                     + ", ".join(undefined_metrics) + ".")
+    for name in DECODERS:
+        for entry, label in zip(numbers, labels):
+            if name in entry and undefined(entry[name].get("uniqueness")) \
+                    and not undefined(entry[name].get("strict_validity")) \
+                    and entry[name]["strict_validity"] == 0.0:
+                lines.append(f"- {label}'s **{name}** decoder produced no valid molecule at all, "
+                             f"so its uniqueness, novelty and diversity are undefined rather "
+                             f"than zero.")
     fallback = head_b.get("fallback_rate", float("nan"))
-    if not np.isnan(fallback) and fallback > 0.25:
+    if not undefined(fallback) and fallback > 0.25:
         lines.append(f"- Arm B's degree-constrained program is still infeasible for "
                      f"{fallback:.1%} of samples, so a large share of its reported validity "
                      f"comes from the greedy fallback rather than from the predicted degrees.")
     qed_fraction = head_b.get("qed_at_least_0p7", float("nan"))
     target = next((block["qed_at_least_0p7"] for block in references.values()), float("nan"))
-    if not np.isnan(qed_fraction) and not np.isnan(target):
+    if not undefined(qed_fraction) and not undefined(target):
         lines.append(f"- The fraction above QED 0.7 is {qed_fraction:.1%} against {target:.1%} in "
                      f"real validation data, so drug-likeness is not yet matched.")
     lines += [
