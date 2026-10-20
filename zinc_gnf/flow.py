@@ -634,6 +634,75 @@ class NodePrior(nn.Module):
         else:
             self.mu = nn.Parameter(torch.zeros(dim))
             self.pre_sigma = nn.Parameter(torch.full((dim,), pre_sigma))
+        # Post-hoc calibration (see `zinc_gnf/latent_calibration.py`). When set, the
+        # effective prior becomes N(calibration_mean, calibration_std^2) per dimension:
+        # the maximum-likelihood diagonal Gaussian for the latents the TRAINED flow
+        # actually produces on training data. Both `log_prob` and `sample` read it, so
+        # the model stays a valid normalized density and the training objective it is
+        # scored by is the same one that is sampled from.
+        self.register_buffer("calibration_mean", torch.zeros(dim))
+        self.register_buffer("calibration_std", torch.ones(dim))
+        self.register_buffer("calibrated", torch.zeros((), dtype=torch.bool))
+
+    # -- calibration ---------------------------------------------------
+    @property
+    def is_calibrated(self) -> bool:
+        return bool(self.calibrated)
+
+    def set_calibration(self, mean: torch.Tensor, std: torch.Tensor, *,
+                        std_floor: float = 1e-3) -> int:
+        """Replace the effective prior by N(mean, std^2). Returns floored dimensions.
+
+        Refused for a conditional prior: overriding mu(c), sigma(c) with one constant
+        pair would throw the conditioning away. A conditional flow needs a
+        condition-resolved calibration, which is deliberately not implemented here.
+        """
+        if self.conditional:
+            raise NotImplementedError(
+                "calibration is implemented for the unconditional prior only; a conditional "
+                "prior would need per-condition statistics")
+        mean = torch.as_tensor(mean, dtype=self.calibration_mean.dtype).reshape(-1)
+        std = torch.as_tensor(std, dtype=self.calibration_std.dtype).reshape(-1)
+        if mean.shape != self.calibration_mean.shape or std.shape != self.calibration_std.shape:
+            raise ValueError("calibration mean and std must have shape [dim]")
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError("calibration statistics must be finite")
+        if (std < 0).any():
+            raise ValueError("calibration std must be non-negative")
+        if std_floor <= 0:
+            raise ValueError("std_floor must be positive")
+        floored = int((std < std_floor).sum())
+        self.calibration_mean.copy_(mean.to(self.calibration_mean.device))
+        self.calibration_std.copy_(std.clamp(min=float(std_floor)).to(self.calibration_std.device))
+        self.calibrated.fill_(True)
+        return floored
+
+    def clear_calibration(self) -> None:
+        self.calibration_mean.zero_()
+        self.calibration_std.fill_(1.0)
+        self.calibrated.fill_(False)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Tolerate checkpoints written before calibration existed.
+
+        A missing calibration buffer means "not calibrated", which is exactly the
+        default, so the three keys are filled in rather than reported as missing. Every
+        other key is still loaded strictly.
+        """
+        patched = dict(state_dict)
+        defaults = {
+            "calibration_mean": torch.zeros_like(self.calibration_mean),
+            "calibration_std": torch.ones_like(self.calibration_std),
+            "calibrated": torch.zeros_like(self.calibrated),
+        }
+        for name, default in defaults.items():
+            # The DEFAULT, not the current value: loading a pre-calibration checkpoint
+            # into a calibrated module must leave it uncalibrated, exactly as the
+            # checkpoint describes.
+            patched.setdefault(prefix + name, default)
+        super()._load_from_state_dict(patched, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def parameters_for(self, batch_size: int, condition: torch.Tensor | None,
                        device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -643,9 +712,22 @@ class NodePrior(nn.Module):
             hidden = F.relu(self.hidden(condition))
             mu, pre_sigma = self.mu_head(hidden), self.sigma_head(hidden)
         else:
+            if bool(self.calibrated):
+                mu = self.calibration_mean.unsqueeze(0).expand(batch_size, -1)
+                return mu, self.calibration_std.unsqueeze(0).expand(batch_size, -1)
             mu = self.mu.unsqueeze(0).expand(batch_size, -1)
             pre_sigma = self.pre_sigma.unsqueeze(0).expand(batch_size, -1)
         return mu, F.softplus(pre_sigma) + self.min_sigma
+
+    def trained_parameters_for(self, batch_size: int, condition: torch.Tensor | None,
+                               device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
+        """The parameters training produced, ignoring any calibration."""
+        was = bool(self.calibrated)
+        self.calibrated.fill_(False)
+        try:
+            return self.parameters_for(batch_size, condition, device)
+        finally:
+            self.calibrated.fill_(was)
 
     def log_prob(self, z: torch.Tensor, mask: torch.Tensor,
                  condition: torch.Tensor | None) -> torch.Tensor:

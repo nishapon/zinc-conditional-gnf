@@ -306,3 +306,75 @@ the ~0.98 quoted in an earlier discussion.
 Decision rule: Arm B wins only if P(no bond), aromatic rings and the QED >= 0.7 fraction
 all improve materially at equal step count. A better NLL alone does not count. If Arm A
 also clears the gates, the architecture was adequate and only training time was missing.
+
+---
+
+## Stage 10 — latent recalibration of a trained flow (new)
+
+**What it fixes.** A flow is sampled from its prior, but training only *pushes* the
+latents towards that prior; nothing guarantees they got there. If `z = f(x)` is wider
+(or narrower, or off-centre) than the prior per dimension, every sample starts in the
+wrong region of latent space, `f^-1` is evaluated where it was never fitted, and the
+decoded graphs degrade even though the flow itself is fine.
+
+This is not speculation about our pipeline being affected — it is a *measured* failure
+in the team's QM9 work (`molecular_generation/inspect_latent_calibration.py`,
+`latent_stats.py` in the teammates' repository): the learned `sigma(N)` underestimated
+the empirical latent spread by about **1.5x**, and widening sigma at sampling time
+alone recovered uniqueness at N=5. The team's ZINC conditional run compensated the
+same way, with sampling temperature **0.2**. Stage 10 measures the ZINC analogue of
+that diagnostic for our own checkpoints and, instead of a sampling hack, folds it into
+the model.
+
+**Why it is a modelling improvement, not postprocessing.** For a diagonal Gaussian
+prior family the maximum-likelihood parameters of the observed latents are exactly
+their empirical per-dimension mean and std, and the trained prior is a member of that
+family. So on the measurement data the calibrated model's likelihood is **>=** the
+trained model's, with equality precisely when the flow was already calibrated — a
+no-op for a converged flow. `NodePrior.set_calibration` is read by **both** `log_prob`
+and `sample`, so the model stays a normalised density that can be scored; a
+generation-time `sigma_scale` would not be. It costs no retraining and applies to the
+checkpoints we already have, including Arm B's paused 10,000-step one.
+
+**What it cannot do.** It matches per-dimension location and spread only. It does not
+teach the flow inter-node dependence (the shuffled-node control's finding), and it
+cannot fix heavy latent tails — the report prints the kurtosis so that is visible. On
+the teammates' own ZINC run, calibration plus `T=0.2` still left atom composition and
+aromaticity unmatched, so expect validity/QED to move before aromaticity does.
+**A gain of 0.0 is a legitimate, informative outcome**: it rules the prior mismatch
+out as a cause and points back at the coupling architecture or the training budget.
+
+### Run order
+
+```
+cd ~/zinc-conditional-gnf && git pull origin rewrite/zinc250k-pipeline
+
+# 1. measure + write a calibrated copy of arm B's paused checkpoint (CPU, minutes)
+sbatch --export=ALL,FLOW_CHECKPOINT=outputs/checkpoints/flow_uncond_ar/seed_1/last.pt \
+       slurm/10_calibrate_flow.sh
+#    -> outputs/checkpoints/flow_uncond_ar/seed_1/last_calibrated.pt
+#       outputs/checkpoints/flow_uncond_ar/seed_1/calibration.{json,txt}
+#    read calibration.txt FIRST: zscore_rms is the headline (1.0 = already calibrated)
+
+# 2. sample the calibrated checkpoint over a temperature sweep incl. the team's T=0.2
+sbatch --export=ALL,ARM=b,CHECKPOINT_NAME=last_calibrated.pt,COUNT=2000,TEMPERATURES=0.2,0.5,0.7,0.85,1.0,SAMPLES_ROOT=outputs/samples/flow_uncond_ar_calibrated \
+       slurm/05_generate_uncond.sh
+
+# 3. the SAME sweep on the UNCALIBRATED checkpoint, so temperature and calibration
+#    are not confounded (the existing 10k samples are T=0.85 only)
+sbatch --export=ALL,ARM=b,CHECKPOINT_NAME=last.pt,COUNT=2000,TEMPERATURES=0.2,0.5,0.7,0.85,1.0,SAMPLES_ROOT=outputs/samples/flow_uncond_ar_pause_sweep \
+       slurm/05_generate_uncond.sh
+
+# 4. in parallel on the GPU: finish arm B's remaining 40,000 steps, since the 10k
+#    numbers may simply be an under-trained flow
+sbatch --export=ALL,ARM=b slurm/04_flow_uncond_gpu.sh
+```
+
+Step 3 is what makes the comparison honest: calibration and temperature both change the
+latent spread, so the calibrated run must be read against an uncalibrated run at the
+same temperatures, at the same step, from the same checkpoint, with the same decoders.
+
+Compare against the recorded Arm B baseline (10,000 steps, `T=0.85`, 2,000 samples):
+mean QED 0.4192, aromatic rings/molecule 0.3891, raw strict validity 1.55%,
+degree-decoded validity 98.95%, decoder fallback 64.8%, internal diversity 0.9104.
+The gates in the table above are unchanged — calibration has to clear the same bar.
