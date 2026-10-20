@@ -47,146 +47,31 @@ import matplotlib
 matplotlib.use("Agg")                                        # headless cluster node
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from rdkit import Chem, rdBase  # noqa: E402
-from rdkit.Chem import QED  # noqa: E402
-from rdkit.Chem.Draw import rdMolDraw2D  # noqa: E402
 
-from zinc_gnf.molecular_profile import profile_molecules  # noqa: E402
+from zinc_gnf.generation_report import (  # noqa: E402
+    DECODER_LABELS,
+    DECODER_MEANING,
+    DECODERS,
+    choose_molecules,
+    decoder_numbers,
+    load_references,
+    load_run,
+    molecule_grid,
+    number,
+    rate,
+    resolve,
+    show,
+    undefined,
+)
 from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 
-DECODERS = ("raw", "constrained", "degree")
-DECODER_LABELS = {"raw": "raw\n(argmax, no chemistry)",
-                  "constrained": "greedy\nvalence-aware",
-                  "degree": "degree-constrained\n(+ greedy fallback)"}
 ARM_COLOURS = {"A": "#4C72B0", "B": "#DD8452"}
 GRID_MOLECULES = 12
 
 
-def resolve(path: Path) -> Path:
-    """Accept either a metrics.json or the directory containing it."""
-    if path.is_dir():
-        return path / "metrics.json"
-    return path
-
-
 def load_arm(path: Path, label: str) -> dict[str, Any]:
-    metrics_path = resolve(path)
-    if not metrics_path.exists():
-        raise FileNotFoundError(f"arm {label}: {metrics_path} not found")
-    metrics = json.loads(metrics_path.read_text())
-    samples_path = metrics_path.parent / "samples.jsonl"
-    records: list[dict[str, Any]] = []
-    if samples_path.exists():
-        with samples_path.open(encoding="utf-8") as handle:
-            records = [json.loads(line) for line in handle if line.strip()]
-    return {"label": label, "metrics": metrics, "records": records,
-            "metrics_path": str(metrics_path),
-            "samples_path": str(samples_path) if records else None}
-
-
-def number(value: Any) -> float:
-    """Coerce to float, mapping missing / null / non-numeric to NaN.
-
-    A metric can be genuinely UNDEFINED rather than zero: uniqueness divides by the
-    number of valid molecules, so an arm with no raw-valid samples stores
-    `"uniqueness": {"value": null}`. Such a metric must stay undefined all the way to
-    the figure and the summary, where it is shown as N/A - never as 0 or 1.
-    """
-    if value is None:
-        return float("nan")
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def rate(block: Any) -> float:
-    """metrics.json stores rates either bare or as {'value': ...}, possibly null."""
-    if isinstance(block, dict):
-        return number(block.get("value"))
-    return number(block)
-
-
-def undefined(value: Any) -> bool:
-    return value is None or (isinstance(value, float) and np.isnan(value))
-
-
-def show(value: Any, template: str = "{:.4f}", missing: str = "N/A") -> str:
-    """Format a metric for display, as N/A when it is undefined."""
-    return missing if undefined(value) else template.format(float(value))
-
-
-def decoder_numbers(arm: dict[str, Any]) -> dict[str, Any]:
-    decoders = arm["metrics"].get("decoders", {})
-    headline = arm["metrics"].get("headline_decoder", "degree")
-    numbers: dict[str, Any] = {"headline_decoder": headline,
-                               "samples": arm["metrics"].get("samples")}
-    for name in DECODERS:
-        block = decoders.get(name)
-        if block is None:
-            continue
-        numbers[name] = {
-            "strict_validity": rate(block.get("strict_validity")),
-            "sanitizable": rate(block.get("sanitizable")),
-            "uniqueness": rate(block.get("uniqueness")),
-            "novelty_vs_train": rate(block.get("novelty_vs_train")),
-            "nuv": number(block.get("nuv")),
-            "fallback_rate": rate(block.get("fallback_rate")),
-            "internal_diversity": number((block.get("diversity") or {}).get(
-                "internal_diversity")),
-            "qed_mean": number((block.get("qed") or {}).get("mean")),
-            "qed_at_least_0p7": rate(block.get("qed_at_least_0p7")),
-        }
-    # Fractions that only the per-sample records can give.
-    head = numbers.get(headline)
-    if head is not None and arm["records"]:
-        entries = [r[headline] for r in arm["records"] if headline in r]
-        solved = [e for e in entries if not e.get("fallback")]
-        head["samples_solved_by_program"] = len(solved) / len(entries) if entries else float("nan")
-        head["validity_among_solved"] = (
-            sum(1 for e in solved if e.get("valid")) / len(solved) if solved else float("nan"))
-        head["validity_among_fallback"] = (
-            sum(1 for e in entries if e.get("fallback") and e.get("valid"))
-            / max(1, len(entries) - len(solved)) if len(entries) - len(solved) else float("nan"))
-        smiles = [e.get("smiles") if e.get("valid") else None for e in entries]
-        profile = profile_molecules(smiles, name=arm["label"], scaffolds=True)
-        head["aromatic_rings_mean"] = profile["aromatic_rings"]["mean"]
-        head["rings_mean"] = profile["rings"]["mean"]
-        head["aromatic_ring_fraction"] = profile["aromatic_ring_fraction"]
-        head["qed_mean_recomputed"] = profile["qed"]["mean"]
-        head["qed_at_least_0p7_recomputed"] = profile["qed_at_least_0p7"]
-        head["distinct_scaffolds_per_molecule"] = (profile.get("scaffolds") or {}).get(
-            "per_molecule", float("nan"))
-    return numbers
-
-
-def load_references(paths: list[Path]) -> dict[str, dict[str, float]]:
-    """Real / reconstruction reference values from earlier diagnostic outputs."""
-    wanted = {"real_validation": "real ZINC250K (validation)", "real": "real ZINC250K (validation)",
-              "ae_reconstruction": "frozen-AE reconstruction"}
-    references: dict[str, dict[str, float]] = {}
-    for path in paths:
-        if not path.exists():
-            raise FileNotFoundError(f"reference not found: {path}")
-        payload = json.loads(path.read_text())
-        profiles = (payload.get("profiles") or {}).get("profiles") or {}
-        for name, profile in profiles.items():
-            if name not in wanted:
-                continue
-            label = wanted[name]
-            references.setdefault(label, {
-                "qed_mean": number((profile.get("qed") or {}).get("mean")),
-                "qed_at_least_0p7": number(profile.get("qed_at_least_0p7")),
-                "aromatic_rings_mean": number((profile.get("aromatic_rings") or {}).get("mean")),
-                "aromatic_ring_fraction": number(profile.get("aromatic_ring_fraction")),
-                "source": str(path),
-            })
-        if "degree_fallback_rate" in str(payload):
-            for name, profile in profiles.items():
-                if name in wanted and "degree_fallback_rate" in profile:
-                    references[wanted[name]]["degree_fallback_rate"] = number(
-                        profile["degree_fallback_rate"])
-    return references
+    """Backwards-compatible name for `load_run` (one arm of the comparison)."""
+    return load_run(path, label)
 
 
 # ---------------------------------------------------------------------------
@@ -302,81 +187,8 @@ def comparison_figure(arms: list[dict[str, Any]], numbers: list[dict[str, Any]],
     plt.close(figure)
 
 
-# ---------------------------------------------------------------------------
-# Figure 2: the molecule grid.
-# ---------------------------------------------------------------------------
-def choose_molecules(records: list[dict[str, Any]], decoder: str, *, count: int,
-                     mode: str) -> list[tuple[str, float]]:
-    """Unique valid molecules with their QED, chosen by a stated, deterministic rule."""
-    seen: dict[str, float] = {}
-    for record in records:
-        entry = record.get(decoder) or {}
-        smiles = entry.get("smiles")
-        if not entry.get("valid") or not smiles or smiles in seen:
-            continue
-        value = entry.get("qed")
-        if value is None:
-            with rdBase.BlockLogs():
-                molecule = Chem.MolFromSmiles(smiles)
-            if molecule is None:
-                continue
-            value = float(QED.qed(molecule))
-        seen[smiles] = float(value)
-    ordered = sorted(seen.items(), key=lambda item: item[1])
-    if not ordered:
-        return []
-    if mode == "best":
-        return list(reversed(ordered[-count:]))
-    if mode == "random":
-        generator = np.random.default_rng(0)
-        picked = generator.choice(len(ordered), size=min(count, len(ordered)), replace=False)
-        return [ordered[int(i)] for i in sorted(picked)]
-    # "spread": evenly spaced across the QED range, so the grid is not cherry-picked
-    indices = np.unique(np.linspace(0, len(ordered) - 1, num=min(count, len(ordered))).round()
-                        .astype(int))
-    return [ordered[int(i)] for i in indices]
-
-
-def molecule_grid(chosen: list[tuple[str, float]], *, output: Path, arm: str, mode: str,
-                  total_unique: int, columns: int = 4) -> None:
-    molecules, legends = [], []
-    for smiles, value in chosen:
-        with rdBase.BlockLogs():
-            molecule = Chem.MolFromSmiles(smiles)
-        if molecule is None:
-            continue
-        molecules.append(molecule)
-        legends.append(f"QED {value:.3f}")
-    if not molecules:
-        raise ValueError("no valid molecules to draw")
-    rows = int(np.ceil(len(molecules) / columns))
-    panel = 300
-    description = {"spread": "evenly spaced across the QED range (not cherry-picked)",
-                   "best": "the highest-QED molecules",
-                   "random": "a seeded random sample"}[mode]
-    for drawer, suffix in ((rdMolDraw2D.MolDraw2DCairo, ".png"),
-                           (rdMolDraw2D.MolDraw2DSVG, ".svg")):
-        # The four-argument form sets the PANEL size, which is what tiles the molecules;
-        # with only the canvas size RDKit draws every molecule over the whole canvas.
-        canvas = drawer(columns * panel, rows * panel, panel, panel)
-        options = canvas.drawOptions()
-        options.legendFontSize = 20
-        try:
-            canvas.DrawMolecules(molecules, legends=legends)
-        except Exception:  # noqa: BLE001 - Cairo may be unavailable on a bare node
-            if suffix == ".png":
-                continue
-            raise
-        canvas.FinishDrawing()
-        text = canvas.GetDrawingText()
-        path = output.with_suffix(suffix)
-        if isinstance(text, bytes):
-            path.write_bytes(text)
-        else:
-            path.write_text(text, encoding="utf-8")
-    caption = (f"Arm {arm}: {len(molecules)} of {total_unique} unique valid molecules, "
-               f"{description}. Decoder: degree-constrained assembly.")
-    output.with_name(output.name + "_caption.txt").write_text(caption + "\n", encoding="utf-8")
+# Figure 2 (the molecule grid) and the file readers live in
+# `zinc_gnf/generation_report.py`, shared with stage 11.
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +397,9 @@ def main(argv: list[str] | None = None) -> int:
                                 if (r.get(decoder) or {}).get("valid")
                                 and r[decoder].get("smiles")})
             if chosen:
-                molecule_grid(chosen, output=output_directory / "arm_b_molecules", arm="B",
-                              mode=arguments.select, total_unique=unique_total)
+                molecule_grid(chosen, output=output_directory / "arm_b_molecules",
+                              subject="Arm B", mode=arguments.select,
+                              total_unique=unique_total)
             else:
                 print("WARNING: Arm B produced no valid molecules, so no grid was drawn",
                       file=sys.stderr, flush=True)
