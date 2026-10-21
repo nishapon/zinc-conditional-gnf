@@ -115,6 +115,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--freeze-backbone", action="store_true",
+                        help="stage A of the warm start: train ONLY the conditional adapters "
+                             "(FiLM, the condition embedding and the prior heads) and leave "
+                             "the pretrained generative backbone untouched")
     parser.add_argument("--resume", default="auto")
     parser.add_argument("--allow-ae-mismatch", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -192,7 +196,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - one training loo
                     "longer pure maximum likelihood. Both terms and the validation NLL are "
                     "logged every evaluation, so the likelihood cost is visible.")
 
-        optimiser = torch.optim.Adam(flow.parameters(), lr=arguments.learning_rate)
+        parameter_split = None
+        if arguments.freeze_backbone:
+            from zinc_gnf.warm_start import freeze_backbone
+
+            parameter_split = freeze_backbone(flow)
+            logger.info(f"BACKBONE FROZEN: training {parameter_split['trainable_parameters']:,} "
+                        f"adapter parameters "
+                        f"({parameter_split['trainable_fraction'] * 100:.2f}% of the model), "
+                        f"{parameter_split['frozen_parameters']:,} frozen. The pretrained "
+                        f"cross-node structure cannot be overwritten by this run.")
+        trainable = [p for p in flow.parameters() if p.requires_grad]
+        optimiser = torch.optim.Adam(trainable, lr=arguments.learning_rate)
         batcher = DeterministicBatcher(len(train_set), arguments.batch_size, arguments.seed)
         noise_generator = torch.Generator(device=device).manual_seed(arguments.seed * 7919 + 13)
         sample_generator = torch.Generator(device=device).manual_seed(arguments.seed * 104729 + 7)
@@ -232,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - one training loo
 
         atomic_write_json({
             "arm": arm, "lambda_structure": arguments.lambda_structure,
+            "freeze_backbone": bool(arguments.freeze_backbone),
+            "parameter_split": parameter_split,
+            "warm_start": probe.get("warm_start"),
             "source_checkpoint": str(source), "source_sha256": file_sha256(source),
             "source_step": probe.get("step"),
             "flow_config": flow.config.to_dict(),
@@ -291,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - one training loo
                 logger.error(f"non-finite loss at step {step + 1}; last state saved")
                 return 5
             if arguments.grad_clip_norm:
-                torch.nn.utils.clip_grad_norm_(flow.parameters(), arguments.grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(trainable, arguments.grad_clip_norm)
             optimiser.step()
             step += 1
             window.append({"loss": float(loss.detach()), "nll": float(nll.detach()),
