@@ -169,7 +169,8 @@ def condition_sensitivity(flow: NodeFlow, autoencoder, dataset: MolecularGraphDa
                           device: torch.device | str = "cpu",
                           batch_size: int = 128,
                           noise_seed: int = 777,
-                          shuffle_seed: int = CONDITION_SHUFFLE_SEED) -> dict[str, Any]:
+                          shuffle_seed: int = CONDITION_SHUFFLE_SEED,
+                          permute_features: Sequence[str] | None = None) -> dict[str, Any]:
     """Likelihood with the TRUE conditions vs with the conditions permuted across molecules.
 
     Identical molecules, identical smoothing noise, identical weights: the only difference
@@ -178,10 +179,26 @@ def condition_sensitivity(flow: NodeFlow, autoencoder, dataset: MolecularGraphDa
     scores the two identically (gap 0) and a model that uses it is worse under the
     permutation (gap > 0). The gap is reported in nats per node, with the per-molecule
     win rate, which does not depend on a few outliers.
+
+    `permute_features` permutes only SOME features and leaves the rest correct. That is
+    what separates one condition from another in a joint model: permuting only QED, while
+    every molecule keeps its true N, isolates whether QED is used for something beyond
+    what N already explains. Permuting both cannot answer that, because N and QED are
+    correlated in ZINC. Default: permute every feature.
     """
     if not flow.config.conditional:
         raise ValueError("condition_sensitivity is only meaningful for a conditional flow")
     features = flow.config.condition_features
+    if permute_features is None:
+        permuted_positions = list(range(len(features)))
+    else:
+        unknown = [f for f in permute_features if f not in features]
+        if unknown:
+            raise ValueError(f"cannot permute {unknown}: this flow conditions on "
+                             f"{list(features)}")
+        if not list(permute_features):
+            raise ValueError("permute_features is empty; nothing would be permuted")
+        permuted_positions = [features.index(f) for f in permute_features]
     was_training = flow.training
     flow.eval()
     device = torch.device(device)
@@ -202,7 +219,10 @@ def condition_sensitivity(flow: NodeFlow, autoencoder, dataset: MolecularGraphDa
         # identity the "control" would be no control at all.
         if np.array_equal(order, np.arange(batch.batch_size)):
             order = np.roll(order, 1)
-        permuted = values[torch.as_tensor(order.copy(), device=values.device)]
+        permuted = values.clone()
+        index = torch.as_tensor(order.copy(), device=values.device)
+        for position in permuted_positions:
+            permuted[:, position] = values[index, position]
         counts = batch.node_mask.sum(-1).to(torch.float64)
         results = {}
         for name, condition_values in (("true", values), ("shuffled", permuted)):
@@ -228,6 +248,7 @@ def condition_sensitivity(flow: NodeFlow, autoencoder, dataset: MolecularGraphDa
         "molecules": molecules,
         "nodes": nodes,
         "features": list(features),
+        "permuted_features": [features[p] for p in permuted_positions],
         "nll_per_node_true": true_nll,
         "nll_per_node_shuffled": shuffled_nll,
         # > 0 means the true conditions explain the data better than permuted ones.

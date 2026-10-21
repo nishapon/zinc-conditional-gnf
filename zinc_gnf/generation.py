@@ -176,7 +176,15 @@ def decode_embeddings(autoencoder, embeddings: torch.Tensor, n_node: Sequence[in
             if name == "raw":
                 bonds = bond_predictions[index, :count, :count].copy()
                 np.fill_diagonal(bonds, 0)
-                bonds = np.minimum(bonds, bonds.T)      # a bond matrix must be symmetric
+                # The decoder's pair features are [h_i + h_j, |h_i - h_j|, h_i * h_j], every
+                # one symmetric in (i, j), so `bond_logits[i, j] == bond_logits[j, i]` already
+                # and this `minimum` is a no-op kept only as a guard. It is NOT a source of
+                # lost bonds: a `minimum` over asymmetric logits would delete a bond whenever
+                # either direction said "none", which was checked and is not what happens
+                # here. Raw validity is low because it demands that ALL ~N^2/2 pair decisions
+                # be right at once, not because of this line - see the decode ceiling in
+                # zinc_gnf/qed_evaluation.py for how strict that is even on real embeddings.
+                bonds = np.minimum(bonds, bonds.T)
                 info: dict[str, Any] = {}
             elif name == "constrained":
                 bonds, info = valence_aware_bond_decode_typed(atoms, probabilities)

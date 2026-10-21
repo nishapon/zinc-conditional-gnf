@@ -444,3 +444,81 @@ run is the one that must pass without `--allow-weak-conditioning`.
 Next milestone: joint **N + QED** conditioning (`condition_features: ["n", "qed"]` — the
 same code path, `--condition-features n,qed`), with explicit QED targets and
 target-achievement evaluation. The N-only model is the control it will be read against.
+
+---
+
+## Stage 13 — joint (N, QED) conditioning
+
+Same frozen autoencoder, split, Arm B architecture, `noise_sigma`, optimiser and budget as
+every earlier stage; `condition_features: ["n", "qed"]` and a new output directory are the
+only changes. QED is the per-molecule label the preprocessing already computed, standardised
+by the same **train-only** scaler, so this is conditional maximum likelihood — not
+optimisation against a QED oracle.
+
+### The control that matters
+
+**N and QED are correlated in ZINC.** A model that learned only N would still look
+conditional under a permutation of both features, and would even show a pooled
+requested-vs-realised QED correlation. So stage 13 reports three permutation controls and
+one derived number:
+
+| Control | What is permuted | Answers |
+|---|---|---|
+| `both` | N and QED | is the conditioning used at all? |
+| **`qed_only`** | QED, every molecule keeping its **true N** | **does QED do anything N cannot?** |
+| `n_only` | N, every molecule keeping its true QED | does N do anything QED cannot? |
+| `qed_independent_of_n` | — | requested-vs-realised QED correlation **within each N**, averaged |
+
+`scripts/13_generate_nqed.py` **exits 5** unless `both` and `qed_only` both clear their
+floors, and writes no achievement table in that state. There is also a test that disconnects
+the QED input of a trained checkpoint: it still satisfies every requested atom count, and
+the job must still refuse it.
+
+### QED target achievement
+
+Per requested (T, N, QED) cell, over the **valid** molecules (an invalid sample has no QED,
+and each cell reports its valid count): MAE, signed bias, RMSE, hit rate within ±0.1, and
+the realised QED distribution. Correlations and response slopes are computed **across**
+requested values — never within a cell, where the request is constant — per N and pooled.
+
+### On the quality problems (raw validity 0%, aromaticity 0, fallback 75–84%)
+
+I checked the three places a defect could hide, and did not open a long investigation:
+
+1. **Bond decoding — no defect.** The decoder's pair features are `[h_i+h_j, |h_i−h_j|,
+   h_i·h_j]`, all symmetric in *(i, j)*, so `bond_logits[i,j] == bond_logits[j,i]` and the
+   `minimum(B, Bᵀ)` symmetrisation in the raw decoder is a no-op, not a bond-deleting bias.
+   The diagonal is zeroed and non-finite embeddings are counted invalid rather than fed to
+   RDKit.
+2. **Atom/bond distributions — the decoder is calibrated on real embeddings.** Job 332841
+   measured P(no bond) = 0.9039 from real embeddings against a true bond density of ≈0.905,
+   with 1.83 aromatic rings and QED 0.7314. The flow's samples give P(no bond) = 0.994 —
+   too sparse. The predictions are fine; the sampled embeddings are not.
+3. **Raw validity is an all-or-nothing metric.** It requires every one of ~N²/2 pair
+   decisions to be simultaneously correct, so it collapses long before the chemistry does.
+   Stage 13 therefore measures the **decode ceiling**: the same raw/greedy/degree decoders
+   run on REAL validation embeddings. Generated raw validity is reported against that row,
+   never against 100%. If the raw ceiling is high, the gap is a modelling problem; if it is
+   low, raw validity is not a model metric at all. One row settles it.
+
+The one cheap lever left is **sampling temperature**: T = 0.2 was chosen for validity, and
+it concentrates samples near the prior mean, which is the obvious suspect for missing
+aromaticity. The smoke job therefore samples T = 0.2 **and** 0.85 in the same run so the
+validity-versus-aromaticity trade-off is visible, rather than assumed. Loss-level changes
+(rewarding pairwise bond correctness) would be a different objective and are deliberately
+not attempted here.
+
+### Run order
+
+```
+cd ~/zinc-conditional-gnf && git pull origin rewrite/zinc250k-pipeline
+
+sbatch slurm/13_flow_nqed_smoke_gpu.sh        # ~600 steps + controls + ceiling + grid
+sbatch slurm/13_flow_nqed_gpu.sh              # full resumable 50k run
+sbatch slurm/13_generate_nqed.sh              # full grid evaluation (CPU)
+sbatch --export=ALL,TEMPERATURES=0.2,0.5,0.85,COUNT=1000 slurm/13_generate_nqed.sh
+```
+
+Raw validity, degree-decoded validity, fallback rate and aromaticity are reported as
+separate columns in every table, and the report states in-line that the degree column
+includes greedy-fallback molecules while aromaticity is enforced by no decoder.
