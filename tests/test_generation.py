@@ -270,14 +270,19 @@ def test_temperature_changes_the_samples():
             [r["atom_types"] for r in hot["records"]])
 
 
-def test_conditional_sampling_is_refused_in_this_stage():
+def test_the_two_sampling_modes_never_mix():
+    """A condition is either required or rejected; it is never silently ignored.
+
+    Stage 12 added the conditional path, so a conditional flow now samples - but only
+    when it is GIVEN conditions, and an unconditional flow still refuses them.
+    """
     atoms, bonds = graph_of("CCO")
     stub = StubAutoencoder([(atoms, bonds)])
     sampler = NodeCountSampler([3])
-    with pytest.raises(ValueError, match="conditional"):
+    with pytest.raises(ValueError, match="condition_values is required"):
         generate_molecules(tiny_flow(condition_features=("n",)), stub, count=1,
                            node_counts=sampler, seed=0)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="unconditional"):
         generate_molecules(tiny_flow(), stub, count=1, node_counts=sampler, seed=0,
                            condition_values=torch.zeros(1, 1))
     with pytest.raises(ValueError):

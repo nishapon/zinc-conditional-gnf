@@ -87,6 +87,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="ARM B: add one node-autoregressive coupling per block")
     parser.add_argument("--num-blocks", type=int, default=None)
     parser.add_argument("--max-log-scale", type=float, default=None)
+    parser.add_argument("--condition-features", default=None,
+                        help="comma-separated subset of 'n,qed' (empty string = unconditional); "
+                             "overrides the config's condition_features")
     parser.add_argument("--resume", default="auto",
                         help="'auto' (resume last.pt if present), 'none', or a checkpoint path")
     return parser.parse_args(argv)
@@ -118,6 +121,10 @@ def build_configs(arguments: argparse.Namespace) -> tuple[FlowConfig, FlowTrainC
         value = getattr(arguments, name)
         if value is not None:
             flow_values[name] = value
+    if arguments.condition_features is not None:
+        # "" means unconditional on purpose, so the flag can also turn conditioning OFF.
+        flow_values["condition_features"] = [f.strip() for f in
+                                             arguments.condition_features.split(",") if f.strip()]
     return FlowConfig.from_dict(flow_values), FlowTrainConfig.from_dict(train_values)
 
 

@@ -197,21 +197,44 @@ def decode_embeddings(autoencoder, embeddings: torch.Tensor, n_node: Sequence[in
 def generate_molecules(flow: NodeFlow, autoencoder, *, count: int, node_counts: NodeCountSampler,
                        temperature: float = 1.0, seed: int = 0, batch_size: int = 128,
                        decoders: Iterable[str] = DECODERS,
-                       condition_values: torch.Generator | None = None,
+                       condition_values: torch.Tensor | np.ndarray | None = None,
+                       condition_present: torch.Tensor | np.ndarray | None = None,
                        target_n: int | None = None,
                        device: torch.device | str = "cpu") -> dict[str, Any]:
     """Sample `count` molecules. Returns `{"records": [...], "settings": {...}}`.
 
     `target_n` fixes every sample's size (used for size-controlled checks);
-    otherwise sizes are drawn from the training histogram. `condition_values`
-    is accepted for the later conditional models and must be None here.
+    otherwise sizes are drawn from the training histogram.
+
+    For a CONDITIONAL flow, `condition_values` is required and must be a
+    `[count, len(flow.config.condition_features)]` array of values standardised
+    with the SAME train-only scaler the model was trained with (build it with
+    `zinc_gnf.conditioning.standardise_condition`). The condition travels with
+    the sample through the whole batch loop, so a row is never paired with
+    another row's latent. An unconditional flow rejects condition values rather
+    than ignoring them.
     """
-    if condition_values is not None:
-        raise NotImplementedError("conditional sampling is not part of the unconditional stage")
     if flow.config.conditional:
-        raise ValueError("this flow is conditional; use the conditional generation path")
+        if condition_values is None:
+            raise ValueError("this flow is conditional; condition_values is required "
+                             "(use zinc_gnf.conditioning.standardise_condition)")
+    elif condition_values is not None:
+        raise ValueError("this flow is unconditional but condition values were given")
     if count < 1:
         raise ValueError("count must be >= 1")
+    width = len(flow.config.condition_features)
+    values = present = None
+    if flow.config.conditional:
+        values = torch.as_tensor(np.asarray(condition_values, dtype=np.float32))
+        if values.dim() != 2 or values.shape != (count, width):
+            raise ValueError(f"condition_values must be [{count}, {width}], "
+                             f"got {tuple(values.shape)}")
+        if not torch.isfinite(values).all():
+            raise ValueError("condition_values must be finite")
+        present = (torch.ones_like(values) if condition_present is None
+                   else torch.as_tensor(np.asarray(condition_present, dtype=np.float32)))
+        if present.shape != values.shape:
+            raise ValueError("condition_present must have the same shape as condition_values")
     flow.eval()
     rng = np.random.default_rng(int(seed))
     generator = torch.Generator(device=device).manual_seed(int(seed))
@@ -222,16 +245,26 @@ def generate_molecules(flow: NodeFlow, autoencoder, *, count: int, node_counts: 
     for start in range(0, count, batch_size):
         chunk = [int(n) for n in sizes[start:start + batch_size]]
         mask = node_mask_from_counts(chunk, device=device)
-        embeddings, latents = flow.sample(mask, temperature=temperature, generator=generator,
-                                          return_latent=True)
+        condition = None
+        if values is not None:
+            condition = flow.conditioning(values[start:start + len(chunk)].to(device),
+                                          present[start:start + len(chunk)].to(device),
+                                          len(chunk), device)
+        embeddings, latents = flow.sample(mask, condition, temperature=temperature,
+                                          generator=generator, return_latent=True)
         if round_trip_error is None:
             # Self-check on the first batch only: re-encoding the sampled embeddings must
             # return the latents they came from. A large error means the inverse used for
-            # sampling is not the inverse of the density being reported.
-            recovered, _ = flow(embeddings, mask)
+            # sampling is not the inverse of the density being reported. The SAME condition
+            # must be used, or the check would compare two different maps.
+            recovered, _ = flow(embeddings, mask, condition)
             scale = max(1e-9, float(latents.abs().max()))
             round_trip_error = float((recovered - latents).abs().max()) / scale
-        records.extend(decode_embeddings(autoencoder, embeddings, chunk, decoders=decoders))
+        decoded = decode_embeddings(autoencoder, embeddings, chunk, decoders=decoders)
+        if values is not None:
+            for offset, record in enumerate(decoded):
+                record["condition"] = [float(v) for v in values[start + offset]]
+        records.extend(decoded)
     for position, record in enumerate(records):
         record["index"] = position
     nonfinite = sum(1 for r in records if r.get("nonfinite_embedding"))
@@ -244,7 +277,9 @@ def generate_molecules(flow: NodeFlow, autoencoder, *, count: int, node_counts: 
                      "target_n": target_n, "decoders": list(decoders),
                      "node_count_source": "train_histogram" if not target_n else "fixed",
                      "mean_sampled_n": float(np.mean(sizes)),
-                     "node_count_histogram_mean": node_counts.mean},
+                     "node_count_histogram_mean": node_counts.mean,
+                     "conditional": bool(flow.config.conditional),
+                     "condition_features": list(flow.config.condition_features)},
     }
 
 
@@ -270,6 +305,55 @@ def node_count_agreement(records: Sequence[dict[str, Any]], decoder: str = "degr
             "note": "structural, not learned: the decoder emits one atom per sampled node vector"}
 
 
+def requested_n_report(records: Sequence[dict[str, Any]], requested: int, *,
+                       decoders: Sequence[str] = DECODERS) -> dict[str, Any]:
+    """Was the REQUESTED atom count delivered, before and after decoding?
+
+    Two separate questions, reported separately on purpose:
+
+    `before_decoding`  the fraction of samples for which the flow was asked for, and drew,
+        exactly `requested` node vectors. This is a plumbing check: it is 1.0 unless the
+        sampler was wired wrongly, and it is NOT evidence of conditioning.
+
+    `after_decoding`   per decoder, the heavy-atom count of the assembled molecule against
+        `requested`, reported BOTH over the valid molecules (where it can be asked) and
+        over all samples (where an invalid sample counts as a miss). An atom can only be
+        lost here if the decoder dropped it or the molecule failed to assemble, so the
+        difference between the two columns is validity, not size control.
+    """
+    total = len(records)
+    if total == 0:
+        raise ValueError("no records to report on")
+    drawn = sum(1 for r in records if int(r.get("n_node", -1)) == int(requested))
+    result: dict[str, Any] = {
+        "requested_n": int(requested),
+        "samples": total,
+        "before_decoding": drawn / total,
+        "after_decoding": {},
+        "note": ("size control here is structural: N sets how many node vectors are drawn and "
+                 "the decoder emits one atom per vector. Use the permuted-condition gap, not "
+                 "this table, as evidence that conditioning was learned."),
+    }
+    for name in decoders:
+        valid = 0
+        matched = 0
+        for record in records:
+            entry = record.get(name) or {}
+            if not entry.get("valid") or not entry.get("smiles"):
+                continue
+            molecule = Chem.MolFromSmiles(entry["smiles"])
+            if molecule is None:
+                continue
+            valid += 1
+            matched += int(molecule.GetNumHeavyAtoms() == int(requested))
+        result["after_decoding"][name] = {
+            "valid_molecules": valid,
+            "match_among_valid": (matched / valid) if valid else float("nan"),
+            "match_over_all_samples": matched / total,
+        }
+    return result
+
+
 def size_distribution(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     counter = Counter(int(r["n_node"]) for r in records)
     return {"histogram": {int(k): int(v) for k, v in sorted(counter.items())},
@@ -283,5 +367,6 @@ __all__ = [
     "generate_molecules",
     "generation_batch",
     "node_count_agreement",
+    "requested_n_report",
     "size_distribution",
 ]

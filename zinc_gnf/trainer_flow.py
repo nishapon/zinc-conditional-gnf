@@ -49,6 +49,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from zinc_gnf.conditioning import (
+    CONDITION_SHUFFLE_SEED,
+    batch_condition,
+    condition_columns,
+    condition_embedding_for,
+)
 from zinc_gnf.constants_charge_aware import vocabulary_fingerprint
 from zinc_gnf.dataset import (
     DeterministicBatcher,
@@ -283,6 +289,18 @@ class FlowTrainer:
             return base * (step + 1) / warmup
         return base
 
+    def _condition(self, flow: NodeFlow, batch: MolecularBatch) -> torch.Tensor | None:
+        """Conditioning embedding for one batch, or None for the unconditional model.
+
+        Each molecule is conditioned on its OWN standardised (log1p(N), QED) columns, as
+        written by the preprocessing with the train-only scaler: plain conditional maximum
+        likelihood, no label smoothing or feature dropout at this stage.
+        """
+        if not flow.config.conditional:
+            return None
+        values, present = batch_condition(batch, flow.config.condition_features)
+        return condition_embedding_for(flow, values, present, batch.batch_size, self.device)
+
     @torch.no_grad()
     def validate(self, flow: NodeFlow) -> dict[str, Any]:
         """Per-node NLL on the fixed validation subset with the fixed noise seed."""
@@ -292,11 +310,34 @@ class FlowTrainer:
         totals = {"log_prob": 0.0, "log_prob_z": 0.0, "log_det": 0.0, "z_norm": 0.0}
         nodes = 0
         molecules = 0
+        # Conditional models get a PERMUTED-CONDITION control in the same pass: the same
+        # molecules and the same smoothing noise, scored against another molecule's
+        # condition vector. A model that ignores its conditioning scores both identically,
+        # so this gap is the running evidence that the conditioning is alive. One extra
+        # forward pass over the validation subset, no extra data.
+        shuffle_rng = (np.random.default_rng(CONDITION_SHUFFLE_SEED)
+                       if flow.config.conditional else None)
+        shuffled_log_prob = 0.0
+        condition_wins = 0
+        condition_molecules = 0
         for batch in iter_eval_batches(self.val_set, max(self.config.batch_size, 64), self.val_indices):
             batch = batch.to(self.device)
             embeddings = encode_batch(self.autoencoder, batch)
             embeddings = flow.add_smoothing_noise(embeddings, batch.node_mask, generator=generator)
-            parts = flow.log_prob(embeddings, batch.node_mask)
+            condition = self._condition(flow, batch)
+            parts = flow.log_prob(embeddings, batch.node_mask, condition)
+            if shuffle_rng is not None and batch.batch_size > 1:
+                values, present = batch_condition(batch, flow.config.condition_features)
+                order = shuffle_rng.permutation(batch.batch_size)
+                if np.array_equal(order, np.arange(batch.batch_size)):
+                    order = np.roll(order, 1)
+                permuted = values[torch.as_tensor(order.copy(), device=values.device)]
+                control = flow.log_prob(
+                    embeddings, batch.node_mask,
+                    condition_embedding_for(flow, permuted, present, batch.batch_size, self.device))
+                shuffled_log_prob += float(control["log_prob"].sum())
+                condition_wins += int((parts["log_prob"] > control["log_prob"]).sum())
+                condition_molecules += batch.batch_size
             totals["log_prob"] += float(parts["log_prob"].sum())
             totals["log_prob_z"] += float(parts["log_prob_z"].sum())
             totals["log_det"] += float(parts["log_det"].sum())
@@ -305,13 +346,23 @@ class FlowTrainer:
             molecules += batch.batch_size
         if was_training:
             flow.train()
-        return {
+        result = {
             "val_loss": -totals["log_prob"] / max(nodes, 1),
             "val_log_prob_z_per_node": totals["log_prob_z"] / max(nodes, 1),
             "val_log_det_per_node": totals["log_det"] / max(nodes, 1),
             "val_z_norm": totals["z_norm"] / max(nodes, 1),
             "val_molecules": molecules, "val_nodes": nodes,
         }
+        if condition_molecules:
+            shuffled_loss = -shuffled_log_prob / max(nodes, 1)
+            result.update({
+                "val_loss_shuffled_condition": shuffled_loss,
+                # > 0 means the molecules' own conditions explain them better than
+                # permuted ones; 0 means the conditioning is being ignored.
+                "val_condition_gap": shuffled_loss - result["val_loss"],
+                "val_condition_win_rate": condition_wins / condition_molecules,
+            })
+        return result
 
     def _save(self, name: str, flow, optimizer, extra_state: dict[str, Any]) -> Path:
         path = self.output_dir / name
@@ -347,7 +398,10 @@ class FlowTrainer:
     def train(self, resume: str | Path | None = "auto", stop_flag: StopFlag | None = None) -> dict[str, Any]:
         cfg, log = self.config, self.logger
         set_seed(cfg.seed, deterministic=cfg.deterministic)
-        log.header("Unconditional node-feature graph normalizing flow")
+        features = self.flow_config.condition_features
+        log.header(("Node-feature graph normalizing flow, conditioned on "
+                    + ", ".join(features)) if features
+                   else "Unconditional node-feature graph normalizing flow")
         log.info(f"device={self.device} seed={cfg.seed} batch_size={cfg.batch_size} "
                  f"max_steps={cfg.max_steps} lr={cfg.learning_rate} warmup={cfg.warmup_steps}")
         self._load_data()
@@ -361,6 +415,24 @@ class FlowTrainer:
                  f"sha256={str(self.ae_fingerprint['sha256'])[:16]} "
                  f"degree_head={self.autoencoder.config.degree_head} "
                  f"trainable_parameters={sum(p.requires_grad for p in self.autoencoder.parameters())}")
+
+        if features:
+            # Fail at startup, not at step 1 of a queued GPU job.
+            for name, dataset in (("train", self.train_set), ("val", self.val_set)):
+                if getattr(dataset, "condition", None) is None:
+                    raise ValueError(
+                        f"the {name} split carries no condition vectors, so a flow conditioned "
+                        f"on {list(features)} cannot be trained on {cfg.data_dir}; the "
+                        f"preprocessing writes them together with the train-only scaler")
+            columns = condition_columns(features)
+            counts = np.asarray(self.train_set.n_node)
+            log.info(f"conditioning on {list(features)} = dataset condition columns {columns} "
+                     f"(standardised with the TRAIN-ONLY scaler written by the preprocessing); "
+                     f"training N ranges {int(counts.min())}-{int(counts.max())}, "
+                     f"mean {counts.mean():.2f}")
+            log.info("every evaluation also scores the same molecules against PERMUTED "
+                     "conditions (val_condition_gap / val_condition_win_rate): a gap of 0 "
+                     "means the conditioning is being ignored")
 
         flow = NodeFlow(self.flow_config, init_seed=cfg.seed).to(self.device)
         log.info(f"flow parameters: {flow.num_parameters():,} "
@@ -424,7 +496,8 @@ class FlowTrainer:
             embeddings = encode_batch(self.autoencoder, batch)
             embeddings = flow.add_smoothing_noise(embeddings, batch.node_mask,
                                                   generator=self.noise_generator)
-            parts = flow.negative_log_likelihood(embeddings, batch.node_mask)
+            parts = flow.negative_log_likelihood(embeddings, batch.node_mask,
+                                                 self._condition(flow, batch))
             loss = parts["loss"]
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -478,10 +551,15 @@ class FlowTrainer:
                     self.best_loss, self.best_step, self.bad_evals = metrics["val_loss"], step, 0
                 else:
                     self.bad_evals += 1
+                condition_note = ""
+                if "val_condition_gap" in metrics:
+                    condition_note = (f"cond_gap={metrics['val_condition_gap']:+.4f} "
+                                      f"cond_win={metrics['val_condition_win_rate']:.3f} ")
                 log.info(f"VAL step {step}: nll/node={metrics['val_loss']:.4f} "
                          f"logp_z/node={metrics['val_log_prob_z_per_node']:.4f} "
                          f"logdet/node={metrics['val_log_det_per_node']:.4f} "
                          f"z_norm={metrics['val_z_norm']:.3f} "
+                         f"{condition_note}"
                          f"molecules={metrics['val_molecules']:,} "
                          f"{'*BEST*' if improved else f'(no improvement x{self.bad_evals})'}")
                 self._append(metrics_path, {"kind": "val", "step": step, "improved": improved, **metrics})

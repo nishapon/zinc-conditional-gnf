@@ -378,3 +378,69 @@ Compare against the recorded Arm B baseline (10,000 steps, `T=0.85`, 2,000 sampl
 mean QED 0.4192, aromatic rings/molecule 0.3891, raw strict validity 1.55%,
 degree-decoded validity 98.95%, decoder fallback 64.8%, internal diversity 0.9104.
 The gates in the table above are unchanged — calibration has to clear the same bar.
+
+---
+
+## Stage 12 — N-conditioned flow (first conditional milestone)
+
+The unconditional stage is frozen at commit `c4faa4a`. Stage 12 changes **three** things
+and nothing else: `condition_features: ["n"]`, the output directory, and the fact that the
+trainer now reads `MolecularBatch.condition`. Same frozen autoencoder
+(`outputs/ablation/ae_degree/seed_3/last.pt`), same MoFlow-fixed split, same Arm B
+node-autoregressive architecture, same `noise_sigma`, whitening, optimiser and 50,000-step
+budget — so the frozen unconditional result stays the baseline, and no conditional job can
+write into `outputs/{checkpoints,samples}/flow_uncond*`.
+
+**Where N enters.** Column 0 of the dataset's condition vector is standardised `log1p(N)`,
+fitted on the TRAINING split only (`<data_dir>/scaler.json`). At sampling time
+`standardise_condition` puts a requested N through that same scaler, so a request means
+exactly what it meant in training. The conditioning reaches the density twice: FiLM in
+every coupling, and the learned `mu(N), sigma(N)` prior.
+
+**Why "the atom count matched" proves nothing.** N also sets how many node vectors are
+drawn, and the decoder emits one atom per vector, so the requested count is delivered even
+by a model that ignores N completely. The reported evidence is instead the
+**permuted-condition control**: the same validation molecules, the same smoothing noise,
+scored once against their own conditions and once against another molecule's. A model that
+ignores conditioning gets the identical likelihood (gap `0.0000`, 100% ties); a model that
+uses it is strictly worse under the permutation.
+
+* during training: every `VAL` line prints `cond_gap` and `cond_win`
+* at evaluation: `conditioning_check.txt`, plus `mu(N)`/`sigma(N)` across the sweep and a
+  per-N latent-spread diagnostic (which is what would justify a conditional calibration —
+  none is installed, and `set_calibration` still refuses conditional priors)
+* `scripts/12_generate_ncond.py` **exits 5** if the model cannot beat its own permuted
+  control, so an unverified model cannot produce a results table (`--allow-weak-conditioning`
+  for smoke runs only)
+
+### Run order
+
+```
+cd ~/zinc-conditional-gnf && git pull origin rewrite/zinc250k-pipeline
+
+# 1. smoke test: ~600 steps, then verification + a small N-conditioned sample
+sbatch slurm/12_flow_ncond_smoke_gpu.sh
+
+# 2. full resumable run (only after the smoke test looks right)
+sbatch slurm/12_flow_ncond_gpu.sh
+
+# 3. evaluation at several requested N (CPU, read-only)
+sbatch slurm/12_generate_ncond.sh
+sbatch --export=ALL,TARGET_N=15,23,30,COUNT=2000 slurm/12_generate_ncond.sh
+```
+
+### Reading the smoke test
+
+| Look at | Expect |
+|---|---|
+| `grep VAL outputs/checkpoints/flow_ncond_smoke/train.log` | finite NLL; `cond_gap` **non-zero**. Exactly `0.0000` with `cond_win 0.000` is a wiring bug, not a short run |
+| `outputs/samples/flow_ncond_smoke/conditioning_check.txt` | section 1 gap and win rate; `sigma` spread across N > 0 |
+| `outputs/samples/flow_ncond_smoke/ncond_report.txt` | one row per requested N, delivered-N, raw vs degree validity, fallback, QED against real molecules of the **same** N |
+
+A 600-step model is not expected to clear the verification thresholds (gap > 1e-4 **and**
+win rate > 0.55); it is expected to show a live gap and a working end-to-end path. The full
+run is the one that must pass without `--allow-weak-conditioning`.
+
+Next milestone: joint **N + QED** conditioning (`condition_features: ["n", "qed"]` — the
+same code path, `--condition-features n,qed`), with explicit QED targets and
+target-achievement evaluation. The N-only model is the control it will be read against.
