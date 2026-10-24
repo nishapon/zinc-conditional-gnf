@@ -28,6 +28,7 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import QED
 import torch
 
+from zinc_gnf.assembly_total import total_degree_bond_decode
 from zinc_gnf.chemistry import canonical_connectivity_smiles
 from zinc_gnf.chemistry_charge_aware import graph_to_mol_charge_aware
 from zinc_gnf.constants_charge_aware import MAX_NODES
@@ -39,6 +40,11 @@ from zinc_gnf.decoding_charge_aware import (
 from zinc_gnf.flow import NodeFlow, node_mask_from_counts
 
 DECODERS = ("raw", "constrained", "degree")
+# Stage 21. Kept OUT of `DECODERS` on purpose: the three baselines above remain the
+# default everywhere, with their behaviour untouched, and the experimental assembly is
+# only ever decoded when a caller asks for it by name.
+EXPERIMENTAL_DECODERS = ("total",)
+KNOWN_DECODERS = DECODERS + EXPERIMENTAL_DECODERS
 
 
 class NodeCountSampler:
@@ -135,12 +141,14 @@ def decode_embeddings(autoencoder, embeddings: torch.Tensor, n_node: Sequence[in
                       decoders: Iterable[str] = DECODERS) -> list[dict[str, Any]]:
     """Turn generated node embeddings into molecules with each requested decoder."""
     decoders = tuple(decoders)
-    unknown = set(decoders) - set(DECODERS)
+    unknown = set(decoders) - set(KNOWN_DECODERS)
     if unknown:
-        raise ValueError(f"unknown decoders {sorted(unknown)}; known: {list(DECODERS)}")
+        raise ValueError(f"unknown decoders {sorted(unknown)}; known: {list(KNOWN_DECODERS)}")
     has_degree = bool(autoencoder.config.degree_head)
-    if "degree" in decoders and not has_degree:
-        raise ValueError("the autoencoder has no degree head, so the degree decoder is unavailable")
+    needs_degree = [name for name in ("degree", "total") if name in decoders]
+    if needs_degree and not has_degree:
+        raise ValueError(f"the autoencoder has no degree head, so the "
+                         f"{needs_degree[0]} decoder is unavailable")
     device = embeddings.device
     batch = generation_batch(n_node, device=device)
     if embeddings.shape[:2] != batch.node_mask.shape:
@@ -161,6 +169,11 @@ def decode_embeddings(autoencoder, embeddings: torch.Tensor, n_node: Sequence[in
     bond_predictions = outputs["bond_logits"].argmax(-1).cpu().numpy()
     degree_predictions = (outputs["degree_logits"].argmax(-1).cpu().numpy()
                           if has_degree and "degree_logits" in outputs else None)
+    # The `total` assembly repairs the degree sequence by the head's own confidence, so it
+    # needs the distribution and not only its argmax. Computed once, and only if asked for.
+    degree_probabilities = (torch.softmax(outputs["degree_logits"], dim=-1).cpu().numpy()
+                            if "total" in decoders and has_degree
+                            and "degree_logits" in outputs else None)
 
     records = []
     for index, count in enumerate(int(n) for n in n_node):
@@ -188,9 +201,15 @@ def decode_embeddings(autoencoder, embeddings: torch.Tensor, n_node: Sequence[in
                 info: dict[str, Any] = {}
             elif name == "constrained":
                 bonds, info = valence_aware_bond_decode_typed(atoms, probabilities)
-            else:
+            elif name == "degree":
                 degrees = degree_predictions[index, :count]
                 bonds, info = degree_constrained_bond_decode(atoms, probabilities, degrees)
+                record["predicted_degrees"] = degrees.tolist()
+            else:                                            # "total" (stage 21)
+                degrees = degree_predictions[index, :count]
+                bonds, info = total_degree_bond_decode(
+                    atoms, probabilities, degree_probabilities[index, :count],
+                    degrees=degrees)
                 record["predicted_degrees"] = degrees.tolist()
             entry = _molecule_record(atoms, bonds)
             entry["fallback"] = bool(info.get("fallback", False))
@@ -370,6 +389,8 @@ def size_distribution(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 __all__ = [
     "DECODERS",
+    "EXPERIMENTAL_DECODERS",
+    "KNOWN_DECODERS",
     "NodeCountSampler",
     "decode_embeddings",
     "generate_molecules",

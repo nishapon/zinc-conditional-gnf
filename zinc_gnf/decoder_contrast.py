@@ -55,11 +55,12 @@ import numpy as np
 from rdkit import Chem, rdBase
 import torch
 
+from zinc_gnf.assembly_total import total_degree_bond_decode
 from zinc_gnf.decoding_charge_aware import (
     degree_constrained_bond_decode,
     valence_aware_bond_decode_typed,
 )
-from zinc_gnf.generation import DECODERS, generation_batch
+from zinc_gnf.generation import DECODERS, KNOWN_DECODERS, generation_batch
 # `_molecule_record` is reused on purpose: "valid" must keep meaning exactly what it means
 # everywhere else in this project (sanitizable AND a single connected fragment).
 # Re-defining validity here would make stage 20 incomparable to stages 17-19.
@@ -94,13 +95,14 @@ def decode_with_graphs(autoencoder, embeddings: torch.Tensor, counts: Sequence[i
     definition are the same as in `generation.decode_embeddings`.
     """
     decoders = tuple(decoders)
-    unknown = set(decoders) - set(DECODERS)
+    unknown = set(decoders) - set(KNOWN_DECODERS)
     if unknown:
-        raise ValueError(f"unknown decoders {sorted(unknown)}; known: {list(DECODERS)}")
+        raise ValueError(f"unknown decoders {sorted(unknown)}; known: {list(KNOWN_DECODERS)}")
     has_degree = bool(autoencoder.config.degree_head)
-    if "degree" in decoders and not has_degree:
-        raise ValueError("the autoencoder has no degree head, so the degree decoder "
-                         "is unavailable")
+    needs_degree = [name for name in ("degree", "total") if name in decoders]
+    if needs_degree and not has_degree:
+        raise ValueError(f"the autoencoder has no degree head, so the "
+                         f"{needs_degree[0]} decoder is unavailable")
     device = embeddings.device
     batch = generation_batch([int(c) for c in counts], device=device)
     if embeddings.shape[:2] != batch.node_mask.shape:
@@ -118,6 +120,9 @@ def decode_with_graphs(autoencoder, embeddings: torch.Tensor, counts: Sequence[i
     bond_predictions = outputs["bond_logits"].argmax(-1).cpu().numpy()
     degree_predictions = (outputs["degree_logits"].argmax(-1).cpu().numpy()
                           if has_degree and "degree_logits" in outputs else None)
+    degree_distribution = (torch.softmax(outputs["degree_logits"], dim=-1).cpu().numpy()
+                           if "total" in decoders and has_degree
+                           and "degree_logits" in outputs else None)
 
     records: list[dict[str, Any]] = []
     for index, count in enumerate((int(c) for c in counts)):
@@ -147,14 +152,24 @@ def decode_with_graphs(autoencoder, embeddings: torch.Tensor, counts: Sequence[i
                 info: dict[str, Any] = {}
             elif name == "constrained":
                 bonds, info = valence_aware_bond_decode_typed(atoms, probs)
-            else:
+            elif name == "degree":
                 bonds, info = degree_constrained_bond_decode(atoms, probs, degrees)
+            else:                                            # "total" (stage 21)
+                bonds, info = total_degree_bond_decode(
+                    atoms, probs, degree_distribution[index, :count], degrees=degrees)
             molecule = _molecule_record(atoms, bonds)
             molecule.update(_ring_statistics(molecule.get("smiles")))
             molecule["fallback"] = bool(info.get("fallback", False))
             molecule["fallback_reason"] = info.get("fallback_reason")
             molecule["bonds"] = int((np.asarray(bonds) > 0).sum() // 2)
             molecule["bond_matrix"] = np.asarray(bonds, dtype=np.int64)
+            # the experimental assembler's own bookkeeping, so stage 21 can report WHY it
+            # behaved as it did without a second decode
+            for key in ("relaxation_level", "degree_satisfied", "degree_absolute_error",
+                        "valence_respected", "assembly_failed", "swaps", "seconds",
+                        "degree_repair", "set_objective", "order_objective"):
+                if key in info:
+                    molecule[key] = info[key]
             entry[name] = molecule
         records.append(entry)
     return records
