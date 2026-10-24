@@ -115,6 +115,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--unfreeze-blocks", type=int, default=0,
+                        help="stage B: additionally unfreeze the couplings of the K blocks "
+                             "that act FIRST during sampling (the last K in forward order), "
+                             "at --backbone-lr. ActNorm and the invertible linears stay "
+                             "frozen: they are volume/gauge, not structure.")
+    parser.add_argument("--backbone-lr", type=float, default=1e-5,
+                        help="learning rate for unfrozen backbone couplings (stage B)")
     parser.add_argument("--freeze-backbone", action="store_true",
                         help="stage A of the warm start: train ONLY the conditional adapters "
                              "(FiLM, the condition embedding and the prior heads) and leave "
@@ -206,8 +213,44 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - one training loo
                         f"({parameter_split['trainable_fraction'] * 100:.2f}% of the model), "
                         f"{parameter_split['frozen_parameters']:,} frozen. The pretrained "
                         f"cross-node structure cannot be overwritten by this run.")
+        groups: list[dict[str, Any]] = []
+        unfrozen_names: list[str] = []
+        if arguments.unfreeze_blocks:
+            if not arguments.freeze_backbone:
+                raise ValueError("--unfreeze-blocks is a stage-B refinement of the frozen "
+                                 "backbone; pass --freeze-backbone as well so that exactly "
+                                 "the named blocks are unfrozen and nothing else")
+            total_blocks = len(flow.blocks)
+            if not 1 <= arguments.unfreeze_blocks <= total_blocks:
+                raise ValueError(f"--unfreeze-blocks must be between 1 and {total_blocks}")
+            # Sampling applies the blocks in REVERSED order, so the blocks that shape the
+            # global structure first are the last ones in forward order.
+            chosen = range(total_blocks - arguments.unfreeze_blocks, total_blocks)
+            for index in chosen:
+                block = flow.blocks[index]
+                for module_name, module in (("couplings", block.couplings),
+                                            ("node_coupling", block.node_coupling)):
+                    if module is None:
+                        continue
+                    for name, parameter in module.named_parameters():
+                        parameter.requires_grad_(True)
+                        unfrozen_names.append(f"blocks.{index}.{module_name}.{name}")
+            logger.info(f"STAGE B: additionally training the couplings of blocks "
+                        f"{list(chosen)} (those applied FIRST when sampling) at lr "
+                        f"{arguments.backbone_lr}; ActNorm and the invertible linears remain "
+                        f"frozen. {len(unfrozen_names)} extra tensors, "
+                        f"{sum(p.numel() for p in flow.parameters() if p.requires_grad):,} "
+                        f"trainable parameters in total.")
+            adapter_set = {id(p) for _, p in __import__(
+                "zinc_gnf.warm_start", fromlist=["adapter_parameters"]).adapter_parameters(flow)}
+            adapters = [p for p in flow.parameters() if p.requires_grad and id(p) in adapter_set]
+            backbone = [p for p in flow.parameters()
+                        if p.requires_grad and id(p) not in adapter_set]
+            groups = [{"params": adapters, "lr": arguments.learning_rate},
+                      {"params": backbone, "lr": arguments.backbone_lr}]
         trainable = [p for p in flow.parameters() if p.requires_grad]
-        optimiser = torch.optim.Adam(trainable, lr=arguments.learning_rate)
+        optimiser = torch.optim.Adam(groups if groups else trainable,
+                                     lr=arguments.learning_rate)
         batcher = DeterministicBatcher(len(train_set), arguments.batch_size, arguments.seed)
         noise_generator = torch.Generator(device=device).manual_seed(arguments.seed * 7919 + 13)
         sample_generator = torch.Generator(device=device).manual_seed(arguments.seed * 104729 + 7)
@@ -248,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - one training loo
         atomic_write_json({
             "arm": arm, "lambda_structure": arguments.lambda_structure,
             "freeze_backbone": bool(arguments.freeze_backbone),
+            "unfreeze_blocks": int(arguments.unfreeze_blocks),
+            "backbone_lr": arguments.backbone_lr if arguments.unfreeze_blocks else None,
+            "unfrozen_tensors": unfrozen_names,
             "parameter_split": parameter_split,
             "warm_start": probe.get("warm_start"),
             "source_checkpoint": str(source), "source_sha256": file_sha256(source),

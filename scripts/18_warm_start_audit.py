@@ -264,6 +264,30 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                                                  temperature=arguments.temperature,
                                                  generator=generator)
                     sampled = conditional.inverse(z, mask, embedding)
+                    # NON-FINITE FIRST. The node-autoregressive inverse is a sequential
+                    # recursion: node i is recovered as (y_i - t_i) * exp(-s_i) from the
+                    # already-recovered nodes, and while the log-scale is tanh-clamped the
+                    # TRANSLATION head is not, so the recursion can be expansive and
+                    # overflow float32 across up to N nodes x 12 blocks. In the trained
+                    # conditional model FiLM is part of what keeps that recursion
+                    # contractive, so switching FiLM off can produce inf -> NaN. A NaN is a
+                    # numerical FAILURE, never evidence of structural recovery, so the
+                    # statistics below are suppressed when any sample is non-finite.
+                    finite_nodes = torch.isfinite(sampled).all(dim=-1) | ~mask
+                    finite = finite_nodes.all(dim=-1)
+                    nonfinite_rate = float((~finite).to(torch.float64).mean())
+                    if nonfinite_rate > 0.0:
+                        logger.warn(
+                            f"ablation [{label}]: {nonfinite_rate * 100:.1f}% of samples are "
+                            f"NON-FINITE (the sequential node-autoregressive inverse "
+                            f"overflowed). This variant is numerically broken; its chemistry "
+                            f"is NOT comparable and is reported as unavailable.")
+                        return {"variant": label, "nonfinite_rate": nonfinite_rate,
+                                "usable": False,
+                                "note": ("non-finite embeddings: the unbounded translation "
+                                         "head makes the node-autoregressive inverse "
+                                         "expansive once FiLM no longer regulates it. "
+                                         "NaN is not structural recovery.")}
                     from zinc_gnf.generation import generation_batch
                     outputs = autoencoder.decode(sampled, generation_batch(counts, device=device),
                                                  teacher_forcing=False)
@@ -276,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                 profile = profile_molecules(smiles, name=label, scaffolds=False)
                 row = {
                     "variant": label,
+                    "usable": True,
+                    "nonfinite_rate": nonfinite_rate,
                     "bonds_per_atom": float(statistics["bonds_per_atom"].mean()),
                     "cycle_rank": float(statistics["cycle_rank"].mean()),
                     "double_bond_fraction": float(statistics["double_bond_fraction"].mean()),
@@ -305,15 +331,31 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                              reference_condition=values[:1]):
                 ablation.append(measure("both_neutralised"))
             baseline = ablation[0]
-            best = max(ablation[1:], key=lambda r: r["aromatic_rings_mean"], default=None)
-            if best is not None:
+            usable = [row for row in ablation[1:] if row.get("usable")]
+            broken = [row["variant"] for row in ablation[1:] if not row.get("usable")]
+            if broken:
+                logger.warn(f"variants that produced NON-FINITE samples and therefore say "
+                            f"NOTHING about structure: {broken}. A NaN is a numerical "
+                            f"failure, not recovery - see the mechanism note in the log.")
+            if not baseline.get("usable"):
+                logger.error("even the as-trained variant is non-finite at this temperature; "
+                             "the ablation cannot be interpreted")
+            elif usable:
+                best = max(usable, key=lambda r: r["aromatic_rings_mean"])
+                improved = best["aromatic_rings_mean"] > baseline["aromatic_rings_mean"]
                 logger.info(
-                    f"the largest structural recovery comes from '{best['variant']}' "
+                    f"among the FINITE variants the best is '{best['variant']}' "
                     f"(aromatic rings {baseline['aromatic_rings_mean']:.3f} -> "
                     f"{best['aromatic_rings_mean']:.3f}, raw validity "
-                    f"{baseline['raw_validity']:.4f} -> {best['raw_validity']:.4f}). If no "
-                    f"variant recovers structure, the loss is in the BACKBONE weights, which "
-                    f"is exactly what a warm start replaces.")
+                    f"{baseline['raw_validity']:.4f} -> {best['raw_validity']:.4f}): "
+                    + ("switching that component off recovers structure, so conditioning is "
+                       "the proximate cause" if improved else
+                       "no finite variant recovers structure, so the loss is in the BACKBONE "
+                       "weights - which is what the warm start replaces"))
+            else:
+                logger.warn("no ablation variant was finite, so this ablation is "
+                            "uninformative; re-run it at a higher temperature or with "
+                            "float64 if a verdict is needed")
 
         payload = {
             "source": {"checkpoint": str(source_path),
@@ -351,10 +393,19 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                       "| variant | bonds/atom | cycle rank | isolated | raw validity | "
                       "aromatic rings | QED |", "|---|---:|---:|---:|---:|---:|---:|"]
             for row in ablation:
+                if not row.get("usable"):
+                    lines.append(f"| {row['variant']} | NON-FINITE "
+                                 f"({row['nonfinite_rate'] * 100:.0f}% of samples) - not "
+                                 f"comparable | | | | | |")
+                    continue
                 lines.append(f"| {row['variant']} | {row['bonds_per_atom']:.4f} | "
                              f"{row['cycle_rank']:.3f} | {row['isolated_atom_rate']:.4f} | "
                              f"{row['raw_validity']:.4f} | "
                              f"{row['aromatic_rings_mean']:.3f} | {row['qed_mean']:.4f} |")
+            lines += ["", "A NON-FINITE row is a numerical failure, not structural recovery: "
+                      "the node-autoregressive inverse is a sequential recursion whose "
+                      "translation head is unbounded, so removing FiLM can make it expansive "
+                      "and overflow float32."]
         (output_root / "warm_start.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
         print("\n".join(lines), flush=True)
         return 0
