@@ -1,0 +1,660 @@
+"""Stage 22: a conditional normalizing flow over molecular graphs, directly.
+
+WHY THIS EXISTS
+---------------
+Stages 17-21 all failed the same way. The conditional signal is present in the embedding
+space (stage 18: delivered/required displacement 0.665, cosine +0.926) and the decoder
+preserves QED differences on REAL embeddings (stage 20: 97.8-99.1% on held-out
+molecules), yet realised QED does not follow the request. Stage 20 located the gap: a
+real-versus-generated embedding classifier reaches AUC 0.979, so the frozen decoder is
+asked to invert points it was never fitted on. Stage 21 then showed that fixing the
+decoder's assembly discontinuity makes conditioning WORSE, because pinning the bond set
+to the degree sequence everywhere removes the channel the signal was travelling through.
+
+The common factor is a separately trained decoder standing between the conditional model
+and the molecule. This module removes it: atoms and bonds are the flow's own variables.
+
+REPRESENTATION
+--------------
+Exactly the dataset's tensors, dequantized (MoFlow/GraphNVP style):
+
+    atoms   x_a = onehot(X) + s*u        [B, N, 17]        u ~ U[0,1)
+    bonds   x_b = onehot(A_ij) + s*u     [B, P, 4]         strict UPPER TRIANGLE only
+
+Modelling only the upper triangle makes bond symmetry STRUCTURAL rather than something
+the model has to learn or something a symmetrisation step has to repair - and it is why
+the density must count each pair once. There is no virtual atom type: N is given by the
+condition, so exactly N atoms are generated and padded rows are excluded from the
+likelihood entirely. Exact N is therefore satisfied by construction, which - as this
+repository has documented since stage 12 - is structural and is NEVER evidence of learned
+conditioning.
+
+Dequantization gives a BOUND, not an exact likelihood:
+
+    log P(G | c)  >=  E_u[ log p(x | c) ]  +  D * log s,     D = 17*N + 4*P_real
+
+so the reported NLL is an upper bound on the discrete NLL. It is NOT comparable with the
+embedding flow's continuous density: different representation, different base measure.
+
+FACTORISATION
+-------------
+    log p(G | c) = log p_bond(x_b | c) + log p_atom(x_a | A, c)
+
+bonds first through a Glow-style stack, then atoms through a stack whose coupling
+conditioner performs one relational message-passing step over the bond tensor. At
+sampling time the bonds the atom block sees are the model's own, so atom errors compound
+on bond errors; that is inherent to the factorisation and is measured, not hidden.
+
+CONDITIONING - THE PART THAT IS MEASURED, NOT ASSUMED
+-----------------------------------------------------
+No published molecular flow established native target-property conditional generation:
+MoFlow optimises QED by latent gradient ascent with a separately trained regressor,
+GraphAF and GraphDF use RL. So nothing licenses the assumption that attaching a QED
+embedding yields control, and this module is built so the assumption can be falsified.
+
+`c = [N, QED]` (train-only standardised) -> `h_c = MLP(c)`, a cINN-style unconstrained
+conditioning network trained jointly (Ardizzone et al.). It enters in two places that are
+deliberately separable:
+
+  1. inside EVERY coupling, concatenated to the subnet input, so it modulates the
+     transformation and reshapes p(G|c). Invertibility is untouched because c is known in
+     both directions.
+  2. in the prior, as mu(c) and sigma(c).
+
+These are not interchangeable. A prior-only conditional flow merely shifts the latent
+cloud: it can move average QED without reshaping anything - which is exactly the artefact
+stage 21 produced (QED up, response slope negative). It is also the cheapest thing for an
+optimiser to find. `neutralise_coupling_condition` therefore switches off (1) on a TRAINED
+model with zero training and every weight restored, so the prior-only response and the
+full response are reported separately.
+
+Conditioning dropout replaces c with a learned null embedding with probability
+`condition_dropout`, so one set of weights models p(G|c) and p(G). That gives an exact
+within-model unconditional reference and penalises ignoring c. Sampling is NATIVE ONLY:
+no guidance, no w>1 extrapolation between conditional and unconditional scores.
+
+Chemistry is deliberately absent. A valence constraint is not an invertible map and
+cannot live inside a flow without destroying the density. Raw argmax validity is the
+architectural number; any correction is applied and reported separately, outside here.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from zinc_gnf.constants_charge_aware import MAX_NODES, NUM_ATOM_TYPES, NUM_BOND_TYPES
+
+LOG_SIGMA_CLAMP = 5.0
+ACTNORM_EPSILON = 1e-6
+
+
+# --------------------------------------------------------- upper-triangle plumbing ---
+def upper_triangle_indices(width: int, device: torch.device | str = "cpu"
+                           ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row/column indices of the strict upper triangle, in a fixed order."""
+    rows, cols = torch.triu_indices(width, width, offset=1, device=torch.device(device))
+    return rows, cols
+
+
+def pair_mask_from_counts(counts: Sequence[int] | torch.Tensor, width: int,
+                          device: torch.device | str = "cpu") -> torch.Tensor:
+    """[B, P] - a pair is real only when BOTH its atoms are real."""
+    values = torch.as_tensor([int(c) for c in counts], dtype=torch.long,
+                             device=torch.device(device))
+    rows, cols = upper_triangle_indices(width, device)
+    limit = values.unsqueeze(1)
+    return (rows.unsqueeze(0) < limit) & (cols.unsqueeze(0) < limit)
+
+
+def pack_upper(dense: torch.Tensor, width: int) -> torch.Tensor:
+    """[B, N, N] -> [B, P], the strict upper triangle in index order."""
+    rows, cols = upper_triangle_indices(width, dense.device)
+    return dense[:, rows, cols]
+
+
+def unpack_upper(values: torch.Tensor, width: int) -> torch.Tensor:
+    """[B, P, C] -> [B, N, N, C], symmetric by construction, zero diagonal."""
+    batch, _, channels = values.shape
+    rows, cols = upper_triangle_indices(width, values.device)
+    dense = values.new_zeros((batch, width, width, channels))
+    dense[:, rows, cols] = values
+    dense[:, cols, rows] = values
+    return dense
+
+
+# ------------------------------------------------------------------------ layers ---
+class MaskedActNorm(nn.Module):
+    """Per-channel affine normalisation, initialised from the first masked batch."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.log_scale = nn.Parameter(torch.zeros(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.register_buffer("initialised", torch.zeros((), dtype=torch.bool))
+
+    @torch.no_grad()
+    def initialise(self, x: torch.Tensor, mask: torch.Tensor) -> None:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        total = weights.sum().clamp(min=1.0)
+        mean = (x * weights).sum(dim=(0, 1)) / total
+        variance = (((x - mean) ** 2) * weights).sum(dim=(0, 1)) / total
+        self.bias.copy_(-mean)
+        self.log_scale.copy_(-0.5 * torch.log(variance + ACTNORM_EPSILON))
+        self.initialised.fill_(True)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training and not bool(self.initialised):
+            self.initialise(x, mask)
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        y = (x + self.bias) * torch.exp(self.log_scale) * weights
+        logdet = self.log_scale.sum() * mask.to(x.dtype).sum(dim=1)
+        return y, logdet
+
+    def inverse(self, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = mask.unsqueeze(-1).to(y.dtype)
+        return (y * torch.exp(-self.log_scale) - self.bias) * weights
+
+
+class MaskedInvertibleLinear(nn.Module):
+    """An invertible mixing of the channel axis - Glow's 1x1 convolution."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        weight = torch.linalg.qr(torch.randn(channels, channels))[0]
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        y = (x @ self.weight) * weights
+        logdet = torch.slogdet(self.weight)[1] * mask.to(x.dtype).sum(dim=1)
+        return y, logdet
+
+    def inverse(self, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = mask.unsqueeze(-1).to(y.dtype)
+        inverse = torch.linalg.inv(self.weight.to(torch.float64)).to(y.dtype)
+        return (y @ inverse) * weights
+
+
+def _mlp(inputs: int, hidden: int, outputs: int) -> nn.Sequential:
+    net = nn.Sequential(nn.Linear(inputs, hidden), nn.ReLU(),
+                        nn.Linear(hidden, hidden), nn.ReLU(),
+                        nn.Linear(hidden, outputs))
+    nn.init.zeros_(net[-1].weight)
+    nn.init.zeros_(net[-1].bias)        # every coupling starts as the identity
+    return net
+
+
+class BondSubnet(nn.Module):
+    """Pair-wise conditioner that is SYMMETRIC in (i, j) by construction.
+
+    For pair (i, j) it sees its own pass-through channels plus two endpoint aggregates,
+    `r_i + r_j` and `|r_i - r_j|`, where `r` sums a channel over the pairs incident on an
+    atom. Both are symmetric functions of the unordered pair, so the model cannot learn an
+    orientation - which is what keeps the bond tensor symmetric without a repair step.
+    """
+
+    def __init__(self, passthrough: int, outputs: int, hidden: int,
+                 condition_dim: int, width: int) -> None:
+        super().__init__()
+        self.width = int(width)
+        rows, cols = upper_triangle_indices(width)
+        self.register_buffer("rows", rows)
+        self.register_buffer("cols", cols)
+        self.net = _mlp(3 * passthrough + condition_dim, hidden, 2 * outputs)
+        self.outputs = int(outputs)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        masked = x * weights
+        batch, _, channels = masked.shape
+        totals = masked.new_zeros((batch, self.width, channels))
+        totals.index_add_(1, self.rows, masked)
+        totals.index_add_(1, self.cols, masked)
+        left, right = totals[:, self.rows], totals[:, self.cols]
+        features = torch.cat([masked, left + right, (left - right).abs(),
+                              context.unsqueeze(1).expand(-1, masked.shape[1], -1)], dim=-1)
+        scale, shift = self.net(features).chunk(2, dim=-1)
+        return scale, shift
+
+
+class AtomSubnet(nn.Module):
+    """Atom conditioner with one relational message-passing step over the bonds.
+
+    This is MoFlow's "graph conditional flow for atoms given bonds" in miniature: the
+    message for atom i is `sum_c sum_j A_c(i,j) * W_c * x_pass(j)`, so an atom's
+    transformation depends on what it is bonded to and with which bond order.
+    """
+
+    def __init__(self, passthrough: int, outputs: int, hidden: int, condition_dim: int,
+                 num_bond_types: int) -> None:
+        super().__init__()
+        self.relational = nn.Parameter(
+            torch.randn(num_bond_types, passthrough, hidden) * (1.0 / max(passthrough, 1)) ** 0.5)
+        self.net = _mlp(passthrough + hidden + condition_dim, hidden, 2 * outputs)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor,
+                bonds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        masked = x * weights
+        # bonds: [B, N, N, C_bond]; projected: [B, C_bond, N, hidden]
+        projected = torch.einsum("bnp,cph->bcnh", masked, self.relational)
+        message = torch.einsum("bijc,bcjh->bih", bonds, projected)
+        features = torch.cat([masked, message,
+                              context.unsqueeze(1).expand(-1, masked.shape[1], -1)], dim=-1)
+        scale, shift = self.net(features).chunk(2, dim=-1)
+        return scale, shift
+
+
+class ConditionalCoupling(nn.Module):
+    """Affine coupling whose scale and shift depend on the condition.
+
+    The log-scale is tanh-bounded. This flow is ONE-SHOT, so the sequential float32
+    overflow stage 18 traced in the node-autoregressive embedding flow cannot occur here -
+    but the bound still keeps the inverse well conditioned, and the invertibility test
+    pins it.
+    """
+
+    def __init__(self, channels: int, subnet: nn.Module, *, passthrough: int,
+                 max_log_scale: float, max_shift: float = 10.0,
+                 flip: bool = False) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.passthrough = int(passthrough)
+        self.subnet = subnet
+        self.max_log_scale = float(max_log_scale)
+        self.max_shift = float(max_shift)
+        self.flip = bool(flip)
+        self.register_buffer("condition_enabled", torch.ones((), dtype=torch.bool))
+
+    def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.flip:
+            return x[..., -self.passthrough:], x[..., :-self.passthrough]
+        return x[..., :self.passthrough], x[..., self.passthrough:]
+
+    def _join(self, passthrough: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        if self.flip:
+            return torch.cat([active, passthrough], dim=-1)
+        return torch.cat([passthrough, active], dim=-1)
+
+    def _scale_shift(self, passthrough: torch.Tensor, mask: torch.Tensor,
+                     context: torch.Tensor, extra: torch.Tensor | None):
+        if not bool(self.condition_enabled):
+            context = torch.zeros_like(context)
+        if extra is None:
+            scale, shift = self.subnet(passthrough, mask, context)
+        else:
+            scale, shift = self.subnet(passthrough, mask, context, extra)
+        # BOTH the scale and the SHIFT are bounded. Stage 18 traced a float32 failure in
+        # the embedding flow to an unbounded translation head; this flow is one-shot so it
+        # cannot overflow the same way, but a large shift still wrecks the INVERSE: it
+        # inflates the intermediate magnitudes block over block, and since sampling IS the
+        # inverse, the generated molecules stop coming from the trained density while the
+        # training loss still looks healthy. The soft clamp is the identity for the shifts
+        # this data needs and saturates smoothly beyond them.
+        bounded_shift = self.max_shift * torch.tanh(shift / self.max_shift)
+        return self.max_log_scale * torch.tanh(scale), bounded_shift
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor,
+                extra: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        passthrough, active = self._split(x)
+        scale, shift = self._scale_shift(passthrough, mask, context, extra)
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        transformed = (active * torch.exp(scale) + shift) * weights
+        logdet = (scale * weights).sum(dim=(1, 2))
+        return self._join(passthrough, transformed) * weights, logdet
+
+    def inverse(self, y: torch.Tensor, mask: torch.Tensor, context: torch.Tensor,
+                extra: torch.Tensor | None = None) -> torch.Tensor:
+        passthrough, active = self._split(y)
+        scale, shift = self._scale_shift(passthrough, mask, context, extra)
+        weights = mask.unsqueeze(-1).to(y.dtype)
+        recovered = ((active - shift) * torch.exp(-scale)) * weights
+        return self._join(passthrough, recovered) * weights
+
+
+class ConditionalPrior(nn.Module):
+    """N(mu(c), sigma(c)^2) per channel, starting at the standard normal."""
+
+    def __init__(self, channels: int, condition_dim: int, conditional: bool) -> None:
+        super().__init__()
+        self.base_mu = nn.Parameter(torch.zeros(channels))
+        self.base_log_sigma = nn.Parameter(torch.zeros(channels))
+        self.conditional = bool(conditional)
+        if conditional:
+            self.mu_head = nn.Linear(condition_dim, channels)
+            self.log_sigma_head = nn.Linear(condition_dim, channels)
+            for head in (self.mu_head, self.log_sigma_head):
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+
+    def parameters_for(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu = self.base_mu.unsqueeze(0).expand(context.shape[0], -1)
+        log_sigma = self.base_log_sigma.unsqueeze(0).expand(context.shape[0], -1)
+        if self.conditional:
+            mu = mu + self.mu_head(context)
+            log_sigma = log_sigma + self.log_sigma_head(context)
+        return mu, log_sigma.clamp(-LOG_SIGMA_CLAMP, LOG_SIGMA_CLAMP)
+
+    def log_prob(self, z: torch.Tensor, mask: torch.Tensor,
+                 context: torch.Tensor) -> torch.Tensor:
+        mu, log_sigma = self.parameters_for(context)
+        mu = mu.unsqueeze(1)
+        log_sigma = log_sigma.unsqueeze(1)
+        weights = mask.unsqueeze(-1).to(z.dtype)
+        normalised = (z - mu) * torch.exp(-log_sigma)
+        density = -0.5 * (normalised ** 2) - log_sigma - 0.5 * float(np.log(2.0 * np.pi))
+        return (density * weights).sum(dim=(1, 2))
+
+    def sample(self, mask: torch.Tensor, context: torch.Tensor, *, temperature: float,
+               channels: int, generator: torch.Generator | None = None) -> torch.Tensor:
+        mu, log_sigma = self.parameters_for(context)
+        shape = (mask.shape[0], mask.shape[1], channels)
+        noise = torch.randn(shape, device=mask.device, dtype=mu.dtype, generator=generator)
+        z = mu.unsqueeze(1) + float(temperature) * torch.exp(log_sigma).unsqueeze(1) * noise
+        return z * mask.unsqueeze(-1).to(z.dtype)
+
+
+# ------------------------------------------------------------------------- model ---
+@dataclass
+class GraphFlowConfig:
+    max_nodes: int = MAX_NODES
+    num_atom_types: int = NUM_ATOM_TYPES
+    num_bond_types: int = NUM_BOND_TYPES
+    bond_blocks: int = 6
+    atom_blocks: int = 6
+    hidden: int = 256
+    condition_features: tuple[str, ...] = ("n", "qed")
+    condition_dim: int = 64
+    condition_hidden: int = 128
+    condition_dropout: float = 0.1
+    conditional_prior: bool = True
+    noise_scale: float = 0.6
+    # The CUMULATIVE log-scale bounds how badly the inverse can amplify float32 rounding
+    # error: a stack of K couplings each bounded by L has inverse condition number up to
+    # exp(K*L), and float32 carries ~1e-7 relative precision. At L=2.0 and K=10 that is
+    # exp(20) ~ 5e8 and the round trip is destroyed - measured, not assumed. L=0.75 with
+    # K=6 gives exp(4.5) ~ 90, comfortably inside precision, and matches the 1.0 the
+    # embedding flow already uses. `sample` reports the round-trip error so a badly
+    # conditioned configuration is detected rather than silently emitting garbage.
+    max_log_scale: float = 0.75
+    # The shift is bounded to the scale of the data it moves. The dequantized variables
+    # live in [0, 1 + noise_scale] and the latents are ~N(0, 1), so +-3 is ample. A large
+    # bound here is actively harmful and was measured to be so: with +-10 the intermediate
+    # magnitudes inflate block over block, and the inverse - which is what SAMPLING uses -
+    # loses so much precision that the round-trip error reaches 0.18 relative. The atom
+    # stack, with 17 channels, failed before the bond stack did.
+    max_shift: float = 3.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"max_nodes": self.max_nodes, "num_atom_types": self.num_atom_types,
+                "num_bond_types": self.num_bond_types, "bond_blocks": self.bond_blocks,
+                "atom_blocks": self.atom_blocks, "hidden": self.hidden,
+                "condition_features": list(self.condition_features),
+                "condition_dim": self.condition_dim,
+                "condition_hidden": self.condition_hidden,
+                "condition_dropout": self.condition_dropout,
+                "conditional_prior": self.conditional_prior,
+                "noise_scale": self.noise_scale, "max_log_scale": self.max_log_scale,
+                "max_shift": self.max_shift}
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "GraphFlowConfig":
+        data = dict(payload)
+        data["condition_features"] = tuple(data.get("condition_features", ("n", "qed")))
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+class ConditionalGraphFlow(nn.Module):
+    """p(atoms, bonds | N, QED) as an invertible map, with no decoder anywhere."""
+
+    def __init__(self, config: GraphFlowConfig) -> None:
+        super().__init__()
+        self.config = config
+        width = config.max_nodes
+        self.condition_net = nn.Sequential(
+            nn.Linear(len(config.condition_features), config.condition_hidden), nn.ReLU(),
+            nn.Linear(config.condition_hidden, config.condition_dim), nn.Tanh())
+        self.null_condition = nn.Parameter(torch.zeros(config.condition_dim))
+
+        def stack(channels: int, blocks: int, make_subnet) -> nn.ModuleList:
+            layers = nn.ModuleList()
+            passthrough = max(1, channels // 2)
+            for index in range(blocks):
+                layers.append(nn.ModuleDict({
+                    "actnorm": MaskedActNorm(channels),
+                    "mixing": MaskedInvertibleLinear(channels),
+                    "coupling": ConditionalCoupling(
+                        channels,
+                        make_subnet(passthrough, channels - passthrough),
+                        passthrough=passthrough,
+                        max_log_scale=config.max_log_scale,
+                        max_shift=config.max_shift,
+                        flip=bool(index % 2)),
+                }))
+            return layers
+
+        self.bond_layers = stack(
+            config.num_bond_types, config.bond_blocks,
+            lambda p, o: BondSubnet(p, o, config.hidden, config.condition_dim, width))
+        self.atom_layers = stack(
+            config.num_atom_types, config.atom_blocks,
+            lambda p, o: AtomSubnet(p, o, config.hidden, config.condition_dim,
+                                    config.num_bond_types))
+        self.bond_prior = ConditionalPrior(config.num_bond_types, config.condition_dim,
+                                           config.conditional_prior)
+        self.atom_prior = ConditionalPrior(config.num_atom_types, config.condition_dim,
+                                           config.conditional_prior)
+
+    # -- conditioning ------------------------------------------------------
+    def conditioning(self, values: torch.Tensor,
+                     present: torch.Tensor | None = None) -> torch.Tensor:
+        """h_c from the standardised condition, with a learned null for dropped rows."""
+        context = self.condition_net(values)
+        if present is None:
+            return context
+        keep = present.reshape(-1, 1).to(context.dtype)
+        return keep * context + (1.0 - keep) * self.null_condition.unsqueeze(0)
+
+    def dropout_mask(self, batch: int, device: torch.device | str,
+                     generator: torch.Generator | None = None) -> torch.Tensor:
+        probability = float(self.config.condition_dropout)
+        if probability <= 0.0:
+            return torch.ones(batch, device=device, dtype=torch.bool)
+        draw = torch.rand(batch, device=device, generator=generator)
+        return draw >= probability
+
+    def null_context(self, batch: int, device: torch.device | str) -> torch.Tensor:
+        return self.null_condition.unsqueeze(0).expand(batch, -1).to(device)
+
+    # -- the two stacks ----------------------------------------------------
+    def _run(self, layers: nn.ModuleList, x: torch.Tensor, mask: torch.Tensor,
+             context: torch.Tensor, extra: torch.Tensor | None
+             ) -> tuple[torch.Tensor, torch.Tensor]:
+        logdet = x.new_zeros(x.shape[0])
+        for layer in layers:
+            x, step = layer["actnorm"](x, mask)
+            logdet = logdet + step
+            x, step = layer["mixing"](x, mask)
+            logdet = logdet + step
+            x, step = layer["coupling"](x, mask, context, extra)
+            logdet = logdet + step
+        return x, logdet
+
+    def _invert(self, layers: nn.ModuleList, z: torch.Tensor, mask: torch.Tensor,
+                context: torch.Tensor, extra: torch.Tensor | None) -> torch.Tensor:
+        for layer in reversed(list(layers)):
+            z = layer["coupling"].inverse(z, mask, context, extra)
+            z = layer["mixing"].inverse(z, mask)
+            z = layer["actnorm"].inverse(z, mask)
+        return z
+
+    def encode(self, atoms: torch.Tensor, bonds: torch.Tensor, node_mask: torch.Tensor,
+               pair_mask: torch.Tensor, context: torch.Tensor) -> dict[str, torch.Tensor]:
+        """(dequantized atoms, dequantized bonds) -> latents and log-determinants."""
+        z_bond, logdet_bond = self._run(self.bond_layers, bonds, pair_mask, context, None)
+        dense = unpack_upper(bonds, self.config.max_nodes)
+        z_atom, logdet_atom = self._run(self.atom_layers, atoms, node_mask, context, dense)
+        return {"z_bond": z_bond, "z_atom": z_atom,
+                "logdet_bond": logdet_bond, "logdet_atom": logdet_atom}
+
+    def log_likelihood(self, atoms: torch.Tensor, bonds: torch.Tensor,
+                       node_mask: torch.Tensor, pair_mask: torch.Tensor,
+                       context: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Per-molecule continuous log-density of the dequantized graph."""
+        encoded = self.encode(atoms, bonds, node_mask, pair_mask, context)
+        log_bond = self.bond_prior.log_prob(encoded["z_bond"], pair_mask, context)
+        log_atom = self.atom_prior.log_prob(encoded["z_atom"], node_mask, context)
+        total = (log_bond + encoded["logdet_bond"] + log_atom + encoded["logdet_atom"])
+        dimensions = (node_mask.to(total.dtype).sum(1) * self.config.num_atom_types
+                      + pair_mask.to(total.dtype).sum(1) * self.config.num_bond_types)
+        return {"log_prob": total, "log_prob_bond": log_bond + encoded["logdet_bond"],
+                "log_prob_atom": log_atom + encoded["logdet_atom"],
+                "dimensions": dimensions,
+                # the dequantization bound: log P(discrete) >= log p(continuous) + D log s
+                "discrete_lower_bound": total + dimensions * float(
+                    np.log(self.config.noise_scale)),
+                "z_bond": encoded["z_bond"], "z_atom": encoded["z_atom"]}
+
+    # -- sampling ----------------------------------------------------------
+    @torch.no_grad()
+    def sample(self, counts: Sequence[int], context: torch.Tensor, *,
+               temperature: float = 1.0, generator: torch.Generator | None = None,
+               device: torch.device | str = "cpu") -> dict[str, Any]:
+        """Native conditional sampling: one pass, no guidance, no selection."""
+        device = torch.device(device)
+        width = self.config.max_nodes
+        sizes = [int(c) for c in counts]
+        if any(c < 1 or c > width for c in sizes):
+            raise ValueError(f"every requested N must lie in 1..{width}")
+        node_mask = torch.zeros((len(sizes), width), dtype=torch.bool, device=device)
+        for row, count in enumerate(sizes):
+            node_mask[row, :count] = True
+        pair_mask = pair_mask_from_counts(sizes, width, device)
+
+        z_bond = self.bond_prior.sample(pair_mask, context, temperature=temperature,
+                                        channels=self.config.num_bond_types,
+                                        generator=generator)
+        bonds = self._invert(self.bond_layers, z_bond, pair_mask, context, None)
+        dense = unpack_upper(bonds, width)
+        z_atom = self.atom_prior.sample(node_mask, context, temperature=temperature,
+                                        channels=self.config.num_atom_types,
+                                        generator=generator)
+        atoms = self._invert(self.atom_layers, z_atom, node_mask, context, dense)
+
+        # Self-check: re-encoding the sampled graph must return the latents it came from.
+        # Sampling IS the inverse, so a large error here means the molecules are not drawn
+        # from the density that was trained - a failure that is otherwise invisible from
+        # the loss curve. The baseline pipeline carries the same guard
+        # (`generation.generate_molecules`), so the two are checked alike.
+        recovered = self.encode(atoms, bonds, node_mask, pair_mask, context)
+        def relative(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> float:
+            weights = mask.unsqueeze(-1).to(a.dtype)
+            scale = max(1e-9, float((b * weights).abs().max()))
+            return float(((a - b).abs() * weights).max()) / scale
+        round_trip = {
+            "bond": relative(recovered["z_bond"], z_bond, pair_mask),
+            "atom": relative(recovered["z_atom"], z_atom, node_mask),
+        }
+
+        atom_types = atoms.argmax(dim=-1)
+        bond_choice = bonds.argmax(dim=-1)
+        return {"atom_types": atom_types, "bond_pairs": bond_choice,
+                "atoms_continuous": atoms, "bonds_continuous": bonds,
+                "node_mask": node_mask, "pair_mask": pair_mask, "counts": sizes,
+                "latent_round_trip_relative_error": round_trip,
+                "finite": (torch.isfinite(atoms).all(-1) | ~node_mask).all(-1)
+                & (torch.isfinite(bonds).all(-1) | ~pair_mask).all(-1)}
+
+    def discrete_graphs(self, sampled: dict[str, Any]) -> list[dict[str, np.ndarray]]:
+        """argmax of the generated tensors -> discrete graphs. No chemistry applied."""
+        width = self.config.max_nodes
+        rows, cols = upper_triangle_indices(width, sampled["atom_types"].device)
+        rows = rows.cpu().numpy()
+        cols = cols.cpu().numpy()
+        atom_types = sampled["atom_types"].cpu().numpy()
+        pairs = sampled["bond_pairs"].cpu().numpy()
+        pair_mask = sampled["pair_mask"].cpu().numpy()
+        graphs = []
+        for index, count in enumerate(sampled["counts"]):
+            bonds = np.zeros((count, count), dtype=np.int64)
+            keep = pair_mask[index]
+            selected = np.flatnonzero(keep & (pairs[index] > 0))
+            for position in selected:
+                i, j = int(rows[position]), int(cols[position])
+                bonds[i, j] = bonds[j, i] = int(pairs[index, position])
+            graphs.append({"atom_types": atom_types[index, :count].copy(),
+                           "bond_matrix": bonds,
+                           "finite": bool(sampled["finite"][index])})
+        return graphs
+
+
+def dequantize(atom_types: torch.Tensor, bond_types: torch.Tensor,
+               node_mask: torch.Tensor, pair_mask: torch.Tensor, *,
+               num_atom_types: int, num_bond_types: int, noise_scale: float,
+               generator: torch.Generator | None = None
+               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-hot + uniform noise, exactly MoFlow's `U[0, noise_scale]` scheme.
+
+    Bond noise is drawn once per PAIR, not per ordered entry, because only the upper
+    triangle is modelled - so the representation stays symmetric and each pair is counted
+    once in the density.
+    """
+    width = node_mask.shape[1]
+    atoms = F.one_hot(atom_types.clamp(min=0), num_atom_types).to(torch.float32)
+    bonds = F.one_hot(pack_upper(bond_types, width).clamp(min=0),
+                      num_bond_types).to(torch.float32)
+    atom_noise = torch.rand(atoms.shape, device=atoms.device, generator=generator)
+    bond_noise = torch.rand(bonds.shape, device=bonds.device, generator=generator)
+    atoms = (atoms + float(noise_scale) * atom_noise) * node_mask.unsqueeze(-1)
+    bonds = (bonds + float(noise_scale) * bond_noise) * pair_mask.unsqueeze(-1)
+    return atoms, bonds
+
+
+@contextmanager
+def neutralise_coupling_condition(flow: ConditionalGraphFlow):
+    """Switch off the condition INSIDE the couplings, leaving the conditional prior.
+
+    Zero training, every buffer restored on exit - the same device stage 17's
+    `warm_start.neutralised` used. What it isolates matters: a prior-only conditional flow
+    shifts the latent cloud and can move average QED without reshaping p(G|c) at all,
+    which is precisely the artefact stage 21's `total` decoder produced. Reporting the
+    prior-only response beside the full response is how that is detected rather than
+    celebrated.
+    """
+    couplings = [module for module in flow.modules()
+                 if isinstance(module, ConditionalCoupling)]
+    previous = [bool(module.condition_enabled) for module in couplings]
+    try:
+        for module in couplings:
+            module.condition_enabled.fill_(False)
+        yield flow
+    finally:
+        for module, state in zip(couplings, previous):
+            module.condition_enabled.fill_(state)
+
+
+__all__ = [
+    "ConditionalCoupling",
+    "ConditionalGraphFlow",
+    "ConditionalPrior",
+    "GraphFlowConfig",
+    "MaskedActNorm",
+    "MaskedInvertibleLinear",
+    "dequantize",
+    "neutralise_coupling_condition",
+    "pack_upper",
+    "pair_mask_from_counts",
+    "unpack_upper",
+    "upper_triangle_indices",
+]
