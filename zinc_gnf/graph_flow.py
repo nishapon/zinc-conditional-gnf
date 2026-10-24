@@ -93,6 +93,7 @@ from zinc_gnf.constants_charge_aware import MAX_NODES, NUM_ATOM_TYPES, NUM_BOND_
 
 LOG_SIGMA_CLAMP = 5.0
 ACTNORM_EPSILON = 1e-6
+BOND_CONDITIONERS = ("topology", "pairwise")
 
 
 # --------------------------------------------------------- upper-triangle plumbing ---
@@ -255,6 +256,101 @@ class AtomSubnet(nn.Module):
         return scale, shift
 
 
+class TopologyBondSubnet(nn.Module):
+    """Stage 23: a masked 2-D convolutional conditioner over the adjacency grid.
+
+    WHY A CONVOLUTION AND NOT MESSAGE PASSING
+    -----------------------------------------
+    `BondSubnet` gives a pair only `r_i + r_j` and `|r_i - r_j|`, and stage 22c proved it
+    blind: a six-ring and two three-rings get byte-identical scales and shifts. The
+    obvious repair - iterate the pair -> atom -> pair aggregation a few times - does NOT
+    fix it. Both graphs are 2-regular and are the textbook counterexample to 1-WL: every
+    atom has degree 2, every neighbour has degree 2, the colouring is stable immediately,
+    so ANY sum-aggregation message-passing scheme over the atom graph assigns identical
+    atom embeddings in both and any pair feature derived from them is identical too.
+
+    A convolution over the N x N grid is not 1-WL-bounded, because it reads the adjacency
+    pattern as a function of atom INDEX. Pair (0,1) sits at grid position (0,1) and, after
+    a few 3x3 layers, its receptive field covers the positions where the two graphs
+    actually differ - {(2,3), (5,0)} versus {(2,0), (5,3)}. That is precisely the
+    mechanism MoFlow used (10 coupling layers of 3x3 convolutions at 512 hidden,
+    82% validity without correction on ZINC250K).
+
+    THE TRADEOFF, STATED. Using the index grid means the model is not permutation
+    equivariant: its density is over CANONICALLY ORDERED graphs. That is already true of
+    this project's representation - `chemistry_charge_aware` fixes the atom order to
+    canonical SMILES order - and of MoFlow and GraphNVP, so it adds no new limitation. It
+    does mean the receptive field's notion of "nearby" is index locality; canonical SMILES
+    order is a DFS walk, so bonded atoms do tend to receive nearby indices, which is what
+    makes the inductive bias useful rather than arbitrary.
+
+    INVERTIBILITY IS UNTOUCHED. The conditioner reads ONLY the coupling's pass-through
+    channels, which the coupling leaves unchanged, so the inverse recomputes exactly the
+    same scale and shift. The transformed (active) channels never enter here - that is
+    enforced by `ConditionalCoupling._split` and pinned by a test.
+
+    SYMMETRY. The convolution output is averaged with its transpose, so a pair's
+    parameters do not depend on which of (i,j) or (j,i) names it. Matrix symmetry itself
+    does not rely on this: only the strict upper triangle is modelled and `unpack_upper`
+    mirrors it. That realisation is what frees the conditioner to be arbitrary at all.
+
+    MASKING. Padded rows and columns are zeroed before every convolution and the result
+    is re-masked after it, so padding contributes nothing but zeros. A real pair near the
+    padding boundary therefore sees fewer non-zero neighbours, exactly as zero-padding
+    implies - the same convention MoFlow's virtual atoms produce.
+    """
+
+    def __init__(self, passthrough: int, outputs: int, hidden: int, condition_dim: int,
+                 width: int, *, layers: int = 3, kernel: int = 3) -> None:
+        super().__init__()
+        self.width = int(width)
+        self.passthrough = int(passthrough)
+        self.outputs = int(outputs)
+        rows, cols = upper_triangle_indices(width)
+        self.register_buffer("rows", rows)
+        self.register_buffer("cols", cols)
+        padding = int(kernel) // 2
+        self.stem = nn.Conv2d(passthrough + 1, hidden, int(kernel), padding=padding)
+        self.context = nn.Linear(condition_dim, hidden)
+        self.blocks = nn.ModuleList([
+            nn.Conv2d(hidden, hidden, int(kernel), padding=padding)
+            for _ in range(max(0, int(layers) - 1))])
+        # Axial aggregation: the masked row and column means of the hidden map, broadcast
+        # back. For pair (i,j) these are summaries of everything incident on atom i and on
+        # atom j, which is the information stage 22's `r_i + r_j` carried - useful for
+        # valence and degree, just insufficient on its own. Keeping it ALONGSIDE the
+        # convolution means the conditioner has both endpoint-global and local structure,
+        # rather than trading one for the other.
+        # 1x1: the row and column means are already global along their axis, so a further
+        # spatial mixing here would only add parameters. The local structure was already
+        # mixed by the convolution stack above.
+        self.axial = nn.Conv2d(3 * hidden, hidden, 1)
+        self.head = nn.Conv2d(hidden, 2 * outputs, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)      # every coupling starts as the identity
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        dense = unpack_upper(x * weights, self.width).permute(0, 3, 1, 2)
+        grid = unpack_upper(weights, self.width).permute(0, 3, 1, 2)
+        features = torch.cat([dense, grid], dim=1)
+        hidden = torch.relu(self.stem(features)
+                            + self.context(context).unsqueeze(-1).unsqueeze(-1)) * grid
+        for block in self.blocks:
+            hidden = torch.relu(block(hidden)) * grid
+        counts = grid.sum(dim=3, keepdim=True).clamp(min=1.0)
+        row = (hidden * grid).sum(dim=3, keepdim=True) / counts
+        column = row.transpose(-1, -2)
+        hidden = torch.relu(self.axial(torch.cat(
+            [hidden, row.expand_as(hidden), column.expand_as(hidden)], dim=1))) * grid
+        out = self.head(hidden)
+        out = 0.5 * (out + out.transpose(-1, -2))
+        gathered = out[:, :, self.rows, self.cols].permute(0, 2, 1)
+        scale, shift = gathered.chunk(2, dim=-1)
+        return scale, shift
+
+
 class ConditionalCoupling(nn.Module):
     """Affine coupling whose scale and shift depend on the condition.
 
@@ -374,6 +470,16 @@ class GraphFlowConfig:
     bond_blocks: int = 6
     atom_blocks: int = 6
     hidden: int = 256
+    # "topology" is the stage-23 masked 2-D convolution over the adjacency grid.
+    # "pairwise" is the stage-22 conditioner, kept so stage-22 checkpoints stay loadable
+    # and usable as a baseline; `from_dict` maps a checkpoint with no entry to it.
+    bond_conditioner: str = "topology"
+    # 48 channels puts the whole model at 1,309,690 parameters against the stage-22
+    # pairwise model's 1,500,538 - strictly FEWER. That matters: it means any improvement
+    # cannot be attributed to added capacity, only to the conditioner seeing topology.
+    conv_hidden: int = 48
+    conv_layers: int = 3
+    conv_kernel: int = 3
     condition_features: tuple[str, ...] = ("n", "qed")
     condition_dim: int = 64
     condition_hidden: int = 128
@@ -400,6 +506,9 @@ class GraphFlowConfig:
         return {"max_nodes": self.max_nodes, "num_atom_types": self.num_atom_types,
                 "num_bond_types": self.num_bond_types, "bond_blocks": self.bond_blocks,
                 "atom_blocks": self.atom_blocks, "hidden": self.hidden,
+                "bond_conditioner": self.bond_conditioner,
+                "conv_hidden": self.conv_hidden, "conv_layers": self.conv_layers,
+                "conv_kernel": self.conv_kernel,
                 "condition_features": list(self.condition_features),
                 "condition_dim": self.condition_dim,
                 "condition_hidden": self.condition_hidden,
@@ -410,8 +519,15 @@ class GraphFlowConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "GraphFlowConfig":
+        """Rebuild a config, normalising anything a pre-stage-23 checkpoint lacks.
+
+        A stage-22 checkpoint has no `bond_conditioner` entry and was trained with the
+        pairwise conditioner, so it must map to "pairwise" rather than to the current
+        default - otherwise loading it would silently build a different architecture.
+        """
         data = dict(payload)
         data["condition_features"] = tuple(data.get("condition_features", ("n", "qed")))
+        data.setdefault("bond_conditioner", "pairwise")
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -444,9 +560,20 @@ class ConditionalGraphFlow(nn.Module):
                 }))
             return layers
 
-        self.bond_layers = stack(
-            config.num_bond_types, config.bond_blocks,
-            lambda p, o: BondSubnet(p, o, config.hidden, config.condition_dim, width))
+        if config.bond_conditioner not in BOND_CONDITIONERS:
+            raise ValueError(f"unknown bond_conditioner {config.bond_conditioner!r}; "
+                             f"known: {list(BOND_CONDITIONERS)}")
+
+        def bond_subnet(passthrough: int, outputs: int) -> nn.Module:
+            if config.bond_conditioner == "topology":
+                return TopologyBondSubnet(passthrough, outputs, config.conv_hidden,
+                                          config.condition_dim, width,
+                                          layers=config.conv_layers,
+                                          kernel=config.conv_kernel)
+            return BondSubnet(passthrough, outputs, config.hidden, config.condition_dim,
+                              width)
+
+        self.bond_layers = stack(config.num_bond_types, config.bond_blocks, bond_subnet)
         self.atom_layers = stack(
             config.num_atom_types, config.atom_blocks,
             lambda p, o: AtomSubnet(p, o, config.hidden, config.condition_dim,
@@ -645,10 +772,13 @@ def neutralise_coupling_condition(flow: ConditionalGraphFlow):
 
 
 __all__ = [
+    "BOND_CONDITIONERS",
+    "BondSubnet",
     "ConditionalCoupling",
     "ConditionalGraphFlow",
     "ConditionalPrior",
     "GraphFlowConfig",
+    "TopologyBondSubnet",
     "MaskedActNorm",
     "MaskedInvertibleLinear",
     "dequantize",

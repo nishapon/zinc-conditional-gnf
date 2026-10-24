@@ -24,16 +24,19 @@ oracle to choose a sample. The only place RDKit appears is sanitisation and meas
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Sequence
 
 import numpy as np
 from rdkit import Chem, rdBase
 import torch
 
-from zinc_gnf.constants_charge_aware import ATOM_VALENCE
+from zinc_gnf.chemistry_charge_aware import graph_to_mol_charge_aware
+from zinc_gnf.constants_charge_aware import ATOM_VALENCE, ATOM_VOCAB
 from zinc_gnf.generation import _molecule_record
 
 MAX_CORRECTION_STEPS_PER_ATOM = 12
+ATOM_BOND_LABELS = {0: "none", 1: "single", 2: "double", 3: "triple"}
 
 
 def _components(bond: np.ndarray) -> list[list[int]]:
@@ -102,6 +105,121 @@ def valency_correction(atom_types: np.ndarray, bond_matrix: np.ndarray, *,
     return atoms[index], bonds[np.ix_(index, index)], info
 
 
+def graph_structure_statistics(atom_types: np.ndarray, bond_matrix: np.ndarray, *,
+                               valence_caps: Sequence[int] = ATOM_VALENCE
+                               ) -> dict[str, Any]:
+    """Structural facts about ONE raw graph, and the single reason it is not a molecule.
+
+    Stage 22b reported raw validity 0.0012 without saying why; stage 22c showed the
+    answer is "both at once" for 74.2% of samples at N=23. Every graph is therefore
+    attributed to exactly one cause so the two failure modes can never be conflated:
+    too few or badly placed bonds (disconnection) and too many on one atom (over-valence)
+    have opposite fixes.
+    """
+    atoms = np.asarray(atom_types, dtype=np.int64).reshape(-1)
+    bonds = np.asarray(bond_matrix, dtype=np.int64)
+    caps = np.asarray([int(valence_caps[int(a)]) for a in atoms], dtype=np.int64)
+    totals = bonds.sum(axis=1)
+    over = int((totals > caps).sum())
+    groups = _components(bonds) if atoms.size else []
+    upper = bonds[np.triu_indices(atoms.size, 1)] if atoms.size > 1 else np.zeros(0, int)
+    sanitizable = True
+    if atoms.size:
+        try:
+            with rdBase.BlockLogs():
+                graph_to_mol_charge_aware(atoms, bonds)
+        except Exception:  # noqa: BLE001
+            sanitizable = False
+    disconnected = len(groups) > 1
+    if over and disconnected:
+        cause = "over_valent_and_disconnected"
+    elif over:
+        cause = "over_valent_only"
+    elif disconnected:
+        cause = "disconnected_only"
+    elif not sanitizable:
+        cause = "other_sanitisation_failure"
+    else:
+        cause = "valid"
+    return {
+        "cause": cause,
+        "atoms": int(atoms.size),
+        "bonds": int((upper > 0).sum()),
+        "bond_density": float((upper > 0).mean()) if upper.size else float("nan"),
+        "components": len(groups),
+        "largest_component": max((len(g) for g in groups), default=0),
+        "isolated_atoms": int(sum(1 for g in groups if len(g) == 1)),
+        "over_valent_atoms": over,
+        "excess_bond_order": int(np.clip(totals - caps, 0, None).sum()),
+        "bond_type_counts": {int(k): int((upper == k).sum()) for k in range(4)},
+        "atom_type_counts": {int(k): int((atoms == k).sum())
+                             for k in np.unique(atoms)} if atoms.size else {},
+    }
+
+
+def population_structure(graphs: Sequence[dict[str, Any]], *, requested_n: int
+                         ) -> dict[str, Any]:
+    """Aggregate the per-graph statistics over a sampled population."""
+    rows = [graph_structure_statistics(g["atom_types"], g["bond_matrix"]) for g in graphs]
+    if not rows:
+        return {"samples": 0}
+    causes = Counter(r["cause"] for r in rows)
+    bond_types: Counter = Counter()
+    atom_types: Counter = Counter()
+    for row in rows:
+        bond_types.update(row["bond_type_counts"])
+        atom_types.update(row["atom_type_counts"])
+    total_bond_slots = sum(bond_types.values()) or 1
+    total_atoms = sum(atom_types.values()) or 1
+    lost, removed, exact = [], [], []
+    for graph in graphs:
+        _, _, info = valency_correction(graph["atom_types"], graph["bond_matrix"])
+        lost.append(info["atoms_total"] - info["atoms_kept"])
+        removed.append(info["bond_orders_removed"])
+        exact.append(int(info["atoms_kept"] == int(requested_n)))
+    mean = lambda key: float(np.mean([r[key] for r in rows]))  # noqa: E731
+    return {
+        "samples": len(rows),
+        "requested_n": int(requested_n),
+        "bonds_mean": mean("bonds"),
+        "bond_density_mean": mean("bond_density"),
+        "components_mean": mean("components"),
+        "largest_component_mean": mean("largest_component"),
+        "largest_component_fraction_of_n": mean("largest_component") / max(requested_n, 1),
+        "isolated_atoms_mean": mean("isolated_atoms"),
+        "over_valent_atoms_mean": mean("over_valent_atoms"),
+        "excess_bond_order_mean": mean("excess_bond_order"),
+        "causes": dict(causes),
+        "cause_fractions": {k: v / len(rows) for k, v in causes.items()},
+        "raw_valid_rate": causes.get("valid", 0) / len(rows),
+        "bond_type_fraction": {ATOM_BOND_LABELS[k]: v / total_bond_slots
+                               for k, v in sorted(bond_types.items())},
+        "atom_type_fraction": {ATOM_VOCAB[k]: v / total_atoms
+                               for k, v in sorted(atom_types.items())},
+        "correction_atoms_lost_mean": float(np.mean(lost)),
+        "correction_orders_removed_mean": float(np.mean(removed)),
+        "correction_exact_n_rate": float(np.mean(exact)),
+    }
+
+
+def real_structure_reference(records: Sequence[dict[str, Any]], *, n: int,
+                            limit: int = 512) -> dict[str, Any] | None:
+    """The same statistics computed on REAL training molecules at this N.
+
+    Without this the generated numbers have no scale: stage 22c only became readable once
+    17.4 generated bonds could be set beside 24.7 real ones at N=23.
+    """
+    rows = [r for r in records if int(r["n_node"]) == int(n)][:int(limit)]
+    if not rows:
+        return None
+    graphs = [{"atom_types": np.asarray(r["atom_types"], dtype=np.int64),
+               "bond_matrix": np.asarray(r["bond_matrix"], dtype=np.int64)}
+              for r in rows]
+    reference = population_structure(graphs, requested_n=int(n))
+    reference["source"] = "train_split"
+    return reference
+
+
 def _heavy_atoms(smiles: str | None) -> int:
     if not smiles:
         return -1
@@ -127,7 +245,7 @@ def _ring_statistics(smiles: str | None) -> dict[str, Any]:
 def _entry(atom_types: np.ndarray, bond_matrix: np.ndarray, requested_n: int,
            extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """One decoding attempt, scored with the project's own validity definition."""
-    if atom_types.size == 0:
+    if np.asarray(atom_types).size == 0:
         record: dict[str, Any] = {"sanitizable": False, "connected": False, "valid": False,
                                   "smiles": None, "fragments": None, "qed": None,
                                   "rings": None, "aromatic_rings": None}
@@ -202,6 +320,7 @@ def generate_conditional(flow, *, scaler, n: int, qed: float, count: int,
     sampled = flow.sample(counts, context, temperature=float(temperature),
                           generator=generator, device=device)
     graphs = flow.discrete_graphs(sampled)
+    structure = population_structure(graphs, requested_n=int(n))
     records = graphs_to_records(graphs, requested_n=counts, correct=correct)
     for position, record in enumerate(records):
         record["index"] = position
@@ -211,6 +330,7 @@ def generate_conditional(flow, *, scaler, n: int, qed: float, count: int,
     nonfinite = sum(1 for r in records if r["nonfinite"])
     return {
         "records": records,
+        "structure": structure,
         "settings": {"requested_n": int(n), "requested_qed": float(qed),
                      "count": int(count), "temperature": float(temperature),
                      "seed": int(seed), "unconditional": bool(unconditional),
@@ -229,7 +349,11 @@ def generate_conditional(flow, *, scaler, n: int, qed: float, count: int,
 
 
 __all__ = [
+    "ATOM_BOND_LABELS",
     "generate_conditional",
+    "graph_structure_statistics",
     "graphs_to_records",
+    "population_structure",
+    "real_structure_reference",
     "valency_correction",
 ]

@@ -50,7 +50,11 @@ import torch  # noqa: E402
 
 from zinc_gnf.conditioning import load_condition_scaler  # noqa: E402
 from zinc_gnf.dataset import MolecularGraphDataset, load_training_splits  # noqa: E402
-from zinc_gnf.graph_flow import ConditionalGraphFlow, GraphFlowConfig  # noqa: E402
+from zinc_gnf.graph_flow import (  # noqa: E402
+    BOND_CONDITIONERS,
+    ConditionalGraphFlow,
+    GraphFlowConfig,
+)
 from zinc_gnf.trainer_graph_flow import (  # noqa: E402
     GraphFlowTrainConfig,
     GraphFlowTrainer,
@@ -74,6 +78,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bond-blocks", type=int, default=6)
     parser.add_argument("--atom-blocks", type=int, default=6)
     parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--bond-conditioner", choices=BOND_CONDITIONERS,
+                        default=GraphFlowConfig().bond_conditioner,
+                        help="topology = stage-23 masked 2-D convolution over the "
+                             "adjacency grid; pairwise = the stage-22 conditioner, kept "
+                             "as a baseline")
+    parser.add_argument("--conv-hidden", type=int, default=GraphFlowConfig().conv_hidden)
+    parser.add_argument("--conv-layers", type=int, default=GraphFlowConfig().conv_layers)
+    parser.add_argument("--conv-kernel", type=int, default=GraphFlowConfig().conv_kernel)
     parser.add_argument("--condition-dim", type=int, default=64)
     parser.add_argument("--condition-dropout", type=float, default=0.1)
     parser.add_argument("--noise-scale", type=float, default=0.6,
@@ -158,13 +170,27 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             condition_dropout=arguments.condition_dropout,
             conditional_prior=not arguments.no_conditional_prior,
             noise_scale=arguments.noise_scale, max_log_scale=arguments.max_log_scale,
-            max_shift=arguments.max_shift)
+            max_shift=arguments.max_shift,
+            bond_conditioner=arguments.bond_conditioner,
+            conv_hidden=arguments.conv_hidden, conv_layers=arguments.conv_layers,
+            conv_kernel=arguments.conv_kernel)
         model = ConditionalGraphFlow(config)
         parameters = sum(p.numel() for p in model.parameters())
         logger.info(f"model parameters: {parameters:,} "
                     f"(bond_blocks={config.bond_blocks} atom_blocks={config.atom_blocks} "
                     f"hidden={config.hidden} conditional_prior={config.conditional_prior} "
                     f"condition_dropout={config.condition_dropout})")
+        logger.info(f"bond conditioner: {config.bond_conditioner}"
+                    + (f" (masked 2-D conv, {config.conv_layers} layers, "
+                       f"{config.conv_kernel}x{config.conv_kernel}, "
+                       f"{config.conv_hidden} channels)"
+                       if config.bond_conditioner == "topology" else
+                       " (stage-22 pairwise aggregates: provably blind to topology at a "
+                       "fixed degree sequence)"))
+        logger.info(f"numerics: max_log_scale={config.max_log_scale} "
+                    f"max_shift={config.max_shift}; inverse condition-number bound "
+                    f"exp(bond_blocks * max_log_scale) = "
+                    f"{float(np.exp(config.bond_blocks * config.max_log_scale)):.3g}")
         logger.info(f"dequantization U[0,{config.noise_scale}] -> the reported NLL is an "
                     f"UPPER BOUND on the discrete NLL and is NOT comparable with the "
                     f"embedding flow's continuous density")

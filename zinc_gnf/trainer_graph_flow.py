@@ -52,6 +52,9 @@ from zinc_gnf.graph_flow import (
 
 VALIDATION_SUBSET_SEED = 12345
 PERMUTATION_SEED = 20261024
+# Above this relative latent round-trip error the inverse - and therefore sampling - can
+# no longer be trusted. Stage 22a's prior-only ablation reached 1.23e-03.
+ROUND_TRIP_LIMIT = 1e-3
 
 
 @dataclass
@@ -242,6 +245,40 @@ class GraphFlowTrainer:
         }
 
     @torch.no_grad()
+    def inverse_health(self, *, count: int = 16) -> dict[str, Any]:
+        """Is the inverse still trustworthy? Checked at init and at every evaluation.
+
+        Sampling IS the inverse, so an ill-conditioned stack produces molecules that are
+        not drawn from the trained density while the loss curve still looks healthy. The
+        stage-22a run shipped at `max_log_scale=2.0`, whose inverse condition number is
+        ~exp(blocks * 2.0), and its prior-only ablation came back at 1.23e-03 - unusable.
+        This turns that into a tracked metric instead of a post-hoc discovery.
+        """
+        self.model.eval()
+        width = self.model.config.max_nodes
+        probe = min(int(count), len(self.val_indices)) or 1
+        counts = [int(self.val_set.n_node[int(i)])
+                  for i in self.val_indices[:probe]] or [width // 2]
+        condition = torch.stack([
+            torch.as_tensor(self.val_set[int(i)]["condition"], dtype=torch.float32)
+            for i in self.val_indices[:probe]]).to(self.device)
+        context = self.model.conditioning(condition)
+        sampled = self.model.sample(counts, context, temperature=1.0,
+                                    generator=torch.Generator(
+                                        device=self.device).manual_seed(0),
+                                    device=self.device)
+        error = sampled["latent_round_trip_relative_error"]
+        worst = float(max(error.values()))
+        return {"latent_round_trip": error, "worst": worst,
+                "acceptable": bool(worst <= ROUND_TRIP_LIMIT),
+                "limit": ROUND_TRIP_LIMIT,
+                "condition_number_bound": float(np.exp(
+                    self.model.config.bond_blocks * self.model.config.max_log_scale)),
+                "note": ("sampling is the inverse; above the limit the samples are not "
+                         "drawn from the trained density and no generation metric is "
+                         "valid")}
+
+    @torch.no_grad()
     def evaluate(self) -> dict[str, Any]:
         self.model.eval()
         totals: dict[str, list[float]] = {}
@@ -256,6 +293,15 @@ class GraphFlowTrainer:
         summary = {key: float(np.mean(values)) for key, values in totals.items()}
         summary["molecules"] = len(self.val_indices)
         summary.update(self.condition_gap(self.val_indices))
+        health = self.inverse_health()
+        summary["inverse_round_trip_worst"] = health["worst"]
+        summary["inverse_acceptable"] = health["acceptable"]
+        if not health["acceptable"]:
+            self.logger.error(
+                f"ILL-CONDITIONED INVERSE: round-trip {health['worst']:.2e} exceeds "
+                f"{ROUND_TRIP_LIMIT:.0e}. Samples from this model are NOT drawn from its "
+                f"trained density. Condition-number bound exp(blocks * max_log_scale) = "
+                f"{health['condition_number_bound']:.3g}; lower --max-log-scale.")
         return summary
 
     # -- checkpoints -------------------------------------------------------
@@ -327,6 +373,21 @@ class GraphFlowTrainer:
             return {"step": step, "history": self.history, "completed": True}
         started = time.perf_counter()
         window: list[dict[str, float]] = []
+        # AT INITIALISATION: the inverse must already be sound, before any training can be
+        # blamed for it. ActNorm needs one forward pass on real data to initialise first.
+        self.model.train()
+        self._loss(make_batch(self.train_set, self.batcher.next_indices()), dropout=False)
+        initial = self.inverse_health()
+        self.logger.info(f"inverse at initialisation: round-trip "
+                         f"{initial['worst']:.2e} (limit {ROUND_TRIP_LIMIT:.0e}), "
+                         f"condition-number bound {initial['condition_number_bound']:.3g}")
+        if not initial["acceptable"]:
+            self.logger.error("the inverse is ill-conditioned BEFORE training; refusing "
+                              "to spend GPU hours on a model whose samples cannot be "
+                              "trusted. Lower --max-log-scale.")
+            return {"step": step, "history": self.history, "completed": False,
+                    "failure": "ill_conditioned_inverse_at_initialisation",
+                    "inverse_health": initial}
         self.logger.info(f"training to step {self.config.max_steps} "
                          f"(batch {self.config.batch_size}, lr {self.config.learning_rate}, "
                          f"{self.batcher.batches_per_epoch} batches per epoch)")

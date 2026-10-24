@@ -53,7 +53,10 @@ from zinc_gnf.conditioning import load_condition_scaler  # noqa: E402
 from zinc_gnf.dataset import MolecularGraphDataset, load_training_splits  # noqa: E402
 from zinc_gnf.decoder_information import support_counts  # noqa: E402
 from zinc_gnf.graph_flow import neutralise_coupling_condition  # noqa: E402
-from zinc_gnf.graph_flow_generation import generate_conditional  # noqa: E402
+from zinc_gnf.graph_flow_generation import (  # noqa: E402
+    generate_conditional,
+    real_structure_reference,
+)
 from zinc_gnf.metrics_generation import decoder_metrics, internal_diversity  # noqa: E402
 from zinc_gnf.qed_evaluation import qed_achievement_table, qed_target_metrics  # noqa: E402
 from zinc_gnf.qed_probes import paired_bootstrap_ci  # noqa: E402
@@ -73,6 +76,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data/processed/zinc250k_charge_aware_moflow_fixed")
     parser.add_argument("--null-checkpoint", default=None,
                         help="the --shuffle-qed arm; the null for every number here")
+    parser.add_argument("--previous-graph-checkpoint", default=None,
+                        help="an earlier graph flow (e.g. the stage-22 pairwise "
+                             "conditioner) to compare against under identical requests")
     parser.add_argument("--baseline-flow-checkpoint", default=None,
                         help="the stage-17 warm start (READ-ONLY)")
     parser.add_argument("--baseline-ae-checkpoint", default=None)
@@ -196,6 +202,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             arms["graph_flow_null"] = {"model": null_model, "kind": "graph"}
             logger.info(f"null arm {arguments.null_checkpoint} step={null_meta.get('step')} "
                         f"arm={(null_meta.get('provenance') or {}).get('arm')}")
+        if arguments.previous_graph_checkpoint:
+            previous, previous_meta = load_graph_flow(
+                Path(arguments.previous_graph_checkpoint), device=device)
+            arms["graph_flow_previous"] = {"model": previous, "kind": "graph"}
+            logger.info(f"previous graph flow {arguments.previous_graph_checkpoint} "
+                        f"step={previous_meta.get('step')} conditioner="
+                        f"{previous.config.bond_conditioner} "
+                        f"max_log_scale={previous.config.max_log_scale} (READ-ONLY)")
         arms["graph_flow_prior"] = {"model": model, "kind": "graph", "prior_only": True}
         baseline = None
         if arguments.baseline_flow_checkpoint:
@@ -216,6 +230,17 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             logger.info(f"baseline {arguments.baseline_flow_checkpoint} "
                         f"step={base_meta.get('step')} (READ-ONLY, stage-17 warm start)")
 
+        # Real structural reference per N: without it the generated numbers have no scale.
+        real_reference = {int(n): real_structure_reference(train_records, n=int(n))
+                          for n in targets_n}
+        for n, reference in real_reference.items():
+            if reference is None:
+                logger.warn(f"no training molecule has N={n}; structural comparison at "
+                            f"this N is unavailable")
+            else:
+                logger.info(f"REAL N={n}: {reference['bonds_mean']:.1f} bonds, "
+                            f"{reference['components_mean']:.2f} components, carbon "
+                            f"{reference['atom_type_fraction'].get('C', 0.0):.3f}")
         support = support_counts(train_set, n_values=targets_n, qed_values=targets_qed,
                                  window=float(arguments.qed_window))
         for row in support:
@@ -255,7 +280,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                             records = output["records"]
                             round_trip.append(
                                 output["settings"]["latent_round_trip_relative_error"])
+                            structure = output.get("structure")
                         else:
+                            structure = None
                             records = _baseline_sample(
                                 arm, scaler=scaler, n=n, qed=qed,
                                 count=int(arguments.count), temperature=temperature,
@@ -266,7 +293,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                             "n": int(n), "requested_qed": float(qed),
                             "temperature": float(temperature), "samples": len(records),
                             "decoders": {}, "realised": {},
+                            "structure": structure,
+                            "real_reference": real_reference.get(int(n)),
                         }
+                        if structure:
+                            reference = real_reference.get(int(n)) or {}
+                            logger.info(
+                                f"    structure: {structure['bonds_mean']:.1f} bonds vs "
+                                f"real {reference.get('bonds_mean', float('nan')):.1f}, "
+                                f"components {structure['components_mean']:.2f}, largest "
+                                f"{structure['largest_component_mean']:.1f}/{n}, "
+                                f"over-valent {structure['over_valent_atoms_mean']:.2f}, "
+                                f"raw valid {structure['raw_valid_rate'] * 100:.2f}%")
                         for decoder in decoders:
                             values = [float(r[decoder]["qed"]) for r in records
                                       if r[decoder].get("valid")
@@ -427,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                      for name, arm in arms.items()},
             "cells": {name: [{k: v for k, v in cell.items() if k != "realised"}
                              for cell in rows] for name, rows in cells.items()},
+            "real_structure_reference": real_reference,
             "summary": summary,
             "cost": cost,
             "likelihood": likelihood,
@@ -601,7 +640,40 @@ def _report(payload: dict[str, Any]) -> str:
               "density and no other number",
               "in this report means anything. Check it before reading table A.", ""]
 
-    lines += ["=" * 108, "C. support - every count with its denominator", "=" * 108]
+    lines += ["=" * 108,
+              "C. STRUCTURE of the RAW graphs against real molecules at the same N",
+              "=" * 108,
+              f"{'arm':<19}{'T':>5}{'N':>4}{'bonds':>8}{'real':>7}{'comps':>7}"
+              f"{'largest':>9}{'over-val':>9}{'raw valid':>10}{'lost':>7}{'carbon':>8}"
+              f"{'real C':>8}"]
+    for arm, rows in (payload.get("cells") or {}).items():
+        for cell in rows:
+            structure = cell.get("structure")
+            if not structure:
+                continue
+            reference = cell.get("real_reference") or {}
+            lines.append(
+                f"{arm:<19}{cell['temperature']:>5.2g}{cell['n']:>4}"
+                f"{show(structure['bonds_mean'], '{:.1f}'):>8}"
+                f"{show(reference.get('bonds_mean'), '{:.1f}'):>7}"
+                f"{show(structure['components_mean'], '{:.2f}'):>7}"
+                f"{show(structure['largest_component_mean'], '{:.1f}'):>9}"
+                f"{show(structure['over_valent_atoms_mean'], '{:.2f}'):>9}"
+                f"{show(structure['raw_valid_rate'], '{:.4f}'):>10}"
+                f"{show(structure['correction_atoms_lost_mean'], '{:.1f}'):>7}"
+                f"{show(structure['atom_type_fraction'].get('C'), '{:.3f}'):>8}"
+                f"{show((reference.get('atom_type_fraction') or {}).get('C'), '{:.3f}'):>8}")
+    lines += ["", "This is the table stage 23 exists to move. Stage 22 produced 17.4 bonds "
+                  "against 24.7 real at",
+              "N=23 with 7.00 components, and 74.2% of graphs were over-valent AND "
+              "disconnected at once - so",
+              "'bonds' must rise TOWARDS 'real' while 'over-val' does NOT: buying validity "
+              "by adding bonds",
+              "indiscriminately would show up here as both columns climbing together.",
+              "'lost' is the atoms the corrector drops, which is what caps exact N before "
+              "anything else.", ""]
+
+    lines += ["=" * 108, "D. support - every count with its denominator", "=" * 108]
     for row in payload["support"]:
         parts = ", ".join(f"QED {k}: {v['molecules_within_window']:,}"
                           for k, v in row["by_qed"].items())
@@ -609,7 +681,7 @@ def _report(payload: dict[str, Any]) -> str:
                      f"molecules; {parts}; minimum {row['minimum_over_qed_values']:,}")
     lines += [""]
 
-    lines += ["=" * 108, "D. likelihoods - LABELLED, AND COMPARED TO NOTHING", "=" * 108]
+    lines += ["=" * 108, "E. likelihoods - LABELLED, AND COMPARED TO NOTHING", "=" * 108]
     for key, block in payload["likelihood"].items():
         if key == "warning":
             continue
