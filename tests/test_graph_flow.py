@@ -39,6 +39,7 @@ import torch
 from tests.test_autoencoder_training import write_dataset
 from zinc_gnf.constants_charge_aware import ATOM_VALENCE, NUM_ATOM_TYPES, NUM_BOND_TYPES
 from zinc_gnf.graph_flow import (
+    BondSubnet,
     ConditionalCoupling,
     ConditionalGraphFlow,
     GraphFlowConfig,
@@ -204,8 +205,9 @@ def test_the_log_determinant_matches_the_true_jacobian():
     reduced = jacobian[index][:, index]
     numeric = torch.slogdet(reduced)[1]
     _, analytic = flow._run(flow.bond_layers, bonds, pair_mask, context, None)
-    assert float(analytic[0]) == pytest.approx(float(numeric), abs=2e-2), (
-        f"analytic logdet {float(analytic[0])} vs numeric {float(numeric)}")
+    measured = float(analytic[0].detach())
+    assert measured == pytest.approx(float(numeric), abs=2e-2), (
+        f"analytic logdet {measured} vs numeric {float(numeric)}")
     assert live.any()
     _ = flow_double
 
@@ -215,8 +217,9 @@ def test_padding_is_untouched_and_contributes_nothing():
     flow = tiny_flow()
     atoms, bonds, node_mask, pair_mask, context = make_inputs(flow, [10, 6, 3])
     encoded = flow.encode(atoms, bonds, node_mask, pair_mask, context)
-    assert float((encoded["z_bond"] * (~pair_mask).unsqueeze(-1)).abs().max()) == 0.0
-    assert float((encoded["z_atom"] * (~node_mask).unsqueeze(-1)).abs().max()) == 0.0
+    bond_leak = float((encoded["z_bond"] * (~pair_mask).unsqueeze(-1)).abs().max().detach())
+    atom_leak = float((encoded["z_atom"] * (~node_mask).unsqueeze(-1)).abs().max().detach())
+    assert bond_leak == 0.0 and atom_leak == 0.0
 
 
 def test_garbage_in_the_padding_cannot_change_the_likelihood():
@@ -755,3 +758,226 @@ def test_the_architecture_review_states_what_is_not_established():
     for name in ("MoFlow", "GraphNVP", "GraphAF", "GraphDF", "cINN"):
         assert name in text
     assert "arxiv.org" in text, "the review must cite its sources"
+
+
+# ===========================================================================
+# Stage 22c: the defects found while diagnosing the stage-22a run, and the
+# limitation that is NOT a defect but is also not undertraining.
+# ===========================================================================
+def test_the_representation_round_trips_on_real_molecules():
+    """THE decisive representation test: real molecule -> tensors -> argmax -> molecule.
+
+    Stage 22b reported raw validity 0.0012, which raises the question of whether padding,
+    masking, symmetry, dequantization or discretisation are wrong. They are not: this
+    drives real molecules - charged species, halogens, Kekulé aromatics - through exactly
+    the path the trainer and sampler use and requires the canonical SMILES back.
+    """
+    from rdkit import Chem, rdBase
+
+    from zinc_gnf.chemistry_charge_aware import (
+        encode_zinc_smiles_charge_aware,
+        graph_to_mol_charge_aware,
+    )
+
+    smiles = ["CC(=O)Nc1ccc(O)cc1", "c1ccccc1", "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
+              "O=C(Nc1ccc(F)cc1)c1cc(Cl)ccc1Br", "CCOC(=O)c1ccccc1", "c1ccsc1"]
+    width = 38
+    rows, cols = (t.numpy() for t in upper_triangle_indices(width))
+    checked = 0
+    for text in smiles:
+        outcome = encode_zinc_smiles_charge_aware(text)
+        record = outcome[0] if isinstance(outcome, tuple) else outcome
+        if not isinstance(record, dict) or "atom_types" not in record:
+            continue
+        checked += 1
+        truth_atoms = np.asarray(record["atom_types"], dtype=np.int64)
+        truth_bonds = np.asarray(record["bond_matrix"], dtype=np.int64)
+        count = int(truth_atoms.size)
+
+        atoms = torch.zeros(1, width, dtype=torch.long)
+        atoms[0, :count] = torch.from_numpy(truth_atoms)
+        bonds = torch.zeros(1, width, width, dtype=torch.long)
+        bonds[0, :count, :count] = torch.from_numpy(truth_bonds)
+        node_mask = torch.zeros(1, width, dtype=torch.bool)
+        node_mask[0, :count] = True
+        pair_mask = pair_mask_from_counts([count], width)
+
+        x_atom, x_bond = dequantize(
+            atoms, bonds, node_mask, pair_mask, num_atom_types=NUM_ATOM_TYPES,
+            num_bond_types=NUM_BOND_TYPES, noise_scale=0.6,
+            generator=torch.Generator().manual_seed(0))
+        decoded_atoms = x_atom.argmax(-1)[0, :count].numpy()
+        choice = x_bond.argmax(-1)[0].numpy()
+        decoded_bonds = np.zeros((count, count), dtype=np.int64)
+        for position in np.flatnonzero(pair_mask[0].numpy() & (choice > 0)):
+            i, j = int(rows[position]), int(cols[position])
+            decoded_bonds[i, j] = decoded_bonds[j, i] = int(choice[position])
+
+        assert np.array_equal(decoded_atoms, truth_atoms), text
+        assert np.array_equal(decoded_bonds, truth_bonds), text
+        with rdBase.BlockLogs():
+            rebuilt = Chem.MolToSmiles(
+                graph_to_mol_charge_aware(decoded_atoms, decoded_bonds))
+            original = Chem.MolToSmiles(Chem.MolFromSmiles(record["smiles"]))
+        assert rebuilt == original, f"{text}: {rebuilt} != {original}"
+    assert checked >= 5, "the round trip must actually have been exercised"
+
+
+def test_the_bond_conditioner_is_blind_to_topology_at_a_fixed_degree_sequence():
+    """A LIMITATION, verified - and one that training cannot remove.
+
+    The bond coupling's conditioner gives a pair only its own channels plus the per-atom
+    sums `r_i + r_j` and `|r_i - r_j|`. Two graphs with the same degree sequence are
+    therefore identical to it: a six-ring and two three-rings get byte-identical scales
+    and shifts on every pair they share. Connectivity and ring closure are exactly the
+    properties that need that distinction, so no amount of further training can make this
+    conditioner express them.
+
+    Note what this is NOT: the symmetry argument that motivated the sum aggregates is
+    unnecessary. Only the strict upper triangle is modelled and `unpack_upper` mirrors it,
+    so each pair appears once and matrix symmetry holds whatever the conditioner does.
+    """
+    torch.manual_seed(0)
+    width = 6
+    subnet = BondSubnet(passthrough=2, outputs=2, hidden=32, condition_dim=8, width=width)
+    with torch.no_grad():
+        for parameter in subnet.net[-1].parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.5)
+    rows, cols = upper_triangle_indices(width)
+    position_of = {
+        (min(a, b), max(a, b)): int(torch.nonzero(
+            (rows == min(a, b)) & (cols == max(a, b))).flatten()[0])
+        for a in range(width) for b in range(width) if a != b}
+
+    def configuration(edges):
+        values = torch.zeros(1, rows.numel(), 2)
+        for a, b in edges:
+            values[0, position_of[(min(a, b), max(a, b))], 0] = 1.0
+        return values
+
+    ring = configuration([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)])
+    triangles = configuration([(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)])
+
+    def degrees(values):
+        return [int(values[0, (rows == i) | (cols == i), 0].sum()) for i in range(width)]
+
+    assert degrees(ring) == degrees(triangles) == [2] * width
+    mask = torch.ones(1, rows.numel(), dtype=torch.bool)
+    context = torch.randn(1, 8)
+    with torch.no_grad():
+        ring_scale, ring_shift = subnet(ring, mask, context)
+        triangle_scale, triangle_shift = subnet(triangles, mask, context)
+    for edge in ((0, 1), (1, 2), (3, 4), (4, 5)):          # present in BOTH graphs
+        position = position_of[edge]
+        assert torch.equal(ring_scale[0, position], triangle_scale[0, position]), edge
+        assert torch.equal(ring_shift[0, position], triangle_shift[0, position]), edge
+
+
+def test_the_training_script_default_tracks_the_dataclass():
+    """The stage-22a defect: the script hard-coded 2.0 while the dataclass said 0.75."""
+    script = load_script("23_train_graph_flow.py")
+    arguments = script.parse_args(["--output-dir", "x"])
+    reference = GraphFlowConfig()
+    assert arguments.max_log_scale == reference.max_log_scale
+    assert arguments.max_shift == reference.max_shift
+    assert arguments.noise_scale == reference.noise_scale
+
+
+def test_resuming_with_a_different_configuration_is_refused(fixture_data, tmp_path):
+    """`max_log_scale` is a plain float, so `load_state_dict` would accept it silently.
+
+    That is how the stage-22a run came to be trained at 2.0 while the dataclass said
+    0.75: nothing compared the two. Resuming must refuse rather than quietly implement a
+    different function with the same weights.
+    """
+    script = load_script("23_train_graph_flow.py")
+    run = tmp_path / "run"
+    common = ["--output-dir", str(run), "--data-dir", str(fixture_data["dir"]),
+              "--batch-size", "4", "--bond-blocks", "2", "--atom-blocks", "2",
+              "--hidden", "32", "--condition-dim", "16", "--val-molecules", "8",
+              "--warmup-steps", "1", "--device", "cpu", "--max-nodes", "18",
+              "--eval-every", "2", "--save-every", "2", "--log-every", "2"]
+    assert script.main(common + ["--max-steps", "2", "--max-log-scale", "0.75"]) == 0
+    # same directory, different numerical configuration -> must fail, not continue
+    assert script.main(common + ["--max-steps", "4", "--max-log-scale", "2.0"]) == 4
+    log = (run / "train.log").read_text()
+    assert "DIFFERENT model configuration" in log
+    assert "max_log_scale" in log
+    # the checkpoint's own value still resumes cleanly
+    assert script.main(common + ["--max-steps", "4", "--max-log-scale", "0.75"]) == 0
+
+
+def test_a_saturated_stack_at_a_large_log_scale_breaks_the_inverse():
+    """Quantifies why the prior-only ablation reported 1.4e-02 while the full arm had 3.3e-05.
+
+    The subnets were trained WITH a context vector; neutralising it pushes them
+    off-distribution, the log-scales saturate toward their bound, and the inverse
+    condition number is ~exp(blocks * max_log_scale). At 2.0 over 6 blocks that is
+    exp(12) ~ 1.6e5 against float32's ~1e-7 precision, leaving no margin.
+    """
+    errors = {}
+    for bound in (0.75, 2.0):
+        torch.manual_seed(5)
+        flow = ConditionalGraphFlow(GraphFlowConfig(
+            max_nodes=12, bond_blocks=6, atom_blocks=6, hidden=48, condition_dim=16,
+            condition_hidden=32, max_log_scale=bound, max_shift=3.0))
+        make_inputs(flow, [12, 12])
+        _wake_couplings(flow, scale=1.2)
+        context = flow.conditioning(torch.randn(2, 2))
+        with neutralise_coupling_condition(flow):
+            sampled = flow.sample([12, 12], context, temperature=1.0,
+                                  generator=torch.Generator().manual_seed(1))
+        errors[bound] = max(sampled["latent_round_trip_relative_error"].values())
+    assert errors[0.75] < 1e-2, errors
+    assert errors[2.0] > errors[0.75] * 100, (
+        f"a large log-scale bound must visibly degrade the inverse: {errors}")
+
+
+def test_the_diagnostic_attributes_raw_failures_and_runs_read_only(fixture_data, tmp_path):
+    train = load_script("23_train_graph_flow.py")
+    run = tmp_path / "run"
+    assert train.main([
+        "--output-dir", str(run), "--data-dir", str(fixture_data["dir"]),
+        "--max-steps", "4", "--batch-size", "4", "--bond-blocks", "2",
+        "--atom-blocks", "2", "--hidden", "32", "--condition-dim", "16",
+        "--val-molecules", "8", "--eval-every", "4", "--save-every", "4",
+        "--log-every", "4", "--warmup-steps", "1", "--device", "cpu",
+        "--max-nodes", "18"]) == 0
+    before = (run / "last.pt").read_bytes()
+
+    output = tmp_path / "diag"
+    assert load_script("25_graph_flow_diagnostics.py").main([
+        "--checkpoint", str(run / "last.pt"), "--output-dir", str(output),
+        "--data-dir", str(fixture_data["dir"]), "--target-n", "9",
+        "--target-qed", "0.8", "--temperature", "0.85", "--count", "16",
+        "--real-molecules", "20", "--seed", "17"]) == 0
+    assert (run / "last.pt").read_bytes() == before, "the diagnostic must be READ-ONLY"
+
+    payload = json.loads((output / "graph_flow_diagnostics.json").read_text())
+    assert payload["stage"] == "22c"
+    assert payload["inverse_condition_number_bound"] > 0
+    assert payload["cells"]
+    cell = payload["cells"][0]
+    for key in ("bonds_mean", "bond_density_mean", "bond_type_fraction",
+                "atom_type_fraction", "causes", "components_mean",
+                "largest_component_mean", "largest_component_fraction_of_n",
+                "over_valent_atoms_mean", "correction_atoms_lost_mean",
+                "correction_exact_n_rate", "latent_round_trip"):
+        assert key in cell, key
+    # every sample must be attributed to exactly one named cause
+    assert sum(cell["causes"].values()) == cell["samples"]
+    assert set(cell["causes"]) <= {"valid", "over_valent_only", "disconnected_only",
+                                   "over_valent_and_disconnected",
+                                   "other_sanitisation_failure"}
+    assert set(payload["inverse_stability"]) == {"with_context", "condition_neutralised"}
+    for block in payload["inverse_stability"].values():
+        assert "log_scale_fraction_at_bound" in block
+        assert "latent_round_trip" in block
+
+
+def test_the_diagnostic_validates_its_arguments(tmp_path):
+    script = load_script("25_graph_flow_diagnostics.py")
+    assert script.main(["--checkpoint", str(tmp_path / "ghost.pt"),
+                        "--output-dir", str(tmp_path / "o"), "--target-n", ""]) == 4
+    assert script.main(["--checkpoint", str(tmp_path / "ghost.pt"),
+                        "--output-dir", str(tmp_path / "o2")]) == 2

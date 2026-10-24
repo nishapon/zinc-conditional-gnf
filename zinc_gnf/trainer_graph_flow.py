@@ -283,6 +283,25 @@ class GraphFlowTrainer:
         if not path.exists():
             return 0
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        # The architecture's numerical behaviour is carried by PLAIN FLOATS - max_log_scale,
+        # max_shift, noise_scale - not by parameters. `load_state_dict` therefore succeeds
+        # with NO shape error when they differ, silently producing a different function
+        # with the same weights. That is how the stage-22a run came to be trained at
+        # max_log_scale 2.0 while the dataclass default said 0.75. Refuse instead.
+        stored = dict(checkpoint.get("model_config") or {})
+        current = self.model.config.to_dict()
+        differences = {key: (stored.get(key), current.get(key))
+                       for key in sorted(set(stored) | set(current))
+                       if stored.get(key) != current.get(key)}
+        if differences:
+            detail = "; ".join(f"{key}: checkpoint={was!r} now={now!r}"
+                               for key, (was, now) in differences.items())
+            raise ValueError(
+                f"{path} was written by a DIFFERENT model configuration and resuming "
+                f"would silently change the function these weights implement -> "
+                f"{detail}. Pass the checkpoint's own values explicitly (for example "
+                f"--max-log-scale {stored.get('max_log_scale')}), or train into a fresh "
+                f"output directory.")
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.batcher.load_state_dict(checkpoint["batcher"])

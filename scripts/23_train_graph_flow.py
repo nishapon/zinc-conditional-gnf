@@ -78,7 +78,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--condition-dropout", type=float, default=0.1)
     parser.add_argument("--noise-scale", type=float, default=0.6,
                         help="uniform dequantization width; MoFlow used 0.6")
-    parser.add_argument("--max-log-scale", type=float, default=2.0)
+    # Defaults are taken FROM the dataclass so the two can never diverge again. They did:
+    # this script hard-coded 2.0 while GraphFlowConfig was changed to 0.75 after 2.0 was
+    # measured to destroy the inverse at depth, and the stage-22a checkpoint was trained
+    # at 2.0 as a result.
+    parser.add_argument("--max-log-scale", type=float,
+                        default=GraphFlowConfig().max_log_scale)
+    parser.add_argument("--max-shift", type=float, default=GraphFlowConfig().max_shift)
     parser.add_argument("--no-conditional-prior", action="store_true",
                         help="condition the couplings only, not the prior")
     parser.add_argument("--eval-every", type=int, default=500)
@@ -151,7 +157,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             condition_dim=arguments.condition_dim,
             condition_dropout=arguments.condition_dropout,
             conditional_prior=not arguments.no_conditional_prior,
-            noise_scale=arguments.noise_scale, max_log_scale=arguments.max_log_scale)
+            noise_scale=arguments.noise_scale, max_log_scale=arguments.max_log_scale,
+            max_shift=arguments.max_shift)
         model = ConditionalGraphFlow(config)
         parameters = sum(p.numel() for p in model.parameters())
         logger.info(f"model parameters: {parameters:,} "
