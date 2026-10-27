@@ -1,0 +1,58 @@
+# ============================================================================
+# ZINC250K charge-aware preprocessing configuration (representation v2).
+#
+# This is a SEPARATE config from configs/zinc250k.yaml (the neutral-only
+# baseline, representation zinc250k_neutral_kekule_v1), which is unchanged.
+# Outputs live in separate directories so the baseline data is never touched.
+#
+# Only the data/preprocessing and representation-interface settings are here.
+# Model sections (autoencoder, flow, generation) will be added when the graph
+# autoencoder is built; they must read node_feature_dim / valence from the
+# representation (zinc_gnf.representations.get_representation), not from
+# zinc_gnf.constants.
+# ============================================================================
+
+experiment:
+  name: zinc250k_charge_aware
+  seed: 42                 # Same seed as the baseline: same shuffle algorithm.
+
+representation:
+  version: zinc250k_charge_aware_kekule_v2
+  # Atom type = (element, formal charge). Indices 0-8 equal the baseline's nine
+  # neutral elements; 9-16 are the charge types measured on all 249,455 ZINC250K
+  # molecules (Phase 0, ISML job 323813): N+1 O-1 N-1 S-1 O+1 S+1 C-1 P+1.
+  # No frequency threshold; an unseen type is rejected with an explicit reason.
+  num_atom_types: 17       # == node_feature_dim of the future autoencoder input.
+  baseline_version: zinc250k_neutral_kekule_v1
+  baseline_processed_dir: data/processed/zinc250k   # never written by this path
+
+data:
+  csv_path: data/raw/zinc250k.csv
+  expected_sha256: 35e3f1a52b1badc0697e373d73a18ad773f415936ff992f4c6baa2e067b3e6ae
+  expected_rows: 249455
+
+  processed_dir: data/processed/zinc250k_charge_aware
+  metrics_dir: outputs/metrics/preprocessing_charge_aware
+
+  # PRIMARY-experiment dataset: MoFlow's official held-out indices as the test
+  # set, validation carved only from the remaining pool, scaler refit on the
+  # new train subset. Derived from the records above (no re-encoding) by
+  # scripts/01d_derive_moflow_split.py; the random-split directory is untouched.
+  moflow_fixed_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  moflow_fixed_metrics_dir: outputs/metrics/split_moflow_fixed
+  moflow_fixed_validation_fraction: 0.10
+  # MoFlow's published ZINC250K counts (its README); the derivation refuses to
+  # run if the files on disk do not reproduce them.
+  moflow_reference_train_count: 224568
+  moflow_reference_heldout_count: 24887
+
+  # Splitting. `random_80_10_10` is the baseline's seeded shuffle. The
+  # alternative `moflow_fixed` is only usable after the MoFlow files have been
+  # copied to the login node and verified row-for-row against our CSV (see
+  # slurm/README_charge_aware.md); it is OFF by default.
+  split_protocol: random_80_10_10
+  train_fraction: 0.80
+  validation_fraction: 0.10
+
+  min_nodes: 2
+  max_nodes: 38
