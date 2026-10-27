@@ -330,6 +330,10 @@ def generate_conditional(flow, *, scaler, n: int, qed: float, count: int,
     nonfinite = sum(1 for r in records if r["nonfinite"])
     return {
         "records": records,
+        # the discrete graphs themselves, so a caller can run structural diagnostics
+        # (valence by element, rings, Kekule alternation) on exactly the sample it scored
+        # rather than drawing a second one. numpy arrays: not JSON-serialisable.
+        "graphs": graphs,
         "structure": structure,
         "settings": {"requested_n": int(n), "requested_qed": float(qed),
                      "count": int(count), "temperature": float(temperature),

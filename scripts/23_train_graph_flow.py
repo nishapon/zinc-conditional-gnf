@@ -51,7 +51,9 @@ import torch  # noqa: E402
 from zinc_gnf.conditioning import load_condition_scaler  # noqa: E402
 from zinc_gnf.dataset import MolecularGraphDataset, load_training_splits  # noqa: E402
 from zinc_gnf.graph_flow import (  # noqa: E402
+    ATOM_CONTEXT_MODES,
     BOND_CONDITIONERS,
+    FACTORISATIONS,
     ConditionalGraphFlow,
     GraphFlowConfig,
 )
@@ -86,6 +88,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--conv-hidden", type=int, default=GraphFlowConfig().conv_hidden)
     parser.add_argument("--conv-layers", type=int, default=GraphFlowConfig().conv_layers)
     parser.add_argument("--conv-kernel", type=int, default=GraphFlowConfig().conv_kernel)
+    # Stage 25. Both orderings are exact factorisations of the same joint; the default
+    # stays bonds_first so the stage-23 baseline remains reproducible and resumable.
+    parser.add_argument("--factorisation", choices=FACTORISATIONS,
+                        default=GraphFlowConfig().factorisation,
+                        help="atoms_first = stage 25: p(X|c) p(A|X,c), so the bond "
+                             "conditioner sees endpoint identity, formal charge and "
+                             "allowed valence; bonds_first = stages 22-24")
+    parser.add_argument("--atom-conv-hidden", type=int,
+                        default=GraphFlowConfig().atom_conv_hidden,
+                        help="atoms_first only: width of the atom stack's conditioner")
+    parser.add_argument("--atom-conv-layers", type=int,
+                        default=GraphFlowConfig().atom_conv_layers)
+    parser.add_argument("--atom-conv-kernel", type=int,
+                        default=GraphFlowConfig().atom_conv_kernel)
+    parser.add_argument("--atom-context-dim", type=int,
+                        default=GraphFlowConfig().atom_context_dim,
+                        help="atoms_first only: per-atom embedding width reaching the "
+                             "bond conditioner")
+    parser.add_argument("--atom-context-mode", choices=ATOM_CONTEXT_MODES,
+                        default=GraphFlowConfig().atom_context_mode,
+                        help="dequantized = the continuous channels the likelihood sees "
+                             "(nothing non-differentiable in the likelihood path); "
+                             "onehot = hard argmax identities, a labelled variant whose "
+                             "density is piecewise in the atom channels")
     parser.add_argument("--condition-dim", type=int, default=64)
     parser.add_argument("--condition-dropout", type=float, default=0.1)
     parser.add_argument("--noise-scale", type=float, default=0.6,
@@ -173,13 +199,39 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             max_shift=arguments.max_shift,
             bond_conditioner=arguments.bond_conditioner,
             conv_hidden=arguments.conv_hidden, conv_layers=arguments.conv_layers,
-            conv_kernel=arguments.conv_kernel)
+            conv_kernel=arguments.conv_kernel,
+            factorisation=arguments.factorisation,
+            atom_conv_hidden=arguments.atom_conv_hidden,
+            atom_conv_layers=arguments.atom_conv_layers,
+            atom_conv_kernel=arguments.atom_conv_kernel,
+            atom_context_dim=arguments.atom_context_dim,
+            atom_context_mode=arguments.atom_context_mode)
         model = ConditionalGraphFlow(config)
         parameters = sum(p.numel() for p in model.parameters())
+        report = model.parameter_report()
         logger.info(f"model parameters: {parameters:,} "
                     f"(bond_blocks={config.bond_blocks} atom_blocks={config.atom_blocks} "
                     f"hidden={config.hidden} conditional_prior={config.conditional_prior} "
                     f"condition_dropout={config.condition_dropout})")
+        logger.info("parameters by part: " + ", ".join(
+            f"{key}={value:,}" for key, value in report.items() if key != "factorisation"))
+        if config.factorisation == "atoms_first":
+            logger.info(f"FACTORISATION atoms_first: p(X|c) p(A|X,c). The bond "
+                        f"conditioner receives endpoint identity, formal charge and "
+                        f"allowed valence through "
+                        f"{model.atom_context.channels} per-pair channels in "
+                        f"'{config.atom_context_mode}' mode. Both orderings are exact "
+                        f"factorisations of the same joint - this is a claim about "
+                        f"learnability, not expressive power.")
+            if config.atom_context_mode == "onehot":
+                logger.warn("atom_context_mode=onehot puts an argmax in the conditioning "
+                            "path: p(x_b | argmax(x_a), c) is still a normalised density "
+                            "in x_b, so the bound is unaffected, but the density is "
+                            "piecewise in the atom channels. This is the labelled "
+                            "variant, not the default.")
+        else:
+            logger.info("FACTORISATION bonds_first: p(A|c) p(X|A,c) - the stage 22-24 "
+                        "ordering, in which the bond stack never sees an atom type")
         logger.info(f"bond conditioner: {config.bond_conditioner}"
                     + (f" (masked 2-D conv, {config.conv_layers} layers, "
                        f"{config.conv_kernel}x{config.conv_kernel}, "
@@ -207,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             shuffle_seed=arguments.shuffle_seed)
         provenance = {
             "arm": arm, "data_dir": str(arguments.data_dir),
-            "data_fingerprint": fingerprint, "stage": 22,
+            "data_fingerprint": fingerprint,
+            "stage": 25 if config.factorisation == "atoms_first" else 22,
+            "factorisation": config.factorisation,
+            "parameter_report": report,
             "condition_features": list(config.condition_features),
             "parameters": int(parameters),
             "representation": "charge_aware_kekule_direct_graph",

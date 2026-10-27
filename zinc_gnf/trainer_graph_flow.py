@@ -334,7 +334,13 @@ class GraphFlowTrainer:
         # with NO shape error when they differ, silently producing a different function
         # with the same weights. That is how the stage-22a run came to be trained at
         # max_log_scale 2.0 while the dataclass default said 0.75. Refuse instead.
-        stored = dict(checkpoint.get("model_config") or {})
+        # Both sides are normalised through `from_dict` first, so a key the checkpoint
+        # predates - stage 25 added `factorisation` and the atom-context settings - reads
+        # as its documented back-compatible default instead of as a difference. Without
+        # this, adding a field would make every older checkpoint unresumable, which is a
+        # silent loss of the baseline rather than a safety gain.
+        stored = GraphFlowConfig.from_dict(
+            dict(checkpoint.get("model_config") or {})).to_dict()
         current = self.model.config.to_dict()
         differences = {key: (stored.get(key), current.get(key))
                        for key in sorted(set(stored) | set(current))

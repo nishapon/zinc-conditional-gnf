@@ -36,14 +36,32 @@ Dequantization gives a BOUND, not an exact likelihood:
 so the reported NLL is an upper bound on the discrete NLL. It is NOT comparable with the
 embedding flow's continuous density: different representation, different base measure.
 
-FACTORISATION
--------------
-    log p(G | c) = log p_bond(x_b | c) + log p_atom(x_a | A, c)
+FACTORISATION - SELECTABLE SINCE STAGE 25
+-----------------------------------------
+    bonds_first   log p(G|c) = log p_bond(x_b | c)      + log p_atom(x_a | A, c)
+    atoms_first   log p(G|c) = log p_atom(x_a | c)       + log p_bond(x_b | X, c)
 
-bonds first through a Glow-style stack, then atoms through a stack whose coupling
-conditioner performs one relational message-passing step over the bond tensor. At
-sampling time the bonds the atom block sees are the model's own, so atom errors compound
-on bond errors; that is inherent to the factorisation and is measured, not hidden.
+Both are EXACT factorisations of the same joint. Neither is incapable of representing
+valid molecules, and nothing here claims otherwise: the stage-25 hypothesis is about
+learnability, inductive bias and sampling quality, not about expressive power.
+
+What stage 24 measured is the motivation. Bonds-first runs the bond stack with
+`extra=None`, so the block that decides bond orders never sees an atom type, while
+valence is a constraint between an atom's type and the sum of its incident bond orders.
+The whole burden of satisfying it fell on the atom stack, against a 73%-carbon marginal:
+89.5% of graphs at N=23 carried an over-valent atom, and best-case relabelling showed
+98.4% of those bond patterns were realisable by SOME atom assignment - the bonds were
+fine, the atom choice was not.
+
+Atoms-first reverses the two so the bond conditioner receives endpoint chemistry -
+identity, formal charge and allowed valence - through `AtomChemistryContext`. The cost is
+symmetric and is measured rather than hidden: bond errors now compound on atom errors
+instead of the other way round, and the atom stack loses its relational view of the bonds
+(replaced, so the comparison is not confounded, by `AtomSequenceSubnet`'s index
+convolution and masked set mean).
+
+The default is bonds_first, because the stage-23 checkpoint is the comparison baseline
+and must stay loadable and resumable; atoms_first is requested explicitly.
 
 CONDITIONING - THE PART THAT IS MEASURED, NOT ASSUMED
 -----------------------------------------------------
@@ -89,11 +107,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from zinc_gnf.constants_charge_aware import MAX_NODES, NUM_ATOM_TYPES, NUM_BOND_TYPES
+from zinc_gnf.constants_charge_aware import (
+    ATOM_VALENCE,
+    CHARGE_OF_TYPE,
+    MAX_NODES,
+    NUM_ATOM_TYPES,
+    NUM_BOND_TYPES,
+)
 
 LOG_SIGMA_CLAMP = 5.0
 ACTNORM_EPSILON = 1e-6
 BOND_CONDITIONERS = ("topology", "pairwise")
+# Stage 25. Both are exact factorisations of the same joint - this is a claim about
+# learnability and inductive bias, NOT about what a flow can represent.
+FACTORISATIONS = ("bonds_first", "atoms_first")
+ATOM_CONTEXT_MODES = ("dequantized", "onehot")
 
 
 # --------------------------------------------------------- upper-triangle plumbing ---
@@ -204,16 +232,19 @@ class BondSubnet(nn.Module):
     """
 
     def __init__(self, passthrough: int, outputs: int, hidden: int,
-                 condition_dim: int, width: int) -> None:
+                 condition_dim: int, width: int, *, context_channels: int = 0) -> None:
         super().__init__()
         self.width = int(width)
         rows, cols = upper_triangle_indices(width)
         self.register_buffer("rows", rows)
         self.register_buffer("cols", cols)
-        self.net = _mlp(3 * passthrough + condition_dim, hidden, 2 * outputs)
+        self.context_channels = int(context_channels)
+        self.net = _mlp(3 * passthrough + condition_dim + self.context_channels,
+                        hidden, 2 * outputs)
         self.outputs = int(outputs)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor,
+                extra: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         weights = mask.unsqueeze(-1).to(x.dtype)
         masked = x * weights
@@ -222,9 +253,15 @@ class BondSubnet(nn.Module):
         totals.index_add_(1, self.rows, masked)
         totals.index_add_(1, self.cols, masked)
         left, right = totals[:, self.rows], totals[:, self.cols]
-        features = torch.cat([masked, left + right, (left - right).abs(),
-                              context.unsqueeze(1).expand(-1, masked.shape[1], -1)], dim=-1)
-        scale, shift = self.net(features).chunk(2, dim=-1)
+        features = [masked, left + right, (left - right).abs(),
+                    context.unsqueeze(1).expand(-1, masked.shape[1], -1)]
+        if self.context_channels:
+            if extra is None:
+                raise ValueError("this BondSubnet was built with atom context channels "
+                                 "and must be given the per-pair atom context")
+            # atoms-first: the per-pair atom context, gathered for this pair only
+            features.append(extra[:, self.rows, self.cols] * weights)
+        scale, shift = self.net(torch.cat(features, dim=-1)).chunk(2, dim=-1)
         return scale, shift
 
 
@@ -254,6 +291,137 @@ class AtomSubnet(nn.Module):
                               context.unsqueeze(1).expand(-1, masked.shape[1], -1)], dim=-1)
         scale, shift = self.net(features).chunk(2, dim=-1)
         return scale, shift
+
+
+class AtomSequenceSubnet(nn.Module):
+    """Stage 25: the atom conditioner for the ATOMS-FIRST factorisation.
+
+    In bonds-first, `AtomSubnet` conditions an atom on the bonds around it. Atoms-first
+    has no bonds yet, so that conditioner is unavailable - and replacing it with a plain
+    per-atom MLP would make `p(X|c)` a product of INDEPENDENT per-atom densities, unable
+    to represent composition (``exactly one sulphur, three nitrogens''). That is strictly
+    weaker than what stage 23 had, and a comparison against it would confound the
+    factorisation with a crippled atom model. So the atom stack keeps cross-atom
+    structure through two masked, pass-through-only paths:
+
+      LOCAL   a 1-D convolution along the atom INDEX axis. Atom order is canonical SMILES
+              order - a DFS walk - so index-adjacent atoms are usually bonded. This is the
+              same inductive bias, and the same stated non-equivariance tradeoff, that
+              `TopologyBondSubnet` already relies on.
+      GLOBAL  the masked MEAN over real atoms, broadcast back (a Deep-Sets aggregate), so
+              every atom's transformation can depend on the whole composition.
+
+    Invertibility is untouched: the conditioner reads ONLY the coupling's pass-through
+    channels, which the coupling leaves unchanged, so the inverse recomputes the same
+    scale and shift. Padded atoms are zeroed before and after every convolution and the
+    mask is supplied as its own channel, so padding contributes nothing but zeros.
+    """
+
+    def __init__(self, passthrough: int, outputs: int, hidden: int, condition_dim: int,
+                 *, layers: int = 3, kernel: int = 3) -> None:
+        super().__init__()
+        padding = int(kernel) // 2
+        self.stem = nn.Conv1d(passthrough + 1, hidden, int(kernel), padding=padding)
+        self.context = nn.Linear(condition_dim, hidden)
+        self.blocks = nn.ModuleList([
+            nn.Conv1d(hidden, hidden, int(kernel), padding=padding)
+            for _ in range(max(0, int(layers) - 1))])
+        self.pooled = nn.Conv1d(2 * hidden, hidden, 1)
+        self.head = nn.Conv1d(hidden, 2 * outputs, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)      # every coupling starts as the identity
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = mask.unsqueeze(-1).to(x.dtype)
+        lanes = torch.cat([x * weights, weights], dim=-1).transpose(1, 2)
+        keep = weights.transpose(1, 2)
+        hidden = torch.relu(self.stem(lanes)
+                            + self.context(context).unsqueeze(-1)) * keep
+        for block in self.blocks:
+            hidden = torch.relu(block(hidden)) * keep
+        counts = keep.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        pooled = (hidden * keep).sum(dim=-1, keepdim=True) / counts
+        hidden = torch.relu(self.pooled(torch.cat(
+            [hidden, pooled.expand_as(hidden)], dim=1))) * keep
+        out = self.head(hidden).transpose(1, 2)
+        scale, shift = out.chunk(2, dim=-1)
+        return scale, shift
+
+
+class AtomChemistryContext(nn.Module):
+    """Stage 25: per-pair ATOM context for the bond stack. The point of atoms-first.
+
+    Stage 24 established that the bonds-first bond stack ran with `extra=None` and so
+    never saw an atom type, while valence is a constraint between an atom's TYPE and the
+    sum of its incident bond orders. This module is what the reversed factorisation makes
+    available: for every pair (i, j) it supplies features of both endpoints, including the
+    two quantities the constraint is actually written in - the allowed valence and the
+    formal charge of each endpoint, read from the charge-aware vocabulary.
+
+    WHAT GOES IN, AND WHY IT IS CONTINUOUS
+    --------------------------------------
+    `mode="dequantized"` (the default) uses the dequantized atom channels exactly as the
+    likelihood sees them. Every operation here is then linear or smooth, so NOTHING
+    non-differentiable and nothing non-invertible enters the likelihood path, and training
+    and sampling use the same quantity: the atom tensor the atom stack produced.
+
+    `mode="onehot"` instead uses `argmax` of those channels. That is a legitimate
+    conditional - `p(x_b | argmax(x_a), c)` is still a normalised density in `x_b` for
+    each fixed `x_a`, so the joint is a valid density and the dequantization bound is
+    unaffected - and it matches decoding, which argmaxes anyway. Its cost is stated rather
+    than hidden: the density becomes piecewise in `x_a`, with discontinuities across
+    argmax boundaries. It is offered as a LABELLED variant, not the default.
+
+    The per-pair features are symmetric in (i, j) by construction - sums and absolute
+    differences - so the context cannot teach the conditioner an orientation. Padded rows
+    and columns are zeroed. The diagonal carries `2*f_i` and `0`, which is a well-defined
+    per-atom channel and is left in place.
+    """
+
+    def __init__(self, num_atom_types: int, *, embed_dim: int,
+                 mode: str = "dequantized") -> None:
+        super().__init__()
+        if mode not in ATOM_CONTEXT_MODES:
+            raise ValueError(f"unknown atom_context_mode {mode!r}; "
+                             f"known: {list(ATOM_CONTEXT_MODES)}")
+        self.num_atom_types = int(num_atom_types)
+        self.mode = str(mode)
+        caps = torch.as_tensor(ATOM_VALENCE[:num_atom_types], dtype=torch.float32)
+        charges = torch.as_tensor(CHARGE_OF_TYPE[:num_atom_types], dtype=torch.float32)
+        # scaled to O(1) so the conditioner does not have to absorb the units
+        self.register_buffer("caps", caps / caps.max().clamp(min=1.0))
+        self.register_buffer("charges", charges)
+        self.embed = nn.Linear(self.num_atom_types + 2, int(embed_dim))
+        self.channels = 2 * int(embed_dim) + 4
+
+    def atom_features(self, atoms: torch.Tensor, node_mask: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+        """[B, N, 17+2] atom features and the [B, N, 2] raw chemistry pair."""
+        weights = node_mask.unsqueeze(-1).to(atoms.dtype)
+        values = atoms * weights
+        if self.mode == "onehot":
+            hard = F.one_hot(values.argmax(dim=-1), self.num_atom_types).to(atoms.dtype)
+            values = hard * weights
+        cap = (values * self.caps).sum(dim=-1, keepdim=True)
+        charge = (values * self.charges).sum(dim=-1, keepdim=True)
+        chemistry = torch.cat([cap, charge], dim=-1)
+        return torch.cat([values, chemistry], dim=-1), chemistry
+
+    def forward(self, atoms: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        """-> [B, N, N, channels], symmetric, masked, zero outside the real atoms."""
+        features, chemistry = self.atom_features(atoms, node_mask)
+        weights = node_mask.unsqueeze(-1).to(atoms.dtype)
+        embedded = self.embed(features) * weights
+
+        def pairwise(values: torch.Tensor) -> torch.Tensor:
+            left = values.unsqueeze(2)
+            right = values.unsqueeze(1)
+            return torch.cat([left + right, (left - right).abs()], dim=-1)
+
+        grid = torch.cat([pairwise(embedded), pairwise(chemistry)], dim=-1)
+        both_real = weights.unsqueeze(2) * weights.unsqueeze(1)
+        return grid * both_real
 
 
 class TopologyBondSubnet(nn.Module):
@@ -301,16 +469,19 @@ class TopologyBondSubnet(nn.Module):
     """
 
     def __init__(self, passthrough: int, outputs: int, hidden: int, condition_dim: int,
-                 width: int, *, layers: int = 3, kernel: int = 3) -> None:
+                 width: int, *, layers: int = 3, kernel: int = 3,
+                 context_channels: int = 0) -> None:
         super().__init__()
         self.width = int(width)
         self.passthrough = int(passthrough)
         self.outputs = int(outputs)
+        self.context_channels = int(context_channels)
         rows, cols = upper_triangle_indices(width)
         self.register_buffer("rows", rows)
         self.register_buffer("cols", cols)
         padding = int(kernel) // 2
-        self.stem = nn.Conv2d(passthrough + 1, hidden, int(kernel), padding=padding)
+        self.stem = nn.Conv2d(passthrough + 1 + self.context_channels, hidden,
+                              int(kernel), padding=padding)
         self.context = nn.Linear(condition_dim, hidden)
         self.blocks = nn.ModuleList([
             nn.Conv2d(hidden, hidden, int(kernel), padding=padding)
@@ -329,12 +500,21 @@ class TopologyBondSubnet(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)      # every coupling starts as the identity
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, context: torch.Tensor,
+                extra: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         weights = mask.unsqueeze(-1).to(x.dtype)
         dense = unpack_upper(x * weights, self.width).permute(0, 3, 1, 2)
         grid = unpack_upper(weights, self.width).permute(0, 3, 1, 2)
-        features = torch.cat([dense, grid], dim=1)
+        channels = [dense, grid]
+        if self.context_channels:
+            if extra is None:
+                raise ValueError("this TopologyBondSubnet was built with atom context "
+                                 "channels and must be given the per-pair atom context")
+            # atoms-first: the atom grid enters as extra INPUT channels of the same
+            # convolution, so endpoint chemistry and local topology are read together
+            channels.append(extra.permute(0, 3, 1, 2))
+        features = torch.cat(channels, dim=1)
         hidden = torch.relu(self.stem(features)
                             + self.context(context).unsqueeze(-1).unsqueeze(-1)) * grid
         for block in self.blocks:
@@ -470,6 +650,28 @@ class GraphFlowConfig:
     bond_blocks: int = 6
     atom_blocks: int = 6
     hidden: int = 256
+    # STAGE 25. "bonds_first" is stages 22-24: p(A|c) p(X|A,c). "atoms_first" is
+    # p(X|c) p(A|X,c), which is what gives the bond stack endpoint chemistry.
+    #
+    # The DEFAULT STAYS bonds_first on purpose. The stage-23 18,000-step checkpoint is
+    # the comparison baseline for stage 25; if the default flipped, re-submitting stage
+    # 23's own driver would build a different architecture and `_resume` would refuse to
+    # continue that checkpoint. The stage-25 driver passes --factorisation atoms_first
+    # explicitly, and `from_dict` maps a checkpoint with no entry to bonds_first.
+    factorisation: str = "bonds_first"
+    # atoms_first only: the width of the atom stack's own conditioner, and of the
+    # per-atom embedding that reaches the bond stack. `atom_context_mode` is the explicit
+    # choice between the continuous dequantized channels (default; nothing
+    # non-differentiable in the likelihood path) and hard argmax identities.
+    # 128 is chosen so the atoms-first model lands at 1,258,778 parameters against the
+    # stage-23 bonds-first baseline's 1,309,690 - 0.961x, strictly FEWER. The comparison
+    # is then not confoundable by capacity in the direction that would flatter stage 25,
+    # and it is close enough that a loss cannot be dismissed as starvation either.
+    atom_conv_hidden: int = 128
+    atom_conv_layers: int = 3
+    atom_conv_kernel: int = 3
+    atom_context_dim: int = 8
+    atom_context_mode: str = "dequantized"
     # "topology" is the stage-23 masked 2-D convolution over the adjacency grid.
     # "pairwise" is the stage-22 conditioner, kept so stage-22 checkpoints stay loadable
     # and usable as a baseline; `from_dict` maps a checkpoint with no entry to it.
@@ -506,6 +708,17 @@ class GraphFlowConfig:
         return {"max_nodes": self.max_nodes, "num_atom_types": self.num_atom_types,
                 "num_bond_types": self.num_bond_types, "bond_blocks": self.bond_blocks,
                 "atom_blocks": self.atom_blocks, "hidden": self.hidden,
+                "factorisation": self.factorisation,
+                # the atom-context settings describe nothing in a bonds-first model - no
+                # such module is built - so they are omitted there. A bonds-first config
+                # written now is then identical to a stage-23 one, which is what keeps the
+                # baseline resumable whatever these (inert) flags were set to.
+                **({"atom_conv_hidden": self.atom_conv_hidden,
+                    "atom_conv_layers": self.atom_conv_layers,
+                    "atom_conv_kernel": self.atom_conv_kernel,
+                    "atom_context_dim": self.atom_context_dim,
+                    "atom_context_mode": self.atom_context_mode}
+                   if self.factorisation == "atoms_first" else {}),
                 "bond_conditioner": self.bond_conditioner,
                 "conv_hidden": self.conv_hidden, "conv_layers": self.conv_layers,
                 "conv_kernel": self.conv_kernel,
@@ -524,10 +737,16 @@ class GraphFlowConfig:
         A stage-22 checkpoint has no `bond_conditioner` entry and was trained with the
         pairwise conditioner, so it must map to "pairwise" rather than to the current
         default - otherwise loading it would silently build a different architecture.
+        Stage 22-24 checkpoints likewise have no `factorisation` entry and were all
+        bonds-first, which is also the dataclass default; it is pinned here explicitly so
+        the mapping survives a later change of default. Normalising a stored config
+        through this method is also what lets the trainer compare an OLD checkpoint's
+        config with a current one without the new keys reading as differences.
         """
         data = dict(payload)
         data["condition_features"] = tuple(data.get("condition_features", ("n", "qed")))
         data.setdefault("bond_conditioner", "pairwise")
+        data.setdefault("factorisation", "bonds_first")
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -563,21 +782,43 @@ class ConditionalGraphFlow(nn.Module):
         if config.bond_conditioner not in BOND_CONDITIONERS:
             raise ValueError(f"unknown bond_conditioner {config.bond_conditioner!r}; "
                              f"known: {list(BOND_CONDITIONERS)}")
+        if config.factorisation not in FACTORISATIONS:
+            raise ValueError(f"unknown factorisation {config.factorisation!r}; "
+                             f"known: {list(FACTORISATIONS)}")
+        self.atoms_first = config.factorisation == "atoms_first"
+
+        # Built ONLY for atoms-first, so a bonds-first state_dict is byte-for-byte the
+        # shape it was in stages 22-24 and those checkpoints keep loading.
+        self.atom_context = (
+            AtomChemistryContext(config.num_atom_types,
+                                 embed_dim=config.atom_context_dim,
+                                 mode=config.atom_context_mode)
+            if self.atoms_first else None)
+        context_channels = self.atom_context.channels if self.atoms_first else 0
 
         def bond_subnet(passthrough: int, outputs: int) -> nn.Module:
             if config.bond_conditioner == "topology":
                 return TopologyBondSubnet(passthrough, outputs, config.conv_hidden,
                                           config.condition_dim, width,
                                           layers=config.conv_layers,
-                                          kernel=config.conv_kernel)
+                                          kernel=config.conv_kernel,
+                                          context_channels=context_channels)
             return BondSubnet(passthrough, outputs, config.hidden, config.condition_dim,
-                              width)
+                              width, context_channels=context_channels)
+
+        def atom_subnet(passthrough: int, outputs: int) -> nn.Module:
+            if self.atoms_first:
+                # no bonds exist yet; cross-atom structure comes from the index
+                # convolution and the masked set mean instead
+                return AtomSequenceSubnet(passthrough, outputs, config.atom_conv_hidden,
+                                          config.condition_dim,
+                                          layers=config.atom_conv_layers,
+                                          kernel=config.atom_conv_kernel)
+            return AtomSubnet(passthrough, outputs, config.hidden, config.condition_dim,
+                              config.num_bond_types)
 
         self.bond_layers = stack(config.num_bond_types, config.bond_blocks, bond_subnet)
-        self.atom_layers = stack(
-            config.num_atom_types, config.atom_blocks,
-            lambda p, o: AtomSubnet(p, o, config.hidden, config.condition_dim,
-                                    config.num_bond_types))
+        self.atom_layers = stack(config.num_atom_types, config.atom_blocks, atom_subnet)
         self.bond_prior = ConditionalPrior(config.num_bond_types, config.condition_dim,
                                            config.conditional_prior)
         self.atom_prior = ConditionalPrior(config.num_atom_types, config.condition_dim,
@@ -604,6 +845,27 @@ class ConditionalGraphFlow(nn.Module):
     def null_context(self, batch: int, device: torch.device | str) -> torch.Tensor:
         return self.null_condition.unsqueeze(0).expand(batch, -1).to(device)
 
+    def parameter_report(self) -> dict[str, Any]:
+        """Where the capacity sits. Reported because the comparison depends on it.
+
+        Stage 25 compares two factorisations, so the parameter counts must be on the
+        record: if the atoms-first arm wins with FEWER parameters the result cannot be
+        attributed to capacity, and if it loses with fewer the question is still open and
+        a capacity-matched rerun is owed before concluding anything.
+        """
+        def count(module: nn.Module | None) -> int:
+            return 0 if module is None else sum(p.numel() for p in module.parameters())
+
+        return {
+            "factorisation": self.config.factorisation,
+            "total": sum(p.numel() for p in self.parameters()),
+            "bond_stack": count(self.bond_layers),
+            "atom_stack": count(self.atom_layers),
+            "atom_context": count(self.atom_context),
+            "conditioning": count(self.condition_net) + self.null_condition.numel(),
+            "priors": count(self.bond_prior) + count(self.atom_prior),
+        }
+
     # -- the two stacks ----------------------------------------------------
     def _run(self, layers: nn.ModuleList, x: torch.Tensor, mask: torch.Tensor,
              context: torch.Tensor, extra: torch.Tensor | None
@@ -628,10 +890,26 @@ class ConditionalGraphFlow(nn.Module):
 
     def encode(self, atoms: torch.Tensor, bonds: torch.Tensor, node_mask: torch.Tensor,
                pair_mask: torch.Tensor, context: torch.Tensor) -> dict[str, torch.Tensor]:
-        """(dequantized atoms, dequantized bonds) -> latents and log-determinants."""
-        z_bond, logdet_bond = self._run(self.bond_layers, bonds, pair_mask, context, None)
-        dense = unpack_upper(bonds, self.config.max_nodes)
-        z_atom, logdet_atom = self._run(self.atom_layers, atoms, node_mask, context, dense)
+        """(dequantized atoms, dequantized bonds) -> latents and log-determinants.
+
+        The map is BLOCK-TRIANGULAR either way round - one block is transformed with the
+        other held fixed as context - so the Jacobian's log-determinant is the sum of the
+        two stacks' log-determinants in both factorisations. Which block is conditioned
+        on which changes the model; it does not change that sum. A test checks it against
+        the full autograd Jacobian for both.
+        """
+        if self.atoms_first:
+            z_atom, logdet_atom = self._run(self.atom_layers, atoms, node_mask,
+                                            context, None)
+            grid = self.atom_context(atoms, node_mask)
+            z_bond, logdet_bond = self._run(self.bond_layers, bonds, pair_mask,
+                                            context, grid)
+        else:
+            z_bond, logdet_bond = self._run(self.bond_layers, bonds, pair_mask,
+                                            context, None)
+            dense = unpack_upper(bonds, self.config.max_nodes)
+            z_atom, logdet_atom = self._run(self.atom_layers, atoms, node_mask,
+                                            context, dense)
         return {"z_bond": z_bond, "z_atom": z_atom,
                 "logdet_bond": logdet_bond, "logdet_atom": logdet_atom}
 
@@ -669,15 +947,31 @@ class ConditionalGraphFlow(nn.Module):
             node_mask[row, :count] = True
         pair_mask = pair_mask_from_counts(sizes, width, device)
 
-        z_bond = self.bond_prior.sample(pair_mask, context, temperature=temperature,
-                                        channels=self.config.num_bond_types,
-                                        generator=generator)
-        bonds = self._invert(self.bond_layers, z_bond, pair_mask, context, None)
-        dense = unpack_upper(bonds, width)
-        z_atom = self.atom_prior.sample(node_mask, context, temperature=temperature,
-                                        channels=self.config.num_atom_types,
-                                        generator=generator)
-        atoms = self._invert(self.atom_layers, z_atom, node_mask, context, dense)
+        if self.atoms_first:
+            # ATOMS FIRST. The bond stack is inverted with the atom context the atom
+            # stack just produced - the same quantity `encode` reads at training time, so
+            # the conditioning path is identical in both directions. Bond errors now
+            # compound on atom errors instead of the other way round; that is inherent to
+            # the factorisation and is measured, not hidden.
+            z_atom = self.atom_prior.sample(node_mask, context, temperature=temperature,
+                                            channels=self.config.num_atom_types,
+                                            generator=generator)
+            atoms = self._invert(self.atom_layers, z_atom, node_mask, context, None)
+            grid = self.atom_context(atoms, node_mask)
+            z_bond = self.bond_prior.sample(pair_mask, context, temperature=temperature,
+                                            channels=self.config.num_bond_types,
+                                            generator=generator)
+            bonds = self._invert(self.bond_layers, z_bond, pair_mask, context, grid)
+        else:
+            z_bond = self.bond_prior.sample(pair_mask, context, temperature=temperature,
+                                            channels=self.config.num_bond_types,
+                                            generator=generator)
+            bonds = self._invert(self.bond_layers, z_bond, pair_mask, context, None)
+            dense = unpack_upper(bonds, width)
+            z_atom = self.atom_prior.sample(node_mask, context, temperature=temperature,
+                                            channels=self.config.num_atom_types,
+                                            generator=generator)
+            atoms = self._invert(self.atom_layers, z_atom, node_mask, context, dense)
 
         # Self-check: re-encoding the sampled graph must return the latents it came from.
         # Sampling IS the inverse, so a large error here means the molecules are not drawn
@@ -772,7 +1066,12 @@ def neutralise_coupling_condition(flow: ConditionalGraphFlow):
 
 
 __all__ = [
+    "ATOM_CONTEXT_MODES",
     "BOND_CONDITIONERS",
+    "FACTORISATIONS",
+    "AtomChemistryContext",
+    "AtomSequenceSubnet",
+    "AtomSubnet",
     "BondSubnet",
     "ConditionalCoupling",
     "ConditionalGraphFlow",
