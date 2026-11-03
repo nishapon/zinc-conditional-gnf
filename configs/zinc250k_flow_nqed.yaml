@@ -1,0 +1,110 @@
+# ============================================================================
+# JOINT (N, QED)-CONDITIONED node-feature graph normalizing flow on ZINC250K
+# (Stage 13). Identical to configs/zinc250k_flow_ncond.yaml except for
+# condition_features (now both columns) and the output directory; identical to
+# the frozen unconditional Arm B config except for conditioning. Everything else - the frozen
+# autoencoder, the dataset split, noise_sigma, whitening, the optimiser and the
+# schedule - is deliberately unchanged, so this model is comparable with the
+# frozen unconditional Arm B result at commit c4faa4a.
+#
+# Conditioning uses the dataset's OWN condition vector, standardised with the
+# TRAIN-ONLY scaler the preprocessing fitted (data/processed/.../scaler.json):
+# column 0 is log1p(N), column 1 is QED. At sampling time the same scaler turns
+# a requested (N, QED) into the same standardised values, so a request means at
+# generation time exactly what it meant during training.
+#
+# N and QED are CORRELATED in ZINC, so a model that learned N alone would still
+# look conditional under a joint permutation test. scripts/13_generate_nqed.py
+# therefore permutes QED alone, with every molecule keeping its true N, and
+# refuses to report a QED-achievement table if that control fails.
+#
+# The flow models the density of the FROZEN autoencoder's per-atom node
+# embeddings. Checkpoint: outputs/ablation/ae_degree/seed_3/last.pt, selected
+# on validation only (exact 93.40%, loss 0.5409, fallback 3.80%, reconstruction
+# validity 99.25%). Its SHA-256 is recorded in config.json and in every flow
+# checkpoint, and a resume refuses to continue against a different encoder.
+#
+# Values marked [teammates] come from molecular_generation/molecular_flow.py
+# and conditional_prior.py; the deviations are justified in zinc_gnf/flow.py.
+#
+# Protocol: train on the TRAIN split only, select on VALIDATION, never load
+# the test split. One frozen autoencoder; flow seeds are independent of it.
+# ============================================================================
+
+flow:
+  node_embedding_dim: 64        # must equal the autoencoder's embedding width
+  num_blocks: 12                # [teammates] 12 coupling steps
+  attention_dim: 64             # s/t trunk width (bond-free self-attention)
+  num_heads: 4                  # ZINC molecules are up to 38 atoms (QM9: 9)
+  hidden_dim: 256               # [teammates] s/t MLP hidden width
+  max_log_scale: 1.0            # [teammates used 0.25] safe here because ActNorm
+                                # is data-dependently initialized and every coupling
+                                # output layer is zero-initialized, so the flow starts
+                                # as the identity with log|det J| = 0
+  actnorm: true
+  node_autoregressive: true     # ARM B, the frozen unconditional architecture. One
+                                # extra coupling per block transforming every channel of
+                                # node i given the FULL vectors of the preceding nodes.
+                                # Targets the demonstrated weakness (the shuffled-node
+                                # control reproduced the flow's failure, so what is missing
+                                # is inter-node dependence, not per-node marginals). Its
+                                # heads are zero-initialised, so at init Arm B IS Arm A.
+                                # NOTE: Arm B is node-ORDER dependent and has more
+                                # parameters than Arm A (reported in train.log).
+  invertible_linear: true       # per-node LU linear; the latent has a participation
+                                # ratio of about 5 of 64 dimensions, so mixing beyond
+                                # the fixed half-split matters
+  prior_min_sigma: 0.1          # [teammates] softplus floor
+  prior_init_sigma: 1.0         # [teammates] sigma at initialization
+  prior_hidden_dim: 64          # [teammates] only used by the conditional prior
+  condition_features: ["n", "qed"]   # Stage 13: BOTH columns of the dataset
+                                # condition vector - standardised log1p(N) and
+                                # standardised QED - with the train-only scaler.
+                                # Each molecule trains on its own (N, QED); at
+                                # sampling time a requested (N, QED) goes through
+                                # the same scaler. QED is a per-molecule label
+                                # computed by the preprocessing, not a model output,
+                                # so this is plain conditional maximum likelihood.
+  condition_embedding_dim: 64
+  condition_hidden_dim: 64
+  noise_sigma: 0.05             # smoothing noise in per-dimension std units. The
+                                # deterministic encoder gives symmetry-equivalent atoms
+                                # identical embeddings, so the unsmoothed density is
+                                # singular. Measured effect on this checkpoint's degree
+                                # decoder: 93.40% exact at 0.00 -> 92.20% at 0.05
+                                # (90.45% at 0.10, 76.15% at 0.20).
+  whiten: true
+  whiten_std_floor: 0.01        # near-constant embedding dimensions must not be
+                                # amplified by dividing by a tiny std
+
+training:
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  output_dir: outputs/checkpoints/flow_nqed
+  ae_checkpoint: outputs/ablation/ae_degree/seed_3/last.pt
+  seed: 1
+  device: auto                  # 'cuda' fails loudly if no GPU is visible
+  batch_size: 128               # fits easily in 8 GB; the flow is ~2M parameters
+  max_steps: 50000              # about 31 epochs of 202,111 molecules at batch 128
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  warmup_steps: 500             # linear warm-up: flows are fragile in the first steps
+  log_every: 100
+  eval_every: 1000
+  save_every: 1000              # resume granularity; the walltime estimate is not a promise
+  val_molecules: 5000           # fixed seeded validation subset, fixed noise seed
+  statistics_molecules: 20000   # training molecules used for the embedding mean/std
+  pause_at_step: null           # null = train straight through. An integer stops cleanly at
+                                # that step with completed=false, so the seed stays unfinished
+                                # and resubmitting resumes exactly; used for a mid-run
+                                # generation check (see slurm/README_flow.md).
+  early_stopping_patience: 10   # in evaluations
+  ae_seen_only: false           # see slurm/README_flow.md: the autoencoder was fitted on
+                                # 100,000 of the 202,111 training molecules, but its
+                                # validation reconstruction (93.40% on molecules it never
+                                # saw) shows the embeddings generalize, so the flow trains
+                                # on the whole training split. true = restrict to the
+                                # autoencoder's own subset.
+  ae_subset_seed: 3             # the autoencoder run's seed, which selected that subset
+  ae_subset_size: 100000
+  deterministic: false

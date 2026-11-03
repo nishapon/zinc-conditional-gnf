@@ -1,0 +1,180 @@
+# ============================================================================
+# ZINC250K conditional graph normalizing flow — experiment configuration.
+#
+# Every hyperparameter below is annotated with its reason. The trainer writes
+# a copy of the effective config to the output directory on each run, so this
+# file is the single source of truth for what the model is.
+#
+# Dataset representation and vocabularies match MoFlow (Zang & Wang 2020,
+# Table 1) so our generation / uniqueness / novelty / N.U.V. numbers are
+# directly comparable to their published ZINC250K results.
+# ============================================================================
+
+experiment:
+  name: zinc250k_conditional_gnf
+  seed: 42                 # Global seed for reproducibility.
+  output_dir: outputs      # Everything lands here under subfolders.
+
+# ----------------------------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------------------------
+data:
+  csv_path: data/raw/zinc250k.csv       # ZINC250K source. Must be downloaded
+                                        # separately (not committed to git).
+  processed_dir: data/processed/zinc250k
+
+  # Split fractions. Random 80/10/10 (NOT scaffold-based) to match MoFlow's
+  # evaluation protocol — scaffold splits make the task strictly harder than
+  # MoFlow's and would make the comparison unfair.
+  train_fraction: 0.80
+  validation_fraction: 0.10
+  # Test fraction is 1 - train - val = 0.10 (not stored; derived).
+
+  # Molecule size constraints.
+  min_nodes: 2             # Reject single-atom "molecules".
+  max_nodes: 38            # Matches MoFlow Table 1 for ZINC250K.
+
+  # Atom vocabulary — the 9 heavy elements present in ZINC250K (MoFlow 9+1,
+  # where the +1 is a virtual padding atom; we handle padding via masks
+  # instead, so our vocabulary is exactly 9).
+  atom_vocab:
+    - C
+    - N
+    - O
+    - F
+    - P
+    - S
+    - Cl
+    - Br
+    - I
+
+  # Bond classes: 0 = no bond, 1 = single, 2 = double, 3 = triple. Aromatic
+  # bonds are kekulized to single/double before encoding, so no separate
+  # aromatic class is needed.
+  bond_classes: 4
+
+  # Only keep molecules with formal charge zero everywhere, no isotopes,
+  # no radicals. Matches MoFlow's preprocessing and makes the atom
+  # representation a simple one-hot over the 9-element vocab.
+  neutral_only: true
+
+# ----------------------------------------------------------------------------
+# Autoencoder (Stage 2)
+#
+# Node features: one-hot atom type → 9-dim input. (No separate charge or
+# hydrogen prediction — hydrogens are inferred by RDKit from valence at decode
+# time, and charges are always zero after neutral_only filtering.)
+# ----------------------------------------------------------------------------
+autoencoder:
+  node_feature_dim: 9              # Matches len(atom_vocab).
+  node_noise_dim: 8                # Gaussian noise appended to each node, so
+                                   # permutation-equivariant layers can still
+                                   # break atom-identity symmetry.
+  embedding_dim: 64                # Output dim per node. Must be even
+                                   # (flow splits it in half).
+  hidden_dim: 256                  # MLP hidden width inside each block.
+  message_passing_steps: 6         # Same depth as teammates' QM9 pipeline.
+  attention_heads: 4               # Multi-head bond-aware self-attention.
+  bond_class_weight: 5.0           # Up-weights the 3 real-bond classes vs.
+                                   # the dominant "no bond" class in the loss.
+                                   # (Teammate tried 10.0 but 5.0 was more
+                                   # stable; we start conservative.)
+  num_bond_refine_steps: 2         # Rounds of iterative bond refinement.
+                                   # 1 = single-shot (original behavior);
+                                   # 2 = one refinement pass using soft
+                                   # remaining valence.
+  batch_size: 128
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  gradient_clip: 5.0
+  patience: 8                      # Early-stop on validation loss.
+
+# ----------------------------------------------------------------------------
+# Property-aware fine-tuning (Stage 2b)
+#
+# Adds a QED prediction head on top of the frozen encoder, then jointly
+# fine-tunes both. This gives us QED-informed embeddings for the flow stage.
+# ----------------------------------------------------------------------------
+property_aware:
+  qed_head_hidden_dim: 256
+  qed_head_dropout: 0.10
+  warmup_epochs: 5                 # Train QED head only, encoder frozen.
+  joint_epochs: 15                 # Then jointly fine-tune AE + head.
+  head_learning_rate: 0.001
+  joint_learning_rate: 0.0001
+  qed_loss_weight: 2.0             # Weight on QED MSE vs. reconstruction CE.
+  patience: 8
+
+# ----------------------------------------------------------------------------
+# Embedding extraction (Stage 3)
+#
+# Normalization statistics are computed ONLY from training molecules.
+# ----------------------------------------------------------------------------
+embeddings:
+  shard_size: 2048                 # Molecules per on-disk shard.
+  minimum_std: 0.000001            # Floor on per-feature std to avoid /0.
+
+# ----------------------------------------------------------------------------
+# Conditional flow (Stage 4)
+#
+# Architecture notes — professor's whiteboard checks baked in:
+#   * dim analysis — logged by the trainer on first batch.
+#   * sigma clamp value — max_log_scale below; justified in flow.py.
+#   * Σ or σ — the conditional prior is DIAGONAL N(μ(y), diag(σ(y))² · I).
+#     σ is the per-feature standard deviation (not variance Σ², not a full
+#     covariance matrix). The prior log-pdf uses σ directly as std.
+#   * intermediate steps — per-block output norm + log-det logged every
+#     log_every_n_steps.
+#   * remove prior & check — flow trainer supports --no-conditional-prior.
+#
+# Condition vector y has 2 dims:
+#   y[0] = standardized log(1 + heavy_atom_count)
+#   y[1] = standardized QED
+# Both statistics are fit on the training split only (preprocessing stage).
+# ----------------------------------------------------------------------------
+flow:
+  embedding_dim: 64                # Must match autoencoder.embedding_dim.
+  condition_dim: 2                 # (log1p_N, QED) after standardization.
+  hidden_dim: 128                  # Inside each FiLM-conditioned s/t network.
+  context_dim: 64                  # Dim of the shared condition embedding
+                                   # fed into every coupling block's FiLM.
+  coupling_blocks: 12              # Matches teammate's QM9 flow depth.
+  attention_heads: 4               # Inside each coupling s/t network.
+  max_log_scale: 0.25              # Clamp s via s = max · tanh(raw/max).
+                                   # Prevents compounding across 12 blocks
+                                   # with zero-init ActNorm. 2.0 is known
+                                   # too loose; 0.25 is empirically stable.
+  minimum_sigma: 0.1               # σ(y) floor via softplus + offset so the
+                                   # prior cannot collapse to a Dirac.
+  weight_sharing: false            # Independent weights per block.
+  batch_size: 256
+  epochs: 40
+  learning_rate: 0.0001
+  weight_decay: 0.000001
+  gradient_clip: 5.0
+  patience: 10
+
+  # QED-balanced training sampler — up-weights rare-QED buckets with a cap
+  # so no single molecule dominates. Directly targets the training-side
+  # distribution issue flagged in the previous ZINC run.
+  qed_balanced_sampling: true
+  qed_balance_bins: 20
+  qed_balance_power: 0.5           # <1 softens the inverse-frequency weight.
+  qed_balance_max_weight: 4.0      # Hard cap on per-sample weight.
+
+# ----------------------------------------------------------------------------
+# Generation (Stage 5)
+# ----------------------------------------------------------------------------
+generation:
+  num_samples: 10000               # Matches MoFlow protocol.
+  num_seeds: 5                     # Matches MoFlow (reports mean ± std).
+  batch_size: 64
+  temperature: 0.85                # Matches MoFlow's reported t = 0.85.
+  sigma_scale: 1.0                 # Multiplier on prior σ at generation
+                                   # time. Teammate found 1.5× rescued
+                                   # uniqueness at rare N on QM9; we start
+                                   # at 1.0 and sweep.
+  qed_tolerance: 0.05              # |requested − actual| ≤ this counts as
+                                   # a target hit.
+  qed_targets: [0.3, 0.5, 0.7, 0.9]

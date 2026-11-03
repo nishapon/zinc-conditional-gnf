@@ -6,6 +6,8 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
+build/
+dist/
 
 # Secrets
 .env
@@ -16,36 +18,43 @@ secrets.*
 credentials.*
 
 # Datasets and serialized objects
+data/raw/
+data/processed/
 *.csv
 *.pkl
 *.pickle
 *.npz
 *.npy
 
-# Model checkpoints and tensors
+# Model checkpoints and tensor shards
 *.pt
 *.pth
 *.ckpt
 
 # Generated outputs
 outputs/checkpoints/*
+outputs/embeddings/*
 outputs/metrics/*
 outputs/samples/*
+outputs/figures/*
 outputs/logs/*
 wandb/
 runs/
 
-# Keep output folders
+# Keep output folders tracked
 !outputs/checkpoints/.gitkeep
+!outputs/embeddings/.gitkeep
 !outputs/metrics/.gitkeep
 !outputs/samples/.gitkeep
+!outputs/figures/.gitkeep
 !outputs/logs/.gitkeep
 
 # SLURM
+logs/
 slurm-*.out
 slurm-*.err
 
-# Editors and operating system
+# Editors and OS
 .vscode/
 .idea/
 .DS_Store

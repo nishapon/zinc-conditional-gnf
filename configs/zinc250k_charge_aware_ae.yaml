@@ -1,0 +1,50 @@
+# ============================================================================
+# Charge-aware graph autoencoder (ZINC250K, representation v2).
+#
+# Starting point = the teammates' v5 QM9 autoencoder
+# (molecular_generation/run_molecular_autoencoder_v5.sh), adapted to the 17
+# (element, formal charge) atom types. Values marked [teammates] are copied
+# from their run; ZINC-specific changes are listed under "adaptations".
+#
+# Protocol decisions: PRIMARY split = MoFlow-fixed (test indices untouched);
+# train on train only; validation for checkpoint selection and tuning; the
+# test split is never loaded by training. One autoencoder is trained and frozen;
+# flow seeds are independent of it (the 5-seed uncertainty therefore does not
+# include autoencoder variability).
+# ============================================================================
+
+autoencoder:
+  num_atom_types: 17            # adaptation: 17 charge-aware types (QM9: 4)
+  num_bond_types: 4             # none / single / double / triple
+  node_embedding_dim: 64        # [teammates]
+  latent_dim: 256               # [teammates] hidden width of every MLP
+  num_mlp_layers: 2             # [teammates]
+  num_processing_steps: 6       # [teammates]
+  attn_kq_dim: 32               # [teammates]
+  attn_v_dim: 32                # [teammates]
+  attn_num_heads: 2             # [teammates]
+  attn_concat_heads_output_dim: 32   # [teammates]
+  weight_sharing: true          # [teammates]
+  residual: false               # [teammates]
+  bond_class_weight: 5.0        # [teammates]
+  num_bond_refine_steps: 1      # [teammates] final run used single-shot decoding
+  symmetry_noise_dim: 0         # Decision 2: pure one-hot identity. >0 ADDS noise
+                                # channels next to the identity features (ablation
+                                # for the symmetry ceiling; never replaces identity).
+
+training:
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  output_dir: outputs/checkpoints/autoencoder
+  seed: 42
+  device: auto                  # 'cuda' fails loudly if no GPU is visible
+  batch_size: 32                # [teammates]
+  max_steps: 50000              # [teammates]; ~7.9 epochs of 202,111 molecules
+  learning_rate: 0.001          # [teammates] Adam
+  grad_clip_norm: 5.0           # adaptation: stabiliser (teammates did not clip)
+  log_every: 100
+  eval_every: 500               # [teammates]
+  save_every: 2000              # [teammates]
+  val_loss_molecules: 4000      # fixed seeded validation subset for loss/accuracy
+  val_recon_molecules: 1000     # subset for the slower RDKit decode metrics
+  selection_key: exact_molecule_constrained   # validation-based model selection
+  early_stopping_patience: null
