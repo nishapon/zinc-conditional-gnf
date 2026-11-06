@@ -1,0 +1,86 @@
+# ============================================================================
+# 128D joint (N, QED) flow + N-MATCHED QED-CONTRASTIVE objective (forward-only).
+#
+# This is the STABLE REPLACEMENT for the sampling-based QED-consistency objective, which
+# diverged on the cluster (jobs 359287 / 359294 / 360343: non-finite at step ~5,400 just
+# after activation, and then ~100% rejected auxiliary updates under the NLL-only
+# fallback). Root cause and derivation: zinc_gnf/qed_contrastive.py.
+#
+# IDENTICAL to configs/zinc250k_flow_nqed_ae128.yaml (same FROZEN 128D autoencoder, same
+# dataset split, same Arm B architecture, 12 blocks, same optimiser, schedule, smoothing
+# noise 0.05 and whitening) EXCEPT:
+#   * qed_contrast_weight > 0 turns on the new forward-only objective, and
+#   * a NEW output directory, so the baseline and the failed-experiment checkpoints are
+#     untouched.
+#
+# The objective adds NO parameters and NO checkpoint keys, so the resulting checkpoint is
+# a drop-in for load_flow and for slurm/13_generate_nqed.sh. With qed_contrast_weight = 0
+# this file reproduces the 128D baseline exactly.
+#
+# WHY IT SHOULD BE STABLE: it backpropagates through the FORWARD map only - the same path
+# the NLL has traversed stably for 50,000 steps. It never calls torch.linalg.inv and never
+# enters the sequential node-autoregressive inverse, which are the two operations that
+# exist ONLY in flow.inverse and are therefore never constrained by the NLL.
+# ============================================================================
+
+flow:
+  node_embedding_dim: 128       # must equal the frozen 128D autoencoder's embedding width
+  num_blocks: 12
+  attention_dim: 64
+  num_heads: 4
+  hidden_dim: 256
+  max_log_scale: 1.0
+  actnorm: true
+  node_autoregressive: true     # ARM B, unchanged from the 128D baseline
+  invertible_linear: true
+  prior_min_sigma: 0.1
+  prior_init_sigma: 1.0
+  prior_hidden_dim: 64
+  condition_features: ["n", "qed"]
+  condition_embedding_dim: 64
+  condition_hidden_dim: 64
+  noise_sigma: 0.05
+  whiten: true
+  whiten_std_floor: 0.01
+
+training:
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  output_dir: outputs/checkpoints/flow_nqed_ae128_qedcontrast   # NEW: baselines untouched
+  ae_checkpoint: outputs/ablation/ae_degree_128d/seed_3/last.pt # FROZEN, never retrained
+  seed: 3                       # the seed the 128D baseline comparison uses
+  device: auto
+  batch_size: 128
+  max_steps: 50000
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  warmup_steps: 500
+  log_every: 100
+  eval_every: 1000
+  save_every: 1000
+  val_molecules: 5000
+  statistics_molecules: 20000
+  pause_at_step: null
+  early_stopping_patience: 10
+  ae_seen_only: false
+  ae_subset_seed: 3
+  ae_subset_size: 100000
+  deterministic: false
+
+  # --- the sampling-based objective stays OFF (it diverged; kept only for provenance) --
+  qed_consistency_weight: 0.0
+
+  # --- N-matched QED-contrastive objective: the ONE change under test -----------------
+  qed_contrast_weight: 1.0          # the term is a bounded cross-entropy (chance = ln 3
+                                    # = 1.0986), so O(1) weight is comparable to the NLL's
+                                    # per-node scale without dominating it
+  qed_contrast_warmup: 2000         # pure NLL first, so the density settles
+  qed_contrast_ramp: 2000           # then lambda ramps linearly to full value by step 4000
+  qed_contrast_offsets: [0.0, -1.0, 1.0]   # true, -1 sigma QED, +1 sigma QED (same N)
+  qed_contrast_subbatch: 32         # molecules scored per application
+  qed_contrast_every: 1             # every step; forward-only, so this is affordable
+  qed_contrast_min_separation: 0.25 # standardised-QED gap required for a usable negative
+  qed_contrast_logit_scale: 1.0
+  qed_contrast_negatives: offset    # deterministic and reproducible; 'inbatch' also valid
+  qed_contrast_max_skip_rate: 0.02  # STOP rather than train with the signal silently absent
+  qed_contrast_skip_grace: 50

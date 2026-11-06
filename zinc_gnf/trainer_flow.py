@@ -42,6 +42,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -116,6 +117,25 @@ class FlowTrainConfig:
     qed_surrogate_hidden: int = 128            # QED read-out MLP hidden width
     qed_surrogate_lr: float = 1e-3             # the read-out's own optimiser learning rate
     qed_consistency_every: int = 1             # apply the (sequential-inverse) aux term every N steps
+    # --- N-matched QED-CONTRASTIVE objective (forward-only; the stable replacement) ----
+    # 0.0 = OFF. Adds NO parameters and NO checkpoint keys, so checkpoints stay
+    # bit-compatible with load_flow and every generation/evaluation script. Requires
+    # 'qed' in condition_features. See zinc_gnf/qed_contrastive.py for the derivation,
+    # the measured root cause of the sampling objective's divergence, and the limits.
+    qed_contrast_weight: float = 0.0           # lambda on the contrastive cross-entropy
+    qed_contrast_warmup: int = 2000            # steps of pure NLL before it switches on
+    qed_contrast_ramp: int = 2000              # linear ramp of lambda after the warmup
+    qed_contrast_offsets: tuple[float, ...] = (0.0, -1.0, 1.0)   # offsets[0] MUST be 0.0
+    qed_contrast_subbatch: int = 32            # molecules scored per application
+    qed_contrast_every: int = 1                # apply every N steps (cost control)
+    qed_contrast_min_separation: float = 0.25  # standardised-QED gap for a usable negative
+    qed_contrast_logit_scale: float = 1.0      # sharpness of the candidate softmax
+    qed_contrast_negatives: str = "offset"     # 'offset' (deterministic) | 'inbatch'
+    # Non-finite auxiliary updates are NOT silently skipped. A few transient skips are
+    # tolerated; exceeding this rate after the grace window raises, because a silently
+    # absent objective is the failure mode of the previous attempt (job 360343).
+    qed_contrast_max_skip_rate: float = 0.02
+    qed_contrast_skip_grace: int = 50          # applications before the rate is enforced
 
     def validate(self) -> None:
         if self.device not in ("auto", "cpu", "cuda"):
@@ -145,6 +165,35 @@ class FlowTrainConfig:
                 raise ValueError("qed_surrogate_hidden must be >= 1")
             if self.qed_consistency_every < 1:
                 raise ValueError("qed_consistency_every must be >= 1")
+        # --- contrastive objective ---------------------------------------------------
+        self.qed_contrast_offsets = tuple(float(o) for o in self.qed_contrast_offsets)
+        if self.qed_contrast_weight < 0:
+            raise ValueError("qed_contrast_weight must be >= 0")
+        for name in ("qed_contrast_warmup", "qed_contrast_ramp", "qed_contrast_skip_grace"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        if self.qed_contrast_weight > 0:
+            if self.qed_consistency_weight > 0:
+                raise ValueError(
+                    "qed_contrast_weight and qed_consistency_weight must not both be > 0: "
+                    "the contrastive objective REPLACES the sampling-based one (which was "
+                    "measured to diverge). Enable exactly one.")
+            if len(self.qed_contrast_offsets) < 2:
+                raise ValueError("qed_contrast_offsets needs at least one negative")
+            if self.qed_contrast_offsets[0] != 0.0:
+                raise ValueError("qed_contrast_offsets[0] must be exactly 0.0 (the true candidate)")
+            if self.qed_contrast_subbatch < 2:
+                raise ValueError("qed_contrast_subbatch must be >= 2")
+            if self.qed_contrast_every < 1:
+                raise ValueError("qed_contrast_every must be >= 1")
+            if self.qed_contrast_min_separation <= 0:
+                raise ValueError("qed_contrast_min_separation must be > 0")
+            if self.qed_contrast_logit_scale <= 0:
+                raise ValueError("qed_contrast_logit_scale must be > 0")
+            if self.qed_contrast_negatives not in ("offset", "inbatch"):
+                raise ValueError("qed_contrast_negatives must be 'offset' or 'inbatch'")
+            if not 0.0 <= self.qed_contrast_max_skip_rate <= 1.0:
+                raise ValueError("qed_contrast_max_skip_rate must lie in [0, 1]")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -406,6 +455,16 @@ class FlowTrainer:
                 "val_condition_gap": shuffled_loss - result["val_loss"],
                 "val_condition_win_rate": condition_wins / condition_molecules,
             })
+        # Root-cause diagnostic (a): the NLL only ever sees sum(log_s) of each invertible
+        # linear, never its CONDITIONING, yet flow.inverse must invert these matrices and
+        # the gradient of that inverse scales with ||W^-1||^2. Logged read-only.
+        if self.flow_config.invertible_linear:
+            try:
+                from zinc_gnf.qed_contrastive import invertible_linear_conditioning
+                result.update({f"val_{k}": v
+                               for k, v in invertible_linear_conditioning(flow).items()})
+            except Exception:  # noqa: BLE001 - a diagnostic must never stop training
+                pass
         if surr_count:
             # MAE is in STANDARDISED QED units (the units the consistency term uses);
             # divide by the scaler's QED std to read it in raw QED. Correlation is unitless.
@@ -432,6 +491,10 @@ class FlowTrainer:
             "best_loss": self.best_loss,
             "best_step": self.best_step,
             "bad_evals": self.bad_evals,
+            # Contrastive-objective counters only (it has NO parameters), so the
+            # checkpoint stays loadable by load_flow and by a baseline resume.
+            "contrast_applied": int(getattr(self, "contrast_applied", 0)),
+            "contrast_skipped": int(getattr(self, "contrast_skipped", 0)),
             "data_fingerprint": self.data_fingerprint,
             "autoencoder": self.ae_fingerprint,
             "embedding_statistics": self.statistics_summary,
@@ -539,6 +602,45 @@ class FlowTrainer:
                 f"surrogate_hidden={cfg.qed_surrogate_hidden} lr={cfg.qed_surrogate_lr}; the flow "
                 f"density and checkpoint format are UNCHANGED (surrogate saved separately)")
 
+        # N-matched QED-contrastive objective (forward-only). No parameters, no new
+        # checkpoint keys; only counters, which are carried in the resume state.
+        self.qed_contrast_on = (cfg.qed_contrast_weight > 0
+                                and "qed" in self.flow_config.condition_features)
+        if cfg.qed_contrast_weight > 0 and "qed" not in self.flow_config.condition_features:
+            raise ValueError("qed_contrast_weight > 0 requires 'qed' in the flow's "
+                             f"condition_features (got {list(self.flow_config.condition_features)})")
+        self.contrast_applied = 0
+        self.contrast_skipped = 0
+        self._contrast_qed_col = None
+        self._contrast_qed_range = (0.0, 0.0)
+        self.contrast_generator = None
+        if self.qed_contrast_on:
+            self._contrast_qed_col = self.flow_config.condition_features.index("qed")
+            # Candidate clamp range from the TRAIN split only (no validation/test access).
+            column = np.asarray(self.train_set.condition, dtype=np.float64)[:, condition_columns(
+                self.flow_config.condition_features)[self._contrast_qed_col]]
+            self._contrast_qed_range = (float(np.min(column)), float(np.max(column)))
+            self.contrast_generator = torch.Generator().manual_seed(cfg.seed * 2654435761 % 2**31)
+            log.info(
+                f"QED-CONTRASTIVE objective ON (forward-only, training only): "
+                f"weight={cfg.qed_contrast_weight} warmup={cfg.qed_contrast_warmup} "
+                f"ramp={cfg.qed_contrast_ramp} offsets={list(cfg.qed_contrast_offsets)} "
+                f"subbatch={cfg.qed_contrast_subbatch} every={cfg.qed_contrast_every} "
+                f"negatives={cfg.qed_contrast_negatives} "
+                f"min_separation={cfg.qed_contrast_min_separation}")
+            log.info(
+                f"    standardised QED range on TRAIN: "
+                f"[{self._contrast_qed_range[0]:.3f}, {self._contrast_qed_range[1]:.3f}]; "
+                f"candidates are clamped to it and every candidate keeps the molecule's OWN N, "
+                f"so the contrast is within-N. Chance loss = "
+                f"{math.log(len(cfg.qed_contrast_offsets)):.4f}; a loss below it means the "
+                f"density prefers the molecule's true QED over N-matched alternatives.")
+            log.info(
+                "    this objective backpropagates through the FORWARD map only - the same "
+                "path the NLL uses - so it contains no linalg.inv and no sequential "
+                "autoregressive inverse, which is why it is expected to be stable where the "
+                "sampling-based objective was not. Non-finite updates are counted, not hidden.")
+
         step = 0
         history: list[dict[str, Any]] = []
 
@@ -619,6 +721,51 @@ class FlowTrainer:
                         parameter.requires_grad_(True)
                     loss = nll_loss + cons_weight * consistency
 
+            # --- N-matched QED-contrastive term (forward-only) -----------------------
+            contrast_diag: dict[str, Any] = {}
+            contrast_weight_now = 0.0
+            if self.qed_contrast_on:
+                from zinc_gnf.qed_contrastive import contrastive_weight, qed_contrastive_loss
+                contrast_weight_now = contrastive_weight(
+                    step, weight=cfg.qed_contrast_weight, warmup=cfg.qed_contrast_warmup,
+                    ramp=cfg.qed_contrast_ramp)
+                if contrast_weight_now > 0.0 and step % cfg.qed_contrast_every == 0:
+                    values_all, _ = batch_condition(batch, self.flow_config.condition_features)
+                    sub = min(cfg.qed_contrast_subbatch, batch.batch_size)
+                    contrast, contrast_diag = qed_contrastive_loss(
+                        flow, embeddings[:sub], batch.node_mask[:sub], values_all[:sub],
+                        qed_column=self._contrast_qed_col,
+                        offsets=cfg.qed_contrast_offsets,
+                        qed_min=self._contrast_qed_range[0],
+                        qed_max=self._contrast_qed_range[1],
+                        min_separation=cfg.qed_contrast_min_separation,
+                        logit_scale=cfg.qed_contrast_logit_scale,
+                        negatives=cfg.qed_contrast_negatives,
+                        generator=self.contrast_generator)
+                    self.contrast_applied += 1
+                    if torch.isfinite(contrast):
+                        loss = loss + contrast_weight_now * contrast
+                    else:
+                        # Counted and surfaced, never silently absorbed.
+                        self.contrast_skipped += 1
+                        contrast_diag["qed_contrast_nonfinite"] = True
+                        log.warn(f"QED-contrastive loss was non-finite at step {step + 1} "
+                                 f"(skipped {self.contrast_skipped}/{self.contrast_applied} "
+                                 f"applications)")
+                    rate = self.contrast_skipped / max(1, self.contrast_applied)
+                    if self.contrast_applied >= cfg.qed_contrast_skip_grace \
+                            and rate > cfg.qed_contrast_max_skip_rate:
+                        self._save("last.pt", flow, optimizer,
+                                   {**self._state(step), "history": history})
+                        raise FloatingPointError(
+                            f"the QED-contrastive objective was non-finite in {rate:.1%} of "
+                            f"{self.contrast_applied} applications, above the permitted "
+                            f"{cfg.qed_contrast_max_skip_rate:.1%}. Training is STOPPING rather "
+                            f"than continuing with the auxiliary signal effectively absent "
+                            f"(the failure mode of the previous sampling-based attempt). State "
+                            f"saved to {self.output_dir / 'last.pt'}. Investigate before "
+                            f"resuming; do not simply lower the weight.")
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None
@@ -658,6 +805,12 @@ class FlowTrainer:
                 entry["qed_cons_weight"] = float(cons_weight)
                 entry["qed_consistency_mse"] = float(aux.get("qed_consistency_mse", 0.0))
                 entry["qed_surrogate_mse"] = float(surrogate_mse if surrogate_mse is not None else 0.0)
+            if self.qed_contrast_on:
+                entry["qed_contrast_weight"] = float(contrast_weight_now)
+                for key in ("qed_contrast_loss", "qed_contrast_accuracy",
+                            "qed_contrast_true_probability", "prior_mu_gap",
+                            "qed_contrast_usable_fraction", "qed_contrast_logit_spread"):
+                    entry[key] = float(contrast_diag.get(key, 0.0))
             window.append(entry)
             if step % cfg.log_every == 0 or step == cfg.max_steps or step <= 5:
                 mean = {k: float(np.mean([w[k] for w in window])) for k in window[0]}
@@ -674,6 +827,15 @@ class FlowTrainer:
                              f"cons_mse={mean.get('qed_consistency_mse', 0.0):.4f} "
                              f"surrogate_mse={mean.get('qed_surrogate_mse', 0.0):.4f} "
                              f"(aux term; NLL above is the density objective)")
+                if self.qed_contrast_on:
+                    chance = math.log(len(cfg.qed_contrast_offsets))
+                    log.info(f"    QED-contrastive: lambda={mean.get('qed_contrast_weight', 0.0):.4f} "
+                             f"loss={mean.get('qed_contrast_loss', 0.0):.4f} (chance {chance:.4f}) "
+                             f"acc={mean.get('qed_contrast_accuracy', 0.0):.3f} "
+                             f"p_true={mean.get('qed_contrast_true_probability', 0.0):.3f} "
+                             f"prior_mu_gap={mean.get('prior_mu_gap', 0.0):.4f} "
+                             f"usable={mean.get('qed_contrast_usable_fraction', 0.0):.3f} "
+                             f"skipped={self.contrast_skipped}/{self.contrast_applied}")
                 self._append(metrics_path, {"kind": "train", "step": step, **mean, "it_per_s": rate})
                 # A log-determinant running away is the documented divergence signature of
                 # this flow family (the teammates saw it before a NaN). Warn loudly while the
@@ -807,6 +969,8 @@ class FlowTrainer:
         self.best_loss = checkpoint.get("best_loss")
         self.best_step = int(checkpoint.get("best_step", -1))
         self.bad_evals = int(checkpoint.get("bad_evals", 0))
+        self.contrast_applied = int(checkpoint.get("contrast_applied", 0))
+        self.contrast_skipped = int(checkpoint.get("contrast_skipped", 0))
         self.statistics_summary = dict(checkpoint.get("embedding_statistics") or {})
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].cpu())

@@ -97,6 +97,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="steps of pure NLL before the QED-consistency term switches on")
     parser.add_argument("--qed-consistency-subbatch", type=int, default=None,
                         help="molecules used for the QED-consistency inverse pass")
+    parser.add_argument("--qed-contrast-weight", type=float, default=None,
+                        help="lambda for the N-matched QED-contrastive objective (0 = off). "
+                             "Forward-only; replaces the sampling-based consistency term.")
+    parser.add_argument("--qed-contrast-warmup", type=int, default=None,
+                        help="steps of pure NLL before the contrastive term switches on")
+    parser.add_argument("--qed-contrast-ramp", type=int, default=None,
+                        help="linear ramp of the contrastive lambda after the warmup")
+    parser.add_argument("--qed-contrast-subbatch", type=int, default=None,
+                        help="molecules scored per contrastive application")
+    parser.add_argument("--qed-contrast-every", type=int, default=None,
+                        help="apply the contrastive term every N steps (cost control)")
     parser.add_argument("--resume", default="auto",
                         help="'auto' (resume last.pt if present), 'none', or a checkpoint path")
     return parser.parse_args(argv)
@@ -121,6 +132,11 @@ def build_configs(arguments: argparse.Namespace) -> tuple[FlowConfig, FlowTrainC
         "qed_consistency_weight": arguments.qed_consistency_weight,
         "qed_consistency_warmup": arguments.qed_consistency_warmup,
         "qed_consistency_subbatch": arguments.qed_consistency_subbatch,
+        "qed_contrast_weight": arguments.qed_contrast_weight,
+        "qed_contrast_warmup": arguments.qed_contrast_warmup,
+        "qed_contrast_ramp": arguments.qed_contrast_ramp,
+        "qed_contrast_subbatch": arguments.qed_contrast_subbatch,
+        "qed_contrast_every": arguments.qed_contrast_every,
     }
     train_values.update({k: v for k, v in overrides_train.items() if v is not None})
     if arguments.ae_seen_only:
