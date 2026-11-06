@@ -103,6 +103,19 @@ class FlowTrainConfig:
     ae_subset_seed: int | None = 3         # seed that selected that subset (AE run seed)
     ae_subset_size: int = 100_000
     deterministic: bool = False
+    # --- optional conditional QED-consistency auxiliary objective (training only) ------
+    # 0.0 = OFF. Every existing config and checkpoint is byte-identical in behaviour when
+    # this is 0. See zinc_gnf/qed_consistency.py. Requires 'qed' in condition_features.
+    # The objective adds no parameters to NodeFlow and does not change the density, so a
+    # checkpoint trained with it stays a drop-in for every generation/evaluation script.
+    qed_consistency_weight: float = 0.0        # lambda on the auxiliary MSE term
+    qed_consistency_warmup: int = 2000         # steps of pure NLL before the term switches on
+    qed_consistency_ramp: int = 2000           # linear ramp of lambda after the warmup
+    qed_consistency_subbatch: int = 32         # molecules used for the (sequential) inverse pass
+    qed_consistency_temperature: float = 1.0   # prior temperature when sampling the aux term
+    qed_surrogate_hidden: int = 128            # QED read-out MLP hidden width
+    qed_surrogate_lr: float = 1e-3             # the read-out's own optimiser learning rate
+    qed_consistency_every: int = 1             # apply the (sequential-inverse) aux term every N steps
 
     def validate(self) -> None:
         if self.device not in ("auto", "cpu", "cuda"):
@@ -118,6 +131,20 @@ class FlowTrainConfig:
                              f"({self.pause_at_step} vs max_steps={self.max_steps})")
         if self.ae_seen_only and self.ae_subset_seed is None:
             raise ValueError("ae_seen_only needs ae_subset_seed (the autoencoder run's seed)")
+        if self.qed_consistency_weight < 0:
+            raise ValueError("qed_consistency_weight must be >= 0")
+        for name in ("qed_consistency_warmup", "qed_consistency_ramp"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        if self.qed_consistency_weight > 0:
+            if self.qed_consistency_subbatch < 1:
+                raise ValueError("qed_consistency_subbatch must be >= 1 when the objective is on")
+            if self.qed_consistency_temperature <= 0:
+                raise ValueError("qed_consistency_temperature must be > 0")
+            if self.qed_surrogate_hidden < 1:
+                raise ValueError("qed_surrogate_hidden must be >= 1")
+            if self.qed_consistency_every < 1:
+                raise ValueError("qed_consistency_every must be >= 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -320,12 +347,29 @@ class FlowTrainer:
         shuffled_log_prob = 0.0
         condition_wins = 0
         condition_molecules = 0
+        # Held-out ACCURACY OF THE QED SURROGATE on real (clean) embeddings. This is the
+        # read-out the consistency term trusts; it is NOT the autoencoder's reconstruction
+        # QED. A weak surrogate here means the auxiliary gradient is unreliable, so it is
+        # reported every evaluation and must be inspected before trusting any QED gain.
+        surrogate = getattr(self, "surrogate", None)
+        qed_col = getattr(self, "_qed_col", None)
+        surr_abs_error = 0.0
+        surr_count = 0
+        surr_pred: list[float] = []
+        surr_true: list[float] = []
         for batch in iter_eval_batches(self.val_set, max(self.config.batch_size, 64), self.val_indices):
             batch = batch.to(self.device)
-            embeddings = encode_batch(self.autoencoder, batch)
-            embeddings = flow.add_smoothing_noise(embeddings, batch.node_mask, generator=generator)
+            clean = encode_batch(self.autoencoder, batch)
+            embeddings = flow.add_smoothing_noise(clean, batch.node_mask, generator=generator)
             condition = self._condition(flow, batch)
             parts = flow.log_prob(embeddings, batch.node_mask, condition)
+            if surrogate is not None and qed_col is not None:
+                target = batch_condition(batch, flow.config.condition_features)[0][:, qed_col]
+                prediction = surrogate(clean, batch.node_mask)
+                surr_abs_error += float((prediction - target).abs().sum())
+                surr_count += int(target.shape[0])
+                surr_pred.extend(float(v) for v in prediction.detach().cpu())
+                surr_true.extend(float(v) for v in target.detach().cpu())
             if shuffle_rng is not None and batch.batch_size > 1:
                 values, present = batch_condition(batch, flow.config.condition_features)
                 order = shuffle_rng.permutation(batch.batch_size)
@@ -362,6 +406,14 @@ class FlowTrainer:
                 "val_condition_gap": shuffled_loss - result["val_loss"],
                 "val_condition_win_rate": condition_wins / condition_molecules,
             })
+        if surr_count:
+            # MAE is in STANDARDISED QED units (the units the consistency term uses);
+            # divide by the scaler's QED std to read it in raw QED. Correlation is unitless.
+            result["val_surrogate_qed_mae_standardised"] = surr_abs_error / surr_count
+            if len(surr_pred) > 2 and np.std(surr_pred) > 1e-8 and np.std(surr_true) > 1e-8:
+                result["val_surrogate_qed_corr"] = float(np.corrcoef(surr_pred, surr_true)[0, 1])
+            else:
+                result["val_surrogate_qed_corr"] = float("nan")
         return result
 
     def _save(self, name: str, flow, optimizer, extra_state: dict[str, Any]) -> Path:
@@ -374,7 +426,7 @@ class FlowTrainer:
         return path
 
     def _state(self, step: int) -> dict[str, Any]:
-        return {
+        state = {
             "step": step,
             "batcher": self.batcher.state_dict(),
             "best_loss": self.best_loss,
@@ -393,6 +445,16 @@ class FlowTrainer:
             "noise_generator_state": (self.noise_generator.get_state().cpu()
                                       if getattr(self, "noise_generator", None) is not None else None),
         }
+        # Training-only QED-consistency state, saved under its own keys so a checkpoint
+        # stays loadable by load_flow (which rebuilds the NodeFlow only) and by any
+        # baseline resume (which simply never reads these keys).
+        if getattr(self, "surrogate", None) is not None:
+            state["qed_surrogate_state"] = self.surrogate.state_dict()
+            state["qed_surrogate_optimizer_state"] = self.surrogate_optimizer.state_dict()
+            state["consistency_generator_state"] = (
+                self.consistency_generator.get_state().cpu()
+                if getattr(self, "consistency_generator", None) is not None else None)
+        return state
 
     # ------------------------------------------------------------------
     def train(self, resume: str | Path | None = "auto", stop_flag: StopFlag | None = None) -> dict[str, Any]:
@@ -447,6 +509,36 @@ class FlowTrainer:
         self.bad_evals = 0
         self.statistics_summary: dict[str, Any] = {}
         self.noise_generator = torch.Generator(device=self.device).manual_seed(cfg.seed * 7919 + 13)
+
+        # Optional conditional QED-consistency objective (training only). Built here so it
+        # exists before any resume, so its state can be restored. When off, nothing below
+        # runs and the loop is byte-identical to the baseline.
+        self.surrogate = None
+        self.surrogate_optimizer = None
+        self.consistency_generator = None
+        self._qed_col = None
+        if cfg.qed_consistency_weight > 0 and "qed" not in self.flow_config.condition_features:
+            raise ValueError("qed_consistency_weight > 0 requires 'qed' in the flow's "
+                             f"condition_features (got {list(self.flow_config.condition_features)})")
+        self.qed_consistency_on = (cfg.qed_consistency_weight > 0
+                                   and "qed" in self.flow_config.condition_features)
+        if self.qed_consistency_on:
+            from zinc_gnf.qed_consistency import EmbeddingQedSurrogate
+            self.surrogate = EmbeddingQedSurrogate(
+                self.flow_config.node_embedding_dim,
+                hidden_dim=cfg.qed_surrogate_hidden).to(self.device)
+            self.surrogate_optimizer = torch.optim.Adam(self.surrogate.parameters(),
+                                                        lr=cfg.qed_surrogate_lr)
+            self.consistency_generator = torch.Generator(device=self.device).manual_seed(
+                cfg.seed * 6271 + 5)
+            self._qed_col = self.flow_config.condition_features.index("qed")
+            log.info(
+                f"QED-consistency objective ON (training only): weight={cfg.qed_consistency_weight} "
+                f"warmup={cfg.qed_consistency_warmup} ramp={cfg.qed_consistency_ramp} "
+                f"subbatch={cfg.qed_consistency_subbatch} T={cfg.qed_consistency_temperature} "
+                f"surrogate_hidden={cfg.qed_surrogate_hidden} lr={cfg.qed_surrogate_lr}; the flow "
+                f"density and checkpoint format are UNCHANGED (surrogate saved separately)")
+
         step = 0
         history: list[dict[str, Any]] = []
 
@@ -493,12 +585,40 @@ class FlowTrainer:
                 group["lr"] = self._learning_rate(step)
             indices = self.batcher.next_indices()
             batch = make_batch(self.train_set, indices).to(self.device)
-            embeddings = encode_batch(self.autoencoder, batch)
-            embeddings = flow.add_smoothing_noise(embeddings, batch.node_mask,
+            clean = encode_batch(self.autoencoder, batch)
+            embeddings = flow.add_smoothing_noise(clean, batch.node_mask,
                                                   generator=self.noise_generator)
-            parts = flow.negative_log_likelihood(embeddings, batch.node_mask,
-                                                 self._condition(flow, batch))
-            loss = parts["loss"]
+            condition = self._condition(flow, batch)
+            parts = flow.negative_log_likelihood(embeddings, batch.node_mask, condition)
+            nll_loss = parts["loss"]
+            loss = nll_loss
+
+            # Optional conditional QED-consistency term. Adds nll + lambda(step) * MSE,
+            # where the MSE is on prior-sampled, inverted embeddings read by a frozen,
+            # real-calibrated QED surrogate. Logged separately from the NLL below.
+            aux = {}
+            cons_weight = 0.0
+            if self.qed_consistency_on:
+                from zinc_gnf.qed_consistency import (conditional_consistency_loss,
+                                                      consistency_weight)
+                cons_weight = consistency_weight(step, weight=cfg.qed_consistency_weight,
+                                                 warmup=cfg.qed_consistency_warmup,
+                                                 ramp=cfg.qed_consistency_ramp)
+                if cons_weight > 0.0 and step % cfg.qed_consistency_every == 0:
+                    values, _present = batch_condition(batch, self.flow_config.condition_features)
+                    sub = min(cfg.qed_consistency_subbatch, batch.batch_size)
+                    # Freeze the surrogate IN-GRAPH so this term updates the flow only.
+                    for parameter in self.surrogate.parameters():
+                        parameter.requires_grad_(False)
+                    consistency, aux = conditional_consistency_loss(
+                        flow, self.surrogate, condition=condition[:sub],
+                        mask=batch.node_mask[:sub], qed_std_target=values[:sub, self._qed_col],
+                        temperature=cfg.qed_consistency_temperature,
+                        generator=self.consistency_generator)
+                    for parameter in self.surrogate.parameters():
+                        parameter.requires_grad_(True)
+                    loss = nll_loss + cons_weight * consistency
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None
@@ -511,13 +631,34 @@ class FlowTrainer:
                     f"state was saved to {self.output_dir / 'last.pt'}; lower max_log_scale or the "
                     f"learning rate before resuming.")
             optimizer.step()
+
+            # Calibrate the QED surrogate on REAL (clean) embeddings only, with its own
+            # optimiser and a separate graph, so the consistency term never moves it and
+            # no gradient reaches the frozen encoder. Detach keeps the flow out of it too.
+            surrogate_mse = None
+            if self.qed_consistency_on:
+                from zinc_gnf.qed_consistency import surrogate_regression_loss
+                values_all, _ = batch_condition(batch, self.flow_config.condition_features)
+                self.surrogate_optimizer.zero_grad(set_to_none=True)
+                regression = surrogate_regression_loss(
+                    self.surrogate, clean.detach(), batch.node_mask,
+                    values_all[:, self._qed_col])
+                regression.backward()
+                self.surrogate_optimizer.step()
+                surrogate_mse = float(regression.detach())
+
             step += 1
 
-            window.append({"loss": float(loss.detach()),
-                           "log_det_per_node": float(parts["log_det_per_node"].detach()),
-                           "log_prob_z_per_node": float(parts["log_prob_z_per_node"].detach()),
-                           "z_norm": float(parts["z_norm"].detach()),
-                           "prior_sigma_mean": float(parts["prior_sigma_mean"].detach())})
+            entry = {"loss": float(nll_loss.detach()),
+                     "log_det_per_node": float(parts["log_det_per_node"].detach()),
+                     "log_prob_z_per_node": float(parts["log_prob_z_per_node"].detach()),
+                     "z_norm": float(parts["z_norm"].detach()),
+                     "prior_sigma_mean": float(parts["prior_sigma_mean"].detach())}
+            if self.qed_consistency_on:
+                entry["qed_cons_weight"] = float(cons_weight)
+                entry["qed_consistency_mse"] = float(aux.get("qed_consistency_mse", 0.0))
+                entry["qed_surrogate_mse"] = float(surrogate_mse if surrogate_mse is not None else 0.0)
+            window.append(entry)
             if step % cfg.log_every == 0 or step == cfg.max_steps or step <= 5:
                 mean = {k: float(np.mean([w[k] for w in window])) for k in window[0]}
                 rate = len(window) / max(time.perf_counter() - step_started, 1e-9)
@@ -528,6 +669,11 @@ class FlowTrainer:
                          f"grad_norm={grad_norm if grad_norm is None else round(grad_norm, 3)} "
                          f"it/s={rate:.2f} elapsed={format_duration(time.perf_counter() - started)} "
                          f"rss_mb={current_rss_mb()}")
+                if self.qed_consistency_on:
+                    log.info(f"    QED-consistency: lambda={mean.get('qed_cons_weight', 0.0):.4f} "
+                             f"cons_mse={mean.get('qed_consistency_mse', 0.0):.4f} "
+                             f"surrogate_mse={mean.get('qed_surrogate_mse', 0.0):.4f} "
+                             f"(aux term; NLL above is the density objective)")
                 self._append(metrics_path, {"kind": "train", "step": step, **mean, "it_per_s": rate})
                 # A log-determinant running away is the documented divergence signature of
                 # this flow family (the teammates saw it before a NaN). Warn loudly while the
@@ -555,11 +701,16 @@ class FlowTrainer:
                 if "val_condition_gap" in metrics:
                     condition_note = (f"cond_gap={metrics['val_condition_gap']:+.4f} "
                                       f"cond_win={metrics['val_condition_win_rate']:.3f} ")
+                surrogate_note = ""
+                if "val_surrogate_qed_mae_standardised" in metrics:
+                    surrogate_note = (
+                        f"surr_qed_mae(std)={metrics['val_surrogate_qed_mae_standardised']:.4f} "
+                        f"surr_qed_corr={metrics['val_surrogate_qed_corr']:.3f} ")
                 log.info(f"VAL step {step}: nll/node={metrics['val_loss']:.4f} "
                          f"logp_z/node={metrics['val_log_prob_z_per_node']:.4f} "
                          f"logdet/node={metrics['val_log_det_per_node']:.4f} "
                          f"z_norm={metrics['val_z_norm']:.3f} "
-                         f"{condition_note}"
+                         f"{condition_note}{surrogate_note}"
                          f"molecules={metrics['val_molecules']:,} "
                          f"{'*BEST*' if improved else f'(no improvement x{self.bad_evals})'}")
                 self._append(metrics_path, {"kind": "val", "step": step, "improved": improved, **metrics})
@@ -666,6 +817,19 @@ class FlowTrainer:
         saved_noise_state = checkpoint.get("noise_generator_state")
         if saved_noise_state is not None and getattr(self, "noise_generator", None) is not None:
             self.noise_generator.set_state(saved_noise_state.to(torch.uint8).cpu())
+        # Restore the training-only QED-consistency state when both the run and the
+        # checkpoint have it; a baseline checkpoint simply carries none of these keys.
+        if getattr(self, "surrogate", None) is not None \
+                and checkpoint.get("qed_surrogate_state") is not None:
+            self.surrogate.load_state_dict(checkpoint["qed_surrogate_state"])
+            if checkpoint.get("qed_surrogate_optimizer_state") is not None:
+                self.surrogate_optimizer.load_state_dict(
+                    checkpoint["qed_surrogate_optimizer_state"])
+            saved_consistency_state = checkpoint.get("consistency_generator_state")
+            if saved_consistency_state is not None \
+                    and getattr(self, "consistency_generator", None) is not None:
+                self.consistency_generator.set_state(
+                    saved_consistency_state.to(torch.uint8).cpu())
         return int(checkpoint["step"]), list(checkpoint.get("history", []))
 
     @staticmethod

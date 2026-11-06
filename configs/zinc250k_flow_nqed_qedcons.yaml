@@ -1,0 +1,76 @@
+# ============================================================================
+# JOINT (N, QED)-conditioned flow + conditional QED-CONSISTENCY objective.
+#
+# IDENTICAL to configs/zinc250k_flow_nqed.yaml (same frozen 64D autoencoder, same
+# dataset split, same Arm B architecture, same optimiser, schedule, smoothing noise
+# and whitening) EXCEPT:
+#   * the training section turns on the optional conditional QED-consistency auxiliary
+#     objective (qed_consistency_weight > 0), and
+#   * a new output directory.
+#
+# The auxiliary objective is TRAINING ONLY. It adds no parameters to the flow and does
+# not change the density, so the resulting checkpoint is a drop-in for every existing
+# generation and evaluation script. See zinc_gnf/qed_consistency.py for the mechanism
+# and the off-manifold-surrogate safeguards. With qed_consistency_weight = 0 this file
+# would reproduce the baseline exactly.
+#
+# WHY: the joint flow carries QED in its likelihood (positive permutation gap) but its
+# SAMPLED QED barely follows the request. Maximum likelihood never scores where the
+# inverse map lands; this term does, pushing samples at condition c to read as QED(c)
+# under a QED surrogate calibrated only on real embeddings.
+# ============================================================================
+
+flow:
+  node_embedding_dim: 64        # must equal the autoencoder's embedding width
+  num_blocks: 12                # [teammates] 12 coupling steps
+  attention_dim: 64
+  num_heads: 4
+  hidden_dim: 256
+  max_log_scale: 1.0
+  actnorm: true
+  node_autoregressive: true     # ARM B, unchanged from the nqed baseline
+  invertible_linear: true
+  prior_min_sigma: 0.1
+  prior_init_sigma: 1.0
+  prior_hidden_dim: 64
+  condition_features: ["n", "qed"]   # QED must be present for the consistency objective
+  condition_embedding_dim: 64
+  condition_hidden_dim: 64
+  noise_sigma: 0.05
+  whiten: true
+  whiten_std_floor: 0.01
+
+training:
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  output_dir: outputs/checkpoints/flow_nqed_qedcons   # NEW: baselines are never touched
+  ae_checkpoint: outputs/ablation/ae_degree/seed_3/last.pt
+  seed: 1
+  device: auto
+  batch_size: 128
+  max_steps: 50000
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  warmup_steps: 500
+  log_every: 100
+  eval_every: 1000
+  save_every: 1000
+  val_molecules: 5000
+  statistics_molecules: 20000
+  pause_at_step: null
+  early_stopping_patience: 10
+  ae_seen_only: false
+  ae_subset_seed: 3
+  ae_subset_size: 100000
+  deterministic: false
+
+  # --- conditional QED-consistency objective (training only; the ONE change) ---------
+  qed_consistency_weight: 0.5        # lambda on the auxiliary MSE (standardised QED units)
+  qed_consistency_warmup: 5000       # ~10% of the run is pure NLL so the density settles first
+  qed_consistency_ramp: 5000         # then lambda ramps linearly to its full value
+  qed_consistency_subbatch: 32       # molecules per step for the (sequential) inverse pass
+  qed_consistency_temperature: 1.0   # train the full prior, NOT the T=0.2 evaluation setting
+  qed_surrogate_hidden: 128
+  qed_surrogate_lr: 0.001
+  qed_consistency_every: 1           # apply the aux term every step; raise to 2-4 if the
+                                     # smoke test shows the sequential inverse is too slow

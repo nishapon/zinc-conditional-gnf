@@ -1,0 +1,66 @@
+# ============================================================================
+# 128D JOINT (N, QED)-conditioned flow + conditional QED-CONSISTENCY objective.
+#
+# The 128D counterpart of configs/zinc250k_flow_nqed_qedcons.yaml: the ONLY differences
+# from that file are node_embedding_dim (128), the frozen autoencoder checkpoint, and the
+# output directory. The training objective is identical.
+#
+# PREREQUISITE (NOT on branch rewrite/zinc250k-pipeline as of this commit): the 128D
+# frozen autoencoder at outputs/ablation/ae_degree_128d/seed_3/last.pt must exist on the
+# cluster. The 128D three-seed baselines referenced in the task brief are not present in
+# this repository snapshot either. Use the 64D config (zinc250k_flow_nqed_qedcons.yaml)
+# for the first controlled comparison unless the 128D autoencoder is available.
+# ============================================================================
+
+flow:
+  node_embedding_dim: 128       # must equal the 128D autoencoder's embedding width
+  num_blocks: 12
+  attention_dim: 64
+  num_heads: 4
+  hidden_dim: 256
+  max_log_scale: 1.0
+  actnorm: true
+  node_autoregressive: true
+  invertible_linear: true
+  prior_min_sigma: 0.1
+  prior_init_sigma: 1.0
+  prior_hidden_dim: 64
+  condition_features: ["n", "qed"]
+  condition_embedding_dim: 64
+  condition_hidden_dim: 64
+  noise_sigma: 0.05
+  whiten: true
+  whiten_std_floor: 0.01
+
+training:
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+  output_dir: outputs/checkpoints/flow_nqed_ae128_qedcons
+  ae_checkpoint: outputs/ablation/ae_degree_128d/seed_3/last.pt
+  seed: 1
+  device: auto
+  batch_size: 128
+  max_steps: 50000
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  warmup_steps: 500
+  log_every: 100
+  eval_every: 1000
+  save_every: 1000
+  val_molecules: 5000
+  statistics_molecules: 20000
+  pause_at_step: null
+  early_stopping_patience: 10
+  ae_seen_only: false
+  ae_subset_seed: 3
+  ae_subset_size: 100000
+  deterministic: false
+
+  qed_consistency_weight: 0.5
+  qed_consistency_warmup: 5000
+  qed_consistency_ramp: 5000
+  qed_consistency_subbatch: 32
+  qed_consistency_temperature: 1.0
+  qed_surrogate_hidden: 128
+  qed_surrogate_lr: 0.001
+  qed_consistency_every: 1           # raise to 2-4 if the smoke test shows the inverse is too slow

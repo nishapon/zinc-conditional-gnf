@@ -90,6 +90,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--condition-features", default=None,
                         help="comma-separated subset of 'n,qed' (empty string = unconditional); "
                              "overrides the config's condition_features")
+    parser.add_argument("--qed-consistency-weight", type=float, default=None,
+                        help="lambda for the optional conditional QED-consistency objective "
+                             "(0 = off, the default); requires 'qed' in condition_features")
+    parser.add_argument("--qed-consistency-warmup", type=int, default=None,
+                        help="steps of pure NLL before the QED-consistency term switches on")
+    parser.add_argument("--qed-consistency-subbatch", type=int, default=None,
+                        help="molecules used for the QED-consistency inverse pass")
     parser.add_argument("--resume", default="auto",
                         help="'auto' (resume last.pt if present), 'none', or a checkpoint path")
     return parser.parse_args(argv)
@@ -111,6 +118,9 @@ def build_configs(arguments: argparse.Namespace) -> tuple[FlowConfig, FlowTrainC
         "early_stopping_patience": arguments.patience,
         "pause_at_step": arguments.pause_at,
         "max_train_molecules": arguments.max_train_molecules,
+        "qed_consistency_weight": arguments.qed_consistency_weight,
+        "qed_consistency_warmup": arguments.qed_consistency_warmup,
+        "qed_consistency_subbatch": arguments.qed_consistency_subbatch,
     }
     train_values.update({k: v for k, v in overrides_train.items() if v is not None})
     if arguments.ae_seen_only:
