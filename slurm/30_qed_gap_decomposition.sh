@@ -67,6 +67,21 @@ FINAL="${FINAL:-outputs/checkpoints/flow_nqed_ae128_qedcontrast/seed_3/best.pt}"
 OUT="${OUT:-outputs/metrics/qed_gap_decomposition}"
 SAMPLES="${SAMPLES:-32}"
 MOLECULES="${MOLECULES:-512}"
+
+# Autoencoder provenance is CHECKED, not waived. The SHA256 recorded in each flow
+# checkpoint must match the autoencoder on disk; set ALLOW_AE_MISMATCH=1 only if you
+# intend to override it, and the override is then recorded in the output JSON.
+EXTRA_ARGS=""
+if [[ "${ALLOW_AE_MISMATCH:-0}" == "1" ]]; then
+    echo "WARNING: ALLOW_AE_MISMATCH=1 - autoencoder SHA256 mismatches will be tolerated"
+    EXTRA_ARGS="${EXTRA_ARGS} --allow-ae-mismatch"
+fi
+# The out-of-support 'offset' protocol is OFF by default: it was the cause of the
+# job 366591 failure. Set INCLUDE_EXTRAPOLATION=1 to run it as a labelled probe.
+if [[ "${INCLUDE_EXTRAPOLATION:-0}" == "1" ]]; then
+    echo "including the EXTRAPOLATION offset protocol (explicitly labelled in the report)"
+    EXTRA_ARGS="${EXTRA_ARGS} --include-extrapolation"
+fi
 mkdir -p outputs/logs "${OUT}"
 
 echo "=============================================="
@@ -105,7 +120,7 @@ srun "${PYTHON}" -u scripts/30_qed_gap_decomposition.py \
     --samples-per-cell "${SAMPLES}" \
     --temperature 0.2 \
     --decoders constrained,degree \
-    --allow-ae-mismatch \
+    ${EXTRA_ARGS} \
     --device cpu
 
 echo

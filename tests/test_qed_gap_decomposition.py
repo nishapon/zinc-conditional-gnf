@@ -11,6 +11,7 @@ Requires torch + rdkit (the cluster env).
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 
 import numpy as np
@@ -208,3 +209,130 @@ def test_bootstrap_ci_handles_degenerate_input():
     assert module.bootstrap_ci(np.array([1.0]))["n"] == 1
     mixed = module.bootstrap_ci(np.array([1.0, np.nan, 2.0, np.inf]))
     assert mixed["n"] == 2
+
+
+# ============================================================================
+# Regression tests for job 366591: the final-offset failure
+# (worst absolute residual 1.638e+04 at a fixed 1e-5 bound).
+#
+# Cause: the 'offset' protocol pushed standardised QED outside the train support, the
+# flow extrapolated (its coupling TRANSLATIONS are unclamped), |z_a| reached ~1e9, the
+# Gaussian log-densities reached ~1e19, and d_prior = log p_t(z_a) - log p_a(z_a)
+# subtracted two numbers of that magnitude. float64 round-off on 1e19 is ~2e3, so a
+# residual of 1.6e4 is arithmetic precision, not an algebraic error. These tests pin
+# that reading and pin the corrections.
+# ============================================================================
+
+
+def test_identity_is_exact_at_extreme_magnitude_in_exact_scaling():
+    """The algebra survives huge latents: the residual tracks the TERM scale, not a
+    fixed bound. Reproduces the failure mode in miniature."""
+    flow, x, mask, values = _setup()
+    alt = values.clone()
+    alt[:, 1] += 1.0
+    # drive the latent to a huge magnitude the way an out-of-support condition does
+    big = x * 1e6
+    t = _terms(flow, big, mask, values, alt)
+    scale = max(float(t[k].abs().max()) for k in ("d_z", "d_prior", "d_logdet"))
+    residual = float((t["d_total"] - (t["d_z"] + t["d_prior"] + t["d_logdet"])).abs().max())
+    # absolute residual grows with scale; RELATIVE residual stays at machine precision
+    assert residual / max(scale, 1.0) < 1e-11, (
+        f"relative residual {residual / max(scale, 1.0):.3e} at term scale {scale:.3e}")
+
+
+def test_relative_criterion_accepts_roundoff_and_rejects_algebraic_error():
+    """The backward-error bound must not be a blanket loosening."""
+    module = _script()
+    rel, floor = module.IDENTITY_RELATIVE_TOLERANCE, module.IDENTITY_ABSOLUTE_FLOOR
+    # the four residuals actually observed in job 366591 on term scale ~1e4
+    for observed in (4.55e-13, 9.09e-13, 1.82e-12):
+        allowed = max(floor, 1.0e4 * rel)
+        assert observed <= allowed, f"{observed:.2e} wrongly rejected"
+    # the failing case at its true term scale is round-off and is accepted
+    assert 1.638e4 <= max(floor, 9.2e18 * rel)
+    # an algebraic error is O(1) RELATIVE and is still rejected at every scale
+    for scale in (1e4, 1e12, 1e19):
+        bogus = 0.01 * scale
+        assert bogus > max(floor, scale * rel), f"algebraic error hidden at scale {scale:.0e}"
+
+
+def test_nan_safe_max_cannot_drop_a_nan():
+    """Python's max(0.0, nan) returns 0.0, which silently hid non-finite residuals."""
+    module = _script()
+    assert max(0.0, float("nan")) == 0.0          # the original defect
+    assert math.isnan(module.nan_safe_max(0.0, float("nan")))
+    assert math.isnan(module.nan_safe_max(float("nan"), 1.0))
+    assert module.nan_safe_max(1.0, 2.0) == 2.0
+    assert module.nan_safe_max(3.0, 2.0) == 3.0
+
+
+def test_grid_protocol_stays_inside_train_support():
+    """The generation-matched protocol must never leave support, by construction."""
+    module = _script()
+    _, _, _, values = _setup()
+    support = (-5.28, 1.94)                        # ZINC standardised QED range
+    grid = [-2.396, -0.952, 0.492]                 # raw 0.4 / 0.6 / 0.8 standardised
+    rng = np.random.default_rng(0)
+    alt, in_support, clamped = module.build_alternative(
+        values, 1, "grid", rng=rng, qed_offset=0.0, grid_std=grid,
+        support=support, clamp=True)
+    assert bool(in_support.all()), "grid protocol left the train support"
+    assert not bool(clamped.any())
+    # N column untouched, and each alternative is an actual grid value
+    assert torch.allclose(alt[:, 0], values[:, 0])
+    for v in alt[:, 1].tolist():
+        assert min(abs(v - g) for g in grid) < 1e-6
+    # and it picks the FARTHEST grid target, maximising the contrast
+    for i, true_q in enumerate(values[:, 1].tolist()):
+        best = max(grid, key=lambda g: abs(g - true_q))
+        assert abs(float(alt[i, 1]) - best) < 1e-6
+
+
+def test_offset_protocol_is_flagged_out_of_support_and_clamped():
+    module = _script()
+    support = (-5.28, 1.94)
+    # a molecule at the very top of the range, offset +1 -> 2.94, i.e. raw QED > 1
+    values = torch.tensor([[0.3, 1.90]], dtype=torch.float64)
+    alt, in_support, clamped = module.build_alternative(
+        values, 1, "offset", rng=np.random.default_rng(0), qed_offset=1.0,
+        grid_std=[], support=support, clamp=True)
+    assert bool(clamped.all()), "out-of-support offset was not flagged as clamped"
+    assert bool(in_support.all()), "clamping must bring it back into support"
+    assert float(alt[0, 1]) == pytest.approx(1.94)
+    # unclamped: stays outside, and the script must mark it so
+    alt2, in_support2, clamped2 = module.build_alternative(
+        values, 1, "offset", rng=np.random.default_rng(0), qed_offset=1.0,
+        grid_std=[], support=support, clamp=False)
+    assert float(alt2[0, 1]) == pytest.approx(2.90)
+    assert not bool(in_support2.any())
+
+
+def test_offset_of_one_sigma_does_not_reproduce_the_generation_grid():
+    """Quantifies why the offset protocol is not a generation-matched probe."""
+    qed_mean, qed_sd = 0.7318, 0.1385
+    grid = [(q - qed_mean) / qed_sd for q in (0.4, 0.6, 0.8)]
+    assert max(grid) - min(grid) == pytest.approx(2.888, abs=0.01)
+    # one standardised sigma is 0.1385 raw QED: far smaller than the grid span, and it is
+    # applied RELATIVE to each molecule, so high-QED molecules are pushed out of support
+    assert 1.0 * qed_sd == pytest.approx(0.1385, abs=1e-4)
+    assert qed_mean + (1.94 + 1.0) * qed_sd > 1.0        # asks for QED > 1
+
+
+def test_in_support_protocols_are_classified_separately():
+    module = _script()
+    assert "permute-qed" in module.IN_SUPPORT_PROTOCOLS
+    assert "grid" in module.IN_SUPPORT_PROTOCOLS
+    assert "offset" in module.EXTRAPOLATION_PROTOCOLS
+    assert set(module.IN_SUPPORT_PROTOCOLS) & set(module.EXTRAPOLATION_PROTOCOLS) == set()
+
+
+def test_permutation_protocol_keeps_n_and_uses_real_qed_values():
+    module = _script()
+    _, _, _, values = _setup()
+    alt, in_support, clamped = module.build_alternative(
+        values, 1, "permute-qed", rng=np.random.default_rng(1), qed_offset=0.0,
+        grid_std=[], support=(-5.28, 1.94), clamp=True)
+    assert torch.allclose(alt[:, 0], values[:, 0])       # N untouched
+    assert bool(in_support.all()) and not bool(clamped.any())
+    pool = sorted(round(v, 9) for v in values[:, 1].tolist())
+    assert sorted(round(v, 9) for v in alt[:, 1].tolist()) == pool

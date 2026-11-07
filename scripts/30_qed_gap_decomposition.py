@@ -104,9 +104,28 @@ from zinc_gnf.trainer_flow import (  # noqa: E402
 )
 from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 
-# The identity is exact in exact arithmetic; in float64 the residual is round-off on
-# sums of order 1e4, so this bound is ~1e-9 relative.
-IDENTITY_TOLERANCE = 1e-5
+# ---------------------------------------------------------------------------------
+# Identity verification uses a BACKWARD-ERROR criterion, not a fixed absolute bound.
+#
+# The decomposition is algebraically exact, so any residual is floating-point summation
+# error. For a sum of k terms of magnitude M the error bound is ~k*eps*M, so a FIXED
+# absolute tolerance is only meaningful at a fixed term scale. In this diagnostic the
+# term scale varies by 15 orders of magnitude: ~1e4 for in-support conditions, but up to
+# ~1e19 when an out-of-support condition drives |z| to ~1e9 (the coupling translations
+# are not clamped, only the scales are). A fixed 1e-5 bound therefore fails on
+# extrapolated conditions for a reason that has nothing to do with the identity.
+#
+# This is NOT a loosened tolerance. On the in-support protocols the measured residuals
+# (4.6e-13 to 1.8e-12 on term scale ~1e4) are 4-12% of k*eps*M, i.e. already at machine
+# precision; the relative criterion accepts exactly those and would still reject a real
+# algebraic error, which would be O(1) relative rather than O(1e-16).
+IDENTITY_RELATIVE_TOLERANCE = 1e-11      # ~5e4 * eps: far above round-off, far below signal
+IDENTITY_ABSOLUTE_FLOOR = 1e-8           # guards the small-scale limit
+# A molecule whose latent exceeds this is numerically degenerate: its log-density is
+# ~-1e19 and it would dominate any mean. Counted and excluded, never silently averaged.
+MAX_ABS_Z_DEFAULT = 1.0e6
+IN_SUPPORT_PROTOCOLS = ("permute-qed", "grid")
+EXTRAPOLATION_PROTOCOLS = ("offset",)
 BOOTSTRAP = 2000
 BOOTSTRAP_SEED = 20261107
 PROBE_SEED = 20261108
@@ -146,9 +165,65 @@ def per_node_rms(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 # ----------------------------------------------------------------- section A ---
+def nan_safe_max(current: float, candidate: float) -> float:
+    """max() that cannot silently drop a NaN.
+
+    Python's max(0.0, nan) returns 0.0 because every comparison with NaN is False, so a
+    non-finite residual would have been discarded by the previous version of this code.
+    """
+    if math.isnan(candidate):
+        return float("nan")
+    if math.isnan(current):
+        return float("nan")
+    return max(current, candidate)
+
+
+def build_alternative(values: torch.Tensor, qed_col: int, protocol: str, *, rng,
+                      qed_offset: float, grid_std: list[float],
+                      support: tuple[float, float], clamp: bool):
+    """`c_a` for one batch, plus per-molecule support bookkeeping.
+
+    permute-qed  each molecule keeps its true N and takes ANOTHER molecule's QED. In
+                 support by construction (every value is a real molecule's QED) and this
+                 is the protocol the recorded control numbers use.
+    grid         QED replaced by the generation grid target FARTHEST from the molecule's
+                 own QED, in RAW units. In support by construction and it is what the
+                 generation request actually is, which a standardised offset is not.
+    offset       standardised QED shifted by a constant. EXTRAPOLATION: for a molecule
+                 already near the top of the observed range this asks for QED > 1, which
+                 no molecule can have. Clamped to the TRAIN range by default.
+    """
+    alt = values.clone()
+    true_q = values[:, qed_col]
+    low, high = support
+    if protocol == "permute-qed":
+        order = rng.permutation(values.shape[0])
+        if np.array_equal(order, np.arange(values.shape[0])):
+            order = np.roll(order, 1)
+        index = torch.as_tensor(order.copy(), device=values.device)
+        alt[:, qed_col] = true_q[index]
+        clamped = torch.zeros_like(true_q, dtype=torch.bool)
+    elif protocol == "grid":
+        targets = torch.as_tensor(grid_std, dtype=values.dtype, device=values.device)
+        distance = (targets.unsqueeze(0) - true_q.unsqueeze(1)).abs()
+        alt[:, qed_col] = targets[distance.argmax(dim=1)]
+        clamped = torch.zeros_like(true_q, dtype=torch.bool)
+    elif protocol == "offset":
+        raw = true_q + float(qed_offset)
+        clamped = (raw < low) | (raw > high)
+        alt[:, qed_col] = raw.clamp(min=low, max=high) if clamp else raw
+    else:
+        raise ValueError("protocol must be 'permute-qed', 'grid' or 'offset'")
+    margin = 1e-6
+    in_support = ((alt[:, qed_col] >= low - margin)
+                  & (alt[:, qed_col] <= high + margin))
+    return alt, in_support, clamped
+
+
 @torch.no_grad()
 def decompose(flow, autoencoder, dataset, indices, *, device, batch_size, protocol,
-              qed_offset, scaler, noise_seed=VALIDATION_NOISE_SEED,
+              qed_offset, scaler, support, grid_std, clamp_to_support=True,
+              max_abs_z=MAX_ABS_Z_DEFAULT, noise_seed=VALIDATION_NOISE_SEED,
               shuffle_seed=31337) -> dict[str, Any]:
     """Exact three-way decomposition of the QED-only conditional likelihood gap.
 
@@ -166,8 +241,16 @@ def decompose(flow, autoencoder, dataset, indices, *, device, batch_size, protoc
     generator = torch.Generator(device=device).manual_seed(int(noise_seed))
 
     rows: list[dict[str, float]] = []
-    worst_residual = 0.0
+    worst_absolute = 0.0
+    worst_relative = 0.0
+    forensic: dict[str, Any] | None = None
+    degenerate = 0
+    out_of_support = 0
+    clamped_total = 0
+    nonfinite = 0
+    batch_ordinal = -1
     for batch in iter_eval_batches(dataset, batch_size, indices):
+        batch_ordinal += 1
         batch = batch.to(device)
         if batch.batch_size < 2:
             continue
@@ -184,16 +267,11 @@ def decompose(flow, autoencoder, dataset, indices, *, device, batch_size, protoc
         values = values.double()
         present = present.double()
 
-        alt = values.clone()
-        if protocol == "permute-qed":
-            order = rng.permutation(batch.batch_size)
-            if np.array_equal(order, np.arange(batch.batch_size)):
-                order = np.roll(order, 1)
-            alt[:, qed_col] = values[torch.as_tensor(order.copy(), device=device), qed_col]
-        elif protocol == "offset":
-            alt[:, qed_col] = values[:, qed_col] + float(qed_offset)
-        else:
-            raise ValueError("protocol must be 'permute-qed' or 'offset'")
+        alt, in_support, clamped = build_alternative(
+            values, qed_col, protocol, rng=rng, qed_offset=qed_offset,
+            grid_std=grid_std, support=support, clamp=clamp_to_support)
+        out_of_support += int((~in_support).sum())
+        clamped_total += int(clamped.sum())
 
         cond_t = condition_embedding_for(flow, values, present, batch.batch_size, device)
         cond_a = condition_embedding_for(flow, alt, present, batch.batch_size, device)
@@ -209,29 +287,100 @@ def decompose(flow, autoencoder, dataset, indices, *, device, batch_size, protoc
         d_logdet = logdet_t - logdet_a
         d_total = (lp_t_zt + logdet_t) - (lp_a_za + logdet_a)
         residual = (d_total - (d_z + d_prior + d_logdet)).abs()
-        worst_residual = max(worst_residual, float(residual.max()))
+
+        # Backward-error criterion: the achievable precision is set by the LARGEST term
+        # entering the sum, not by the size of the answer.
+        term_scale = torch.stack([lp_t_zt.abs(), lp_t_za.abs(), lp_a_za.abs(),
+                                  logdet_t.abs(), logdet_a.abs()]).max(dim=0).values
+        allowed = torch.clamp(term_scale * IDENTITY_RELATIVE_TOLERANCE,
+                              min=IDENTITY_ABSOLUTE_FLOOR)
+        relative = residual / term_scale.clamp(min=1.0)
+
+        z_abs_t = (z_t * mask.unsqueeze(-1)).abs().amax(dim=(1, 2))
+        z_abs_a = (z_a * mask.unsqueeze(-1)).abs().amax(dim=(1, 2))
+        finite = (torch.isfinite(lp_t_zt) & torch.isfinite(lp_t_za)
+                  & torch.isfinite(lp_a_za) & torch.isfinite(logdet_t)
+                  & torch.isfinite(logdet_a) & torch.isfinite(residual))
+        is_degenerate = (z_abs_a > float(max_abs_z)) | (z_abs_t > float(max_abs_z)) | ~finite
 
         nodes = mask.sum(-1).clamp(min=1).double()
         separation = (alt[:, qed_col] - values[:, qed_col]).abs()
         for i in range(batch.batch_size):
+            worst_absolute = nan_safe_max(worst_absolute, float(residual[i]))
+            worst_relative = nan_safe_max(worst_relative, float(relative[i]))
+            violates = (math.isnan(float(residual[i]))
+                        or float(residual[i]) > float(allowed[i]))
+            # record the FIRST offending molecule in full, for the forensic report
+            if violates and forensic is None:
+                forensic = {
+                    "batch_ordinal": int(batch_ordinal),
+                    "index_in_batch": int(i),
+                    "n": int(batch.n_node[i]),
+                    "qed_true": float(batch.qed[i]),
+                    "qed_std_true": float(values[i, qed_col]),
+                    "qed_std_alternative": float(alt[i, qed_col]),
+                    "alternative_in_support": bool(in_support[i]),
+                    "alternative_was_clamped": bool(clamped[i]),
+                    "z_t_abs_max": float(z_abs_t[i]),
+                    "z_a_abs_max": float(z_abs_a[i]),
+                    "log_p_t_of_z_t": float(lp_t_zt[i]),
+                    "log_p_t_of_z_a": float(lp_t_za[i]),
+                    "log_p_a_of_z_a": float(lp_a_za[i]),
+                    "log_det_t": float(logdet_t[i]),
+                    "log_det_a": float(logdet_a[i]),
+                    "total_log_p_t": float(lp_t_zt[i] + logdet_t[i]),
+                    "total_log_p_a": float(lp_a_za[i] + logdet_a[i]),
+                    "all_terms_finite": bool(finite[i]),
+                    "absolute_residual": float(residual[i]),
+                    "relative_residual": float(relative[i]),
+                    "largest_term_magnitude": float(term_scale[i]),
+                    "allowed_absolute": float(allowed[i]),
+                    "diagnosis": (
+                        "catastrophic cancellation: d_prior subtracts two log-densities of "
+                        f"magnitude {float(term_scale[i]):.3e}, whose float64 round-off is "
+                        f"~{float(term_scale[i]) * 2.22e-16:.3e}, so an absolute residual of "
+                        f"{float(residual[i]):.3e} is arithmetic precision rather than an "
+                        "algebraic error"
+                        if bool(finite[i]) and float(term_scale[i]) > 1e12
+                        else "non-finite term" if not bool(finite[i])
+                        else "residual exceeds the backward-error bound at this term scale"),
+                }
+            if bool(is_degenerate[i]):
+                degenerate += 1
+                if not bool(finite[i]):
+                    nonfinite += 1
+                continue                      # never averaged into the reported statistics
             rows.append({
                 "n": int(batch.n_node[i]),
                 "qed_true": float(batch.qed[i]),
                 "qed_separation_std": float(separation[i]),
+                "in_support": bool(in_support[i]),
                 "d_z": float(d_z[i] / nodes[i]),
                 "d_prior": float(d_prior[i] / nodes[i]),
                 "d_logdet": float(d_logdet[i] / nodes[i]),
                 "d_total": float(d_total[i] / nodes[i]),
-                "residual": float(residual[i] / nodes[i]),
+                "absolute_residual": float(residual[i]),
+                "relative_residual": float(relative[i]),
+                "largest_term_magnitude": float(term_scale[i]),
             })
 
     if not rows:
-        raise ValueError("no molecules were scored")
-    if worst_residual > IDENTITY_TOLERANCE:
+        raise ValueError(
+            f"protocol '{protocol}': every molecule was numerically degenerate "
+            f"({degenerate} excluded, {nonfinite} non-finite). The conditions being "
+            f"evaluated are outside the model's usable range; this is a finding about the "
+            f"protocol, not a bug in the decomposition.")
+
+    verified = not (math.isnan(worst_relative)
+                    or worst_relative > IDENTITY_RELATIVE_TOLERANCE)
+    # An IN-SUPPORT protocol that fails the backward-error bound is a real defect and must
+    # stop the run. An EXTRAPOLATION protocol that fails is reporting that the arithmetic
+    # has run out of precision, which is a result, not a crash.
+    if not verified and protocol in IN_SUPPORT_PROTOCOLS:
         raise FloatingPointError(
-            f"the three-way decomposition did not reconstruct the total: worst absolute "
-            f"residual {worst_residual:.3e} exceeds {IDENTITY_TOLERANCE:.1e}. The "
-            f"decomposition is reported only when the identity holds.")
+            f"protocol '{protocol}' is IN SUPPORT yet the identity failed the "
+            f"backward-error bound: worst relative residual {worst_relative:.3e} exceeds "
+            f"{IDENTITY_RELATIVE_TOLERANCE:.1e}. Forensics: {json.dumps(forensic)}")
 
     def summarise(subset: list[dict[str, float]]) -> dict[str, Any]:
         if not subset:
@@ -250,10 +399,28 @@ def decompose(flow, autoencoder, dataset, indices, *, device, batch_size, protoc
 
     result: dict[str, Any] = {
         "protocol": protocol,
+        "protocol_class": ("in_support" if protocol in IN_SUPPORT_PROTOCOLS
+                           else "extrapolation"),
         "qed_offset_standardised": float(qed_offset) if protocol == "offset" else None,
-        "identity_worst_absolute_residual": worst_residual,
-        "identity_tolerance": IDENTITY_TOLERANCE,
-        "identity_verified": True,
+        "clamped_to_train_support": bool(clamp_to_support),
+        "train_qed_std_support": [float(support[0]), float(support[1])],
+        "identity_worst_absolute_residual": worst_absolute,
+        "identity_worst_relative_residual": worst_relative,
+        "identity_relative_tolerance": IDENTITY_RELATIVE_TOLERANCE,
+        "identity_absolute_floor": IDENTITY_ABSOLUTE_FLOOR,
+        "identity_verified": bool(verified),
+        "identity_criterion": ("backward error: residual <= max(abs_floor, rel_tol * "
+                               "largest term magnitude). A fixed absolute bound is not "
+                               "meaningful because the term scale spans ~1e4 to ~1e19."),
+        "first_violating_molecule": forensic,
+        "molecules_scored": len(rows),
+        "molecules_excluded_degenerate": int(degenerate),
+        "molecules_nonfinite": int(nonfinite),
+        "alternatives_out_of_support": int(out_of_support),
+        "alternatives_clamped": int(clamped_total),
+        "max_abs_z_threshold": float(max_abs_z),
+        "median_largest_term_magnitude": float(np.median(
+            [r["largest_term_magnitude"] for r in rows])),
         "dtype": "float64",
         "noise_seed": int(noise_seed),
         "overall": summarise(rows),
@@ -626,7 +793,16 @@ def parse_args(argv=None):
     p.add_argument("--samples-per-cell", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--qed-offset", type=float, default=1.0,
-                   help="standardised-QED offset for the 'offset' protocol")
+                   help="standardised-QED offset for the EXTRAPOLATION 'offset' protocol")
+    p.add_argument("--include-extrapolation", action="store_true",
+                   help="also run the out-of-support 'offset' protocol, reported as an "
+                        "explicitly labelled extrapolation test (off by default)")
+    p.add_argument("--no-clamp", action="store_true",
+                   help="do NOT clamp offset conditions to the train support; produces a "
+                        "deliberately degenerate probe")
+    p.add_argument("--max-abs-z", type=float, default=MAX_ABS_Z_DEFAULT,
+                   help="molecules whose |z| exceeds this are counted as numerically "
+                        "degenerate and excluded from the reported means")
     p.add_argument("--qed-halfwidth", type=float, default=0.05)
     p.add_argument("--real-molecules-per-band", type=int, default=128)
     p.add_argument("--probe-molecules", type=int, default=2000)
@@ -680,6 +856,39 @@ def main(argv=None) -> int:
                 f"{ae_path} is {digest[:16]} (use --allow-ae-mismatch to override)")
         autoencoder, _ = load_autoencoder(ae_path, device=device)
         autoencoder.eval().requires_grad_(False)
+        ae_provenance = {
+            "checkpoint": str(ae_path),
+            "sha256_actual": digest,
+            "sha256_recorded_in_flow": recorded.get("sha256"),
+            "sha256_match": bool(recorded.get("sha256") == digest),
+            "mismatch_override_used": bool(
+                args.allow_ae_mismatch and recorded.get("sha256")
+                and recorded.get("sha256") != digest),
+        }
+        if not ae_provenance["sha256_match"]:
+            print(f"WARNING: autoencoder SHA256 does NOT match the flow's recorded "
+                  f"provenance (recorded {str(recorded.get('sha256'))[:16]}, actual "
+                  f"{digest[:16]}). Recorded in the output as "
+                  f"mismatch_override_used=True.", file=sys.stderr, flush=True)
+        else:
+            print(f"autoencoder provenance VERIFIED: sha256 {digest[:16]} matches the "
+                  f"flow checkpoint's record", flush=True)
+
+        # Observed standardised-QED support on the TRAIN split, and the generation grid
+        # expressed in standardised units. Both are needed to tell an in-support
+        # perturbation from an extrapolation.
+        qed_mean, qed_std = float(scaler.mean[1]), float(scaler.std[1])
+        train_qed_std = (np.asarray(train_set.qed, dtype=np.float64) - qed_mean) / qed_std
+        support = (float(train_qed_std.min()), float(train_qed_std.max()))
+        grid_std = [float((q - qed_mean) / qed_std) for q in qed_values]
+        print(f"standardised QED: train support [{support[0]:.3f}, {support[1]:.3f}]; "
+              f"generation grid {[f'{q:.2f}' for q in qed_values]} -> "
+              f"{[f'{v:+.3f}' for v in grid_std]}", flush=True)
+        print(f"a +{args.qed_offset:g} standardised offset reaches "
+              f"{support[1] + args.qed_offset:.3f} for the highest-QED molecules, i.e. raw "
+              f"QED {qed_mean + (support[1] + args.qed_offset) * qed_std:.3f} "
+              f"({'OUTSIDE [0,1] - extrapolation' if qed_mean + (support[1] + args.qed_offset) * qed_std > 1.0 else 'in range'})",
+              flush=True)
 
         # the SAME subset seed the trainer's validation and condition_sensitivity use, so
         # the total gap here is comparable with the recorded control numbers
@@ -703,7 +912,9 @@ def main(argv=None) -> int:
                         "decomposition, route-separated inverse-sampling geometry, and "
                         "decoder/descriptor coherence"),
             "data_dir": args.data_dir, "data_fingerprint": fingerprint,
-            "autoencoder": {"checkpoint": str(ae_path), "sha256": digest},
+            "autoencoder": ae_provenance,
+            "train_qed_std_support": [support[0], support[1]],
+            "generation_grid_qed_std": grid_std,
             "validation_molecules": len(val_set),
             "decomposition_molecules": len(indices),
             "targets_n": targets, "qed_values": qed_values,
@@ -730,16 +941,26 @@ def main(argv=None) -> int:
 
             # --- Section A, in float64 ---
             doubled = flow.double()
-            for protocol in ("permute-qed", "offset"):
-                block["decomposition"][protocol] = decompose(
+            protocols = ["permute-qed", "grid"]
+            if args.include_extrapolation:
+                protocols.append("offset")
+            for protocol in protocols:
+                result = decompose(
                     doubled, autoencoder, val_set, indices, device=device,
                     batch_size=args.batch_size, protocol=protocol,
-                    qed_offset=args.qed_offset, scaler=scaler)
-                mean = block["decomposition"][protocol]["overall"]["d_total"]["mean"]
-                print(f"  [{label}] {protocol}: d_total={mean:+.4f} nats/node "
-                      f"(identity residual "
-                      f"{block['decomposition'][protocol]['identity_worst_absolute_residual']:.2e})",
-                      flush=True)
+                    qed_offset=args.qed_offset, scaler=scaler, support=support,
+                    grid_std=grid_std, clamp_to_support=not args.no_clamp,
+                    max_abs_z=args.max_abs_z)
+                block["decomposition"][protocol] = result
+                mean = result["overall"]["d_total"]["mean"]
+                print(f"  [{label}] {protocol} ({result['protocol_class']}): "
+                      f"d_total={mean:+.4f} nats/node | identity "
+                      f"abs={result['identity_worst_absolute_residual']:.2e} "
+                      f"rel={result['identity_worst_relative_residual']:.2e} "
+                      f"{'VERIFIED' if result['identity_verified'] else 'NOT VERIFIED'} | "
+                      f"term scale ~{result['median_largest_term_magnitude']:.2e} | "
+                      f"excluded={result['molecules_excluded_degenerate']} "
+                      f"out_of_support={result['alternatives_out_of_support']}", flush=True)
             flow = doubled.float()
 
             # --- Section B ---
@@ -808,9 +1029,40 @@ def format_report(payload: dict[str, Any]) -> str:
         lines += [f"--- {label}  (step {block.get('step')}) ---", ""]
         for protocol, result in block["decomposition"].items():
             o = result["overall"]
-            lines.append(f"  decomposition [{protocol}]  identity residual "
-                         f"{result['identity_worst_absolute_residual']:.2e} "
-                         f"(tol {result['identity_tolerance']:.0e}) VERIFIED")
+            lines.append(f"  decomposition [{protocol}] class={result['protocol_class']}")
+            lines.append(f"    identity: abs={result['identity_worst_absolute_residual']:.2e} "
+                         f"rel={result['identity_worst_relative_residual']:.2e} "
+                         f"(rel tol {result['identity_relative_tolerance']:.0e}) "
+                         f"{'VERIFIED' if result['identity_verified'] else 'NOT VERIFIED'}")
+            lines.append(f"    term scale (median largest term) "
+                         f"{result['median_largest_term_magnitude']:.3e}; scored "
+                         f"{result['molecules_scored']}, excluded degenerate "
+                         f"{result['molecules_excluded_degenerate']} "
+                         f"(non-finite {result['molecules_nonfinite']}), out of support "
+                         f"{result['alternatives_out_of_support']}, clamped "
+                         f"{result['alternatives_clamped']}")
+            if result.get("first_violating_molecule"):
+                f = result["first_violating_molecule"]
+                lines.append(f"    FIRST VIOLATING MOLECULE: batch {f['batch_ordinal']} "
+                             f"index {f['index_in_batch']} N={f['n']} "
+                             f"qed_true={f['qed_true']:.4f}")
+                lines.append(f"      qed_std true={f['qed_std_true']:+.4f} "
+                             f"alt={f['qed_std_alternative']:+.4f} "
+                             f"in_support={f['alternative_in_support']} "
+                             f"clamped={f['alternative_was_clamped']}")
+                lines.append(f"      |z_t|max={f['z_t_abs_max']:.3e} "
+                             f"|z_a|max={f['z_a_abs_max']:.3e} "
+                             f"all_finite={f['all_terms_finite']}")
+                lines.append(f"      log p_t(z_t)={f['log_p_t_of_z_t']:+.6e} "
+                             f"log p_t(z_a)={f['log_p_t_of_z_a']:+.6e} "
+                             f"log p_a(z_a)={f['log_p_a_of_z_a']:+.6e}")
+                lines.append(f"      log|det|_t={f['log_det_t']:+.6e} "
+                             f"log|det|_a={f['log_det_a']:+.6e}")
+                lines.append(f"      abs_residual={f['absolute_residual']:.3e} "
+                             f"rel_residual={f['relative_residual']:.3e} "
+                             f"largest_term={f['largest_term_magnitude']:.3e} "
+                             f"allowed_abs={f['allowed_absolute']:.3e}")
+                lines.append(f"      diagnosis: {f['diagnosis']}")
             lines.append(f"    {'term':<12}{'mean':>10}{'95% CI':>26}")
             for key, name in (("d_total", "d_total"), ("d_z", "d_z"),
                               ("d_prior", "d_prior"), ("d_logdet", "d_logdet")):
