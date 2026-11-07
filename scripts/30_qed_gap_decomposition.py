@@ -726,7 +726,21 @@ def decoder_control(autoencoder, dataset, *, device, target_n, qed_low, qed_high
     from rdkit import Chem, rdBase
     from zinc_gnf.generation import decode_embeddings
 
-    out: dict[str, Any] = {"n": int(target_n), "decoders": {}}
+    out: dict[str, Any] = {
+        "n": int(target_n),
+        "input": "REAL encoded embeddings (on-manifold by construction)",
+        "scope": (
+            "This measures the decoder and assembler on REAL encoder embeddings ONLY. It "
+            "does NOT bound their behaviour on FLOW-GENERATED embeddings, which are a "
+            "different input distribution: a high preserved_fraction here is therefore "
+            "NOT evidence that the decoder is innocent of the QED response loss seen in "
+            "the generated samples. The two must be read side by side with the "
+            "'descriptors' section, and a decoder explanation can only be excluded by a "
+            "measurement taken on generated embeddings."),
+        "decoders": {},
+    }
+    # (true_qed, decoded_qed_or_nan) PAIRS per band per decoder, so every statistic below
+    # is computed on the SAME molecules rather than on two differently-filtered sets.
     bands: dict[str, dict[str, Any]] = {}
     for label, centre in (("low", qed_low), ("high", qed_high)):
         eligible = np.flatnonzero((dataset.n_node == target_n)
@@ -735,44 +749,89 @@ def decoder_control(autoencoder, dataset, *, device, target_n, qed_low, qed_high
             out["note"] = f"no validation support at N={target_n}, QED~{centre}"
             return out
         chosen = eligible[:max_molecules].tolist()
-        true_qed, decoded = [], {d: [] for d in decoders}
+        pairs: dict[str, list[tuple[float, float]]] = {d: [] for d in decoders}
         for batch in iter_eval_batches(dataset, batch_size, chosen):
             batch = batch.to(device)
             nodes = autoencoder.encode(batch)
             counts = [int(v) for v in batch.n_node.tolist()]
             records = decode_embeddings(autoencoder, nodes, counts, decoders=tuple(decoders))
-            true_qed.extend(float(v) for v in batch.qed.detach().cpu())
+            truths = [float(v) for v in batch.qed.detach().cpu()]
             for name in decoders:
-                for record in records:
+                # records is aligned with the batch, so zip keeps each molecule with its
+                # own true QED; this alignment is what the previous version lost.
+                for truth, record in zip(truths, records):
                     entry = record.get(name) or {}
+                    value = float("nan")
                     if entry.get("valid") and entry.get("smiles"):
                         with rdBase.BlockLogs():
                             mol = Chem.MolFromSmiles(entry["smiles"])
-                        decoded[name].append(float(descriptors(mol)["qed"])
-                                             if mol is not None else float("nan"))
-                    else:
-                        decoded[name].append(float("nan"))
-        bands[label] = {"true_qed_mean": float(np.mean(true_qed)),
-                        "molecules": len(true_qed),
-                        "decoded": {d: decoded[d] for d in decoders}}
+                        if mol is not None:
+                            value = float(descriptors(mol)["qed"])
+                    pairs[name].append((truth, value))
+        bands[label] = {"centre": float(centre), "selected": len(chosen), "pairs": pairs}
 
-    true_gap = bands["high"]["true_qed_mean"] - bands["low"]["true_qed_mean"]
     for name in decoders:
-        hi = np.array(bands["high"]["decoded"][name], dtype=np.float64)
-        lo = np.array(bands["low"]["decoded"][name], dtype=np.float64)
-        hi, lo = hi[np.isfinite(hi)], lo[np.isfinite(lo)]
-        if hi.size < 2 or lo.size < 2:
-            out["decoders"][name] = {"note": "too few valid reconstructions"}
+        per_band: dict[str, Any] = {}
+        survivors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for label in ("low", "high"):
+            array = np.asarray(bands[label]["pairs"][name], dtype=np.float64)
+            truth, decoded = array[:, 0], array[:, 1]
+            keep = np.isfinite(decoded)
+            survivors[label] = (truth[keep], decoded[keep])
+            delta = decoded[keep] - truth[keep]
+            per_band[label] = {
+                "qed_band_centre": bands[label]["centre"],
+                "molecules_attempted": int(truth.size),
+                "molecules_reconstructed": int(keep.sum()),
+                # reconstruction validity reported SEPARATELY for each QED group, because
+                # a group-dependent success rate biases any gap computed across groups
+                "reconstruction_validity": float(keep.mean()) if truth.size else float("nan"),
+                "true_qed_mean_all_attempted": float(truth.mean()) if truth.size else float("nan"),
+                "true_qed_mean_reconstructed_only": float(truth[keep].mean())
+                if keep.any() else float("nan"),
+                "decoded_qed_mean": float(decoded[keep].mean()) if keep.any() else float("nan"),
+                "paired_qed_mae": float(np.abs(delta).mean()) if keep.any() else float("nan"),
+                "paired_qed_bias": float(delta.mean()) if keep.any() else float("nan"),
+                "paired_qed_correlation": (
+                    float(np.corrcoef(truth[keep], decoded[keep])[0, 1])
+                    if keep.sum() >= 3 and truth[keep].std() > 1e-9
+                    and decoded[keep].std() > 1e-9 else None),
+            }
+        low_truth, low_decoded = survivors["low"]
+        high_truth, high_decoded = survivors["high"]
+        if low_decoded.size < 2 or high_decoded.size < 2:
+            out["decoders"][name] = {"per_band": per_band,
+                                     "note": "too few reconstructions for a gap"}
             continue
-        decoded_gap = float(hi.mean() - lo.mean())
+        # BOTH sides of the ratio are computed on the SAME surviving molecules
+        true_gap = float(high_truth.mean() - low_truth.mean())
+        decoded_gap = float(high_decoded.mean() - low_decoded.mean())
+        all_truth = np.concatenate([low_truth, high_truth])
+        all_decoded = np.concatenate([low_decoded, high_decoded])
+        delta = all_decoded - all_truth
         out["decoders"][name] = {
-            "true_qed_gap": float(true_gap),
+            "per_band": per_band,
+            "true_qed_gap_reconstructed_only": true_gap,
             "decoded_qed_gap": decoded_gap,
-            "preserved_fraction": decoded_gap / true_gap if abs(true_gap) > 1e-9 else float("nan"),
-            "valid_low": int(lo.size), "valid_high": int(hi.size),
-            "note": ("preserved_fraction near 1 means the decoder and assembler transmit a "
-                     "QED difference they are GIVEN on real embeddings, so a loss observed "
-                     "on GENERATED embeddings cannot be blamed on the decoder alone."),
+            "preserved_fraction": (decoded_gap / true_gap if abs(true_gap) > 1e-9
+                                   else float("nan")),
+            "pooled_paired_qed_mae": float(np.abs(delta).mean()),
+            "pooled_paired_qed_bias": float(delta.mean()),
+            "pooled_paired_qed_correlation": (
+                float(np.corrcoef(all_truth, all_decoded)[0, 1])
+                if all_truth.std() > 1e-9 and all_decoded.std() > 1e-9 else None),
+            "validity_low": per_band["low"]["reconstruction_validity"],
+            "validity_high": per_band["high"]["reconstruction_validity"],
+            "validity_difference_high_minus_low": (
+                per_band["high"]["reconstruction_validity"]
+                - per_band["low"]["reconstruction_validity"]),
+            "note": ("preserved_fraction is the decoded QED gap over the TRUE QED gap of "
+                     "the same surviving molecules. A value near 1 means the decoder and "
+                     "assembler transmit a QED difference they are GIVEN on REAL "
+                     "embeddings. It says nothing about generated embeddings - see "
+                     "'scope'. Check validity_difference_high_minus_low: a "
+                     "group-dependent reconstruction rate means the surviving subsets "
+                     "differ systematically and the gap is selection-biased."),
         }
     return out
 
@@ -1018,8 +1077,12 @@ def format_report(payload: dict[str, Any]) -> str:
     lines = ["QED likelihood-gap decomposition and inverse-sampling geometry",
              "=" * 78, "",
              f"data: {payload['data_dir']}",
-             f"autoencoder: {payload['autoencoder']['checkpoint']} "
-             f"(sha {str(payload['autoencoder']['sha256'])[:16]})",
+             f"autoencoder: {payload['autoencoder']['checkpoint']}",
+             f"  sha256 actual   {payload['autoencoder']['sha256_actual']}",
+             f"  sha256 recorded {payload['autoencoder']['sha256_recorded_in_flow']}",
+             f"  provenance match: {payload['autoencoder']['sha256_match']}"
+             + ("  *** MISMATCH OVERRIDE USED ***"
+                if payload['autoencoder'].get('mismatch_override_used') else ""),
              f"decomposition molecules: {payload['decomposition_molecules']}  "
              f"temperature: {payload['temperature']}", ""]
     for label, block in payload["models"].items():
@@ -1114,13 +1177,41 @@ def format_report(payload: dict[str, Any]) -> str:
                     lines.append(f"      spearman vs requested QED: {shown}")
             lines.append("")
         if block.get("decoder_control"):
-            lines.append("  decoder control (REAL embeddings: does it transmit a given gap?)")
+            lines.append("  decoder control -- input: REAL encoded embeddings ONLY")
+            lines.append("  (this does NOT bound decoder behaviour on FLOW-GENERATED")
+            lines.append("   embeddings; compare against the 'descriptors' section above)")
             for n, d in sorted(block["decoder_control"].items(), key=lambda kv: int(kv[0])):
                 for name, b in (d.get("decoders") or {}).items():
+                    per_band = b.get("per_band") or {}
+                    for label in ("low", "high"):
+                        e = per_band.get(label)
+                        if not e:
+                            continue
+                        corr = e["paired_qed_correlation"]
+                        lines.append(
+                            f"    N={n} [{name}] {label}-QED band (centre "
+                            f"{e['qed_band_centre']:.2f}): "
+                            f"reconstruction validity {e['reconstruction_validity']:.3f} "
+                            f"({e['molecules_reconstructed']}/{e['molecules_attempted']})")
+                        lines.append(
+                            f"        paired on reconstructed only: true "
+                            f"{e['true_qed_mean_reconstructed_only']:.4f} -> decoded "
+                            f"{e['decoded_qed_mean']:.4f}  MAE={e['paired_qed_mae']:.4f} "
+                            f"bias={e['paired_qed_bias']:+.4f} "
+                            f"corr={'n/a' if corr is None else f'{corr:+.3f}'}")
                     if "preserved_fraction" in b:
-                        lines.append(f"    N={n} [{name}] true_gap={b['true_qed_gap']:+.4f} "
-                                     f"decoded_gap={b['decoded_qed_gap']:+.4f} "
-                                     f"preserved={b['preserved_fraction']:.3f}")
+                        pooled = b["pooled_paired_qed_correlation"]
+                        lines.append(
+                            f"      gap on the SAME surviving molecules: true "
+                            f"{b['true_qed_gap_reconstructed_only']:+.4f} -> decoded "
+                            f"{b['decoded_qed_gap']:+.4f}  preserved="
+                            f"{b['preserved_fraction']:.3f}")
+                        lines.append(
+                            f"      pooled paired MAE={b['pooled_paired_qed_mae']:.4f} "
+                            f"bias={b['pooled_paired_qed_bias']:+.4f} "
+                            f"corr={'n/a' if pooled is None else f'{pooled:+.3f}'}  "
+                            f"validity gap (high-low)="
+                            f"{b['validity_difference_high_minus_low']:+.3f}")
             lines.append("")
     lines += ["", "Reading guide", "-" * 78,
               "d_z large is NOT a failure on its own: a conditional translation of z that",

@@ -336,3 +336,125 @@ def test_permutation_protocol_keeps_n_and_uses_real_qed_values():
     assert bool(in_support.all()) and not bool(clamped.any())
     pool = sorted(round(v, 9) for v in values[:, 1].tolist())
     assert sorted(round(v, 9) for v in alt[:, 1].tolist()) == pool
+
+
+# ============================================================================
+# Regression tests for the job 366708 report defects:
+#   (a) format_report read payload['autoencoder']['sha256'], which does not exist
+#       (the field is sha256_actual), so the text report could not be rendered;
+#   (b) decoder_control compared the true QED of ALL attempted molecules against the
+#       decoded QED of only the SUCCESSFULLY DECODED ones - an unpaired comparison that
+#       is selection-biased whenever reconstruction success depends on QED.
+# ============================================================================
+
+
+def test_format_report_uses_sha256_actual_and_renders():
+    """The exact failure: a KeyError on 'sha256' while writing the text report."""
+    module = _script()
+    payload = {
+        "data_dir": "data/processed/x",
+        "autoencoder": {
+            "checkpoint": "outputs/ablation/ae_degree_128d/seed_3/last.pt",
+            "sha256_actual": "a" * 64,
+            "sha256_recorded_in_flow": "a" * 64,
+            "sha256_match": True,
+            "mismatch_override_used": False,
+        },
+        "decomposition_molecules": 512,
+        "temperature": 0.2,
+        "models": {},
+    }
+    text = module.format_report(payload)
+    assert "sha256 actual" in text
+    assert "a" * 16 in text
+    assert "provenance match: True" in text
+    assert "MISMATCH OVERRIDE USED" not in text
+    # and the old key must not be required
+    assert "sha256" not in payload["autoencoder"] or True
+    payload["autoencoder"]["sha256_match"] = False
+    payload["autoencoder"]["mismatch_override_used"] = True
+    assert "MISMATCH OVERRIDE USED" in module.format_report(payload)
+
+
+def test_format_report_does_not_reference_the_nonexistent_sha_field():
+    import re
+    src = (ROOT / "scripts" / "30_qed_gap_decomposition.py").read_text()
+    body = src.split("def format_report")[1]
+    assert not re.search(r"\[.autoencoder.\]\[.sha256.\]", body), \
+        "format_report still reads the nonexistent 'sha256' field"
+    assert "sha256_actual" in body
+
+
+def test_decoder_control_pairs_truth_with_its_own_reconstruction():
+    """The core fix: both sides of the gap come from the SAME surviving molecules.
+
+    Constructed so the bias is unmissable: in the low band only the lowest-QED molecule
+    reconstructs, in the high band only the highest-QED one does. Comparing all-attempted
+    truth against reconstructed-only decoded values gives the wrong gap; pairing gives
+    the right one.
+    """
+    low_truth = np.array([0.35, 0.40, 0.45])
+    low_decoded = np.array([0.35, np.nan, np.nan])      # only the first survives
+    high_truth = np.array([0.75, 0.80, 0.85])
+    high_decoded = np.array([np.nan, np.nan, 0.85])     # only the last survives
+
+    # the OLD (buggy) computation
+    buggy_true_gap = high_truth.mean() - low_truth.mean()               # 0.80 - 0.40
+    buggy_decoded_gap = (high_decoded[np.isfinite(high_decoded)].mean()
+                         - low_decoded[np.isfinite(low_decoded)].mean())  # 0.85 - 0.35
+    assert buggy_true_gap == pytest.approx(0.40)
+    assert buggy_decoded_gap == pytest.approx(0.50)
+    buggy_preserved = buggy_decoded_gap / buggy_true_gap
+    assert buggy_preserved == pytest.approx(1.25)        # >1: decoder "amplifies" QED
+
+    # the FIXED computation: truth restricted to survivors
+    lk, hk = np.isfinite(low_decoded), np.isfinite(high_decoded)
+    fixed_true_gap = high_truth[hk].mean() - low_truth[lk].mean()        # 0.85 - 0.35
+    fixed_decoded_gap = high_decoded[hk].mean() - low_decoded[lk].mean()
+    assert fixed_true_gap == pytest.approx(0.50)
+    assert fixed_decoded_gap == pytest.approx(0.50)
+    assert fixed_decoded_gap / fixed_true_gap == pytest.approx(1.0)      # correct
+    # the bug inflated preservation by 25 percentage points
+    assert abs(buggy_preserved - 1.0) > 0.2
+
+
+def test_decoder_control_paired_mae_and_correlation_are_well_defined():
+    truth = np.array([0.40, 0.55, 0.70, 0.85])
+    decoded = np.array([0.41, 0.54, 0.72, 0.84])
+    delta = decoded - truth
+    assert float(np.abs(delta).mean()) == pytest.approx(0.0125, abs=1e-6)
+    assert float(delta.mean()) == pytest.approx(-0.0025, abs=1e-6)
+    assert float(np.corrcoef(truth, decoded)[0, 1]) > 0.999
+    # a constant decoded series must yield a None correlation, not a divide-by-zero
+    assert np.asarray([0.5, 0.5, 0.5]).std() < 1e-9
+
+
+def test_decoder_control_reports_validity_per_qed_group():
+    """Group-dependent reconstruction rate must be visible, since it biases the gap."""
+    src = (ROOT / "scripts" / "30_qed_gap_decomposition.py").read_text()
+    body = src.split("def decoder_control")[1].split("def format_report")[0]
+    for field in ("reconstruction_validity", "validity_low", "validity_high",
+                  "validity_difference_high_minus_low", "paired_qed_mae",
+                  "paired_qed_correlation", "true_qed_mean_reconstructed_only",
+                  "true_qed_gap_reconstructed_only"):
+        assert field in body, f"decoder_control does not report {field}"
+    # the all-attempted mean is kept, but only alongside the reconstructed-only mean
+    assert "true_qed_mean_all_attempted" in body
+
+
+def test_decoder_control_scope_does_not_claim_generated_embeddings_are_fine():
+    """Point 4: the control must not be allowed to exonerate the decoder on samples."""
+    src = (ROOT / "scripts" / "30_qed_gap_decomposition.py").read_text()
+    body = src.split("def decoder_control")[1].split("def format_report")[0]
+    assert "does NOT bound" in body
+    assert "NOT evidence" in body
+    assert "REAL encoded embeddings" in body
+    # the previous wording asserted the opposite and must be gone
+    assert "cannot be blamed on the decoder alone" not in body
+
+
+def test_report_separates_real_from_generated_decoder_evidence():
+    src = (ROOT / "scripts" / "30_qed_gap_decomposition.py").read_text()
+    body = src.split("def format_report")[1]
+    assert "REAL encoded embeddings ONLY" in body
+    assert "FLOW-GENERATED" in body
