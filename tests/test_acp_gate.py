@@ -196,48 +196,152 @@ def test_prior_delta_is_the_models_own_prior_movement():
 
 
 # ------------------------------------------------------------------ bookkeeping ---
-def test_zero_shift_must_be_present_in_the_sweep():
-    module = _gate()
-    with pytest.raises(SystemExit) as excinfo:
-        module.main(["--flow-checkpoint", "x", "--output-dir", "/tmp/acp_unused",
-                     "--shift-deltas", "0.5,1.0"])
-    assert excinfo.value.code == 4
+def test_main_returns_an_exit_code_rather_than_raising():
+    """The repository's CLI contract, pinned.
+
+    Every script here is `def main(argv) -> int` wrapped by `sys.exit(main())` at module
+    scope (04_train_flow, 15_invertibility_audit, 30_qed_gap_decomposition, and this
+    gate). Invalid configuration must therefore RETURN 4, not raise SystemExit; the
+    earlier version of these two tests asserted the wrong contract.
+    """
+    source = (ROOT / "scripts" / "31_acp_falsification_gate.py").read_text()
+    assert "def main(argv=None) -> int" in source
+    assert "sys.exit(main())" in source
 
 
-def test_unknown_direction_is_rejected():
+def test_zero_shift_must_be_present_in_the_sweep(tmp_path):
     module = _gate()
-    with pytest.raises(SystemExit) as excinfo:
-        module.main(["--flow-checkpoint", "x", "--output-dir", "/tmp/acp_unused",
-                     "--directions", "magic"])
-    assert excinfo.value.code == 4
+    out = tmp_path / "unused"
+    code = module.main(["--flow-checkpoint", "x", "--output-dir", str(out),
+                        "--shift-deltas", "0.5,1.0"])
+    assert code == 4
+    # validation precedes any side effect, so no output directory is created
+    assert not out.exists()
+
+
+def test_unknown_direction_is_rejected(tmp_path):
+    module = _gate()
+    out = tmp_path / "unused"
+    code = module.main(["--flow-checkpoint", "x", "--output-dir", str(out),
+                        "--directions", "magic"])
+    assert code == 4
+    assert not out.exists()
+
+
+def test_empty_target_n_is_rejected(tmp_path):
+    module = _gate()
+    code = module.main(["--flow-checkpoint", "x",
+                        "--output-dir", str(tmp_path / "unused"), "--target-n", ""])
+    assert code == 4
+
+
+def test_a_valid_configuration_is_not_rejected_by_validation(tmp_path):
+    """Guard the other direction: the CLI contract must not reject good arguments.
+
+    A nonexistent checkpoint must fail LATER (code 2, missing input), not at validation,
+    which proves the validation stage itself accepted the configuration.
+    """
+    module = _gate()
+    code = module.main(["--flow-checkpoint", str(tmp_path / "absent.pt"),
+                        "--output-dir", str(tmp_path / "out"),
+                        "--shift-deltas", "-1.0,0.0,1.0",
+                        "--directions", "real_qed,random"])
+    assert code != 4, "a valid configuration was wrongly rejected by validation"
+    assert code in (2, 3), f"expected a missing-input/provenance failure, got {code}"
+
+
+def _record(qed, *, smiles, heavy=23.0, aromatic=2.0, rings=3.0, fallback=False):
+    """A REALISTIC decoded record.
+
+    `descriptors()` writes every DESCRIPTOR_KEYS entry together at a single site, so a
+    valid record carries all four or none. The earlier fixture omitted aromatic_rings and
+    rings, which cannot occur in real data, and that is what raised KeyError.
+    """
+    return {"valid": True, "fallback": fallback, "smiles": smiles, "qed": qed,
+            "aromatic_rings": aromatic, "rings": rings, "heavy_atoms": heavy}
+
+
+def _invalid():
+    return {"valid": False, "fallback": False, "smiles": None}
+
+
+def test_descriptor_keys_are_exactly_what_descriptors_writes():
+    """Pins the invariant the completeness filter relies on."""
+    module = _gate()
+    source = (ROOT / "scripts" / "31_acp_falsification_gate.py").read_text()
+    body = source.split("def descriptors")[1].split("def reference_condition")[0]
+    for key in module.DESCRIPTOR_KEYS:
+        assert f'"{key}"' in body, f"{key} is in DESCRIPTOR_KEYS but not written"
+    assert set(module.DESCRIPTOR_KEYS) == {"qed", "aromatic_rings", "rings",
+                                           "heavy_atoms"}
 
 
 def test_paired_summary_only_uses_jointly_valid_samples():
     module = _gate()
-    baseline = [{"valid": True, "qed": 0.40, "heavy_atoms": 23.0, "smiles": "C",
-                 "fallback": False},
-                {"valid": False, "fallback": False, "smiles": None},
-                {"valid": True, "qed": 0.50, "heavy_atoms": 23.0, "smiles": "CC",
-                 "fallback": False}]
-    shifted = [{"valid": True, "qed": 0.60, "heavy_atoms": 23.0, "smiles": "CCC",
-                "fallback": False},
-               {"valid": True, "qed": 0.90, "heavy_atoms": 23.0, "smiles": "CCCC",
-                "fallback": False},
-               {"valid": False, "fallback": False, "smiles": None}]
+    baseline = [_record(0.40, smiles="C"), _invalid(), _record(0.50, smiles="CC")]
+    shifted = [_record(0.60, smiles="CCC"), _record(0.90, smiles="CCCC"), _invalid()]
     block = module.summarise_cell(shifted, baseline=baseline)
-    # only index 0 is jointly valid -> dQED = 0.60 - 0.40
+    # only index 0 is jointly scored -> dQED = 0.60 - 0.40
     assert block["paired_jointly_valid"] == 1
     assert block["paired_qed_delta"]["mean"] == pytest.approx(0.20, abs=1e-9)
+    # index 1 is valid only on the shifted side and must NOT contribute
+    assert block["valid"] == 2
+    assert block["paired_qed_delta"]["n"] == 1
+
+
+def test_paired_size_delta_uses_the_same_jointly_scored_pairs():
+    module = _gate()
+    baseline = [_record(0.40, smiles="C", heavy=23.0), _invalid()]
+    shifted = [_record(0.60, smiles="CC", heavy=20.0), _record(0.9, smiles="CCC",
+                                                               heavy=10.0)]
+    block = module.summarise_cell(shifted, baseline=baseline)
+    assert block["paired_jointly_valid"] == 1
+    assert block["paired_heavy_atom_delta"]["mean"] == pytest.approx(-3.0, abs=1e-9)
+
+
+def test_valid_but_unscored_record_is_counted_not_crashed():
+    """A record can be valid with NO descriptors if RDKit cannot re-parse its SMILES.
+
+    That must be reported, not silently dropped and not a KeyError.
+    """
+    module = _gate()
+    rows = [_record(0.7, smiles="C"),
+            {"valid": True, "fallback": False, "smiles": "garbage"}]   # no descriptors
+    block = module.summarise_cell(rows)
+    assert block["attempts"] == 2
+    assert block["valid"] == 1                       # only the scored one counts
+    assert block["valid_but_unscored"] == 1          # the anomaly is surfaced
+    assert block["qed_mean"] == pytest.approx(0.7)
+
+
+def test_partially_scored_record_is_treated_as_unscored():
+    """Defensive: a record with some but not all descriptor keys must not be averaged."""
+    module = _gate()
+    rows = [{"valid": True, "fallback": False, "smiles": "C", "qed": 0.7,
+             "heavy_atoms": 23.0}]                   # missing aromatic_rings, rings
+    block = module.summarise_cell(rows)
+    assert block["valid"] == 0
+    assert block["valid_but_unscored"] == 1
+    assert block["qed_mean"] is None
 
 
 def test_summary_reports_size_so_a_size_driven_qed_change_is_visible():
     module = _gate()
-    rows = [{"valid": True, "qed": 0.7, "aromatic_rings": 2.0, "rings": 3.0,
-             "heavy_atoms": 20.0, "smiles": "C", "fallback": False}]
-    block = module.summarise_cell(rows)
+    block = module.summarise_cell([_record(0.7, smiles="C", heavy=20.0, aromatic=2.0)])
     assert block["heavy_atoms_mean"] == pytest.approx(20.0)
     assert block["aromatic_rings_mean"] == pytest.approx(2.0)
     assert block["uniqueness_over_valid"] == pytest.approx(1.0)
+    assert block["valid_but_unscored"] == 0
+
+
+def test_summary_handles_an_all_invalid_cell():
+    module = _gate()
+    block = module.summarise_cell([_invalid(), _invalid()])
+    assert block["valid"] == 0
+    assert block["validity"] == pytest.approx(0.0)
+    assert block["qed_mean"] is None
+    assert block["uniqueness_over_valid"] is None
+    assert block["valid_but_unscored"] == 0
 
 
 # ------------------------------------------------------------------- the verdict ---

@@ -105,6 +105,8 @@ from zinc_gnf.trainer_flow import file_sha256, load_flow  # noqa: E402
 from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 
 DIRECTIONS = ("real_qed", "prior_delta", "random")
+# Written together by `descriptors()`; a decoded record has all of them or none.
+DESCRIPTOR_KEYS = ("qed", "aromatic_rings", "rings", "heavy_atoms")
 RANDOM_DIRECTION_SEED = 20261109
 GENERATION_SEED = 20261110
 BOOTSTRAP = 2000
@@ -283,32 +285,50 @@ def decode_and_measure(autoencoder, embeddings, counts, decoders):
     return out
 
 
+def scored(record) -> bool:
+    """Is this record usable for the chemical statistics?
+
+    `descriptors()` writes every key in DESCRIPTOR_KEYS together, at the single site in
+    `decode_and_measure`, and only when RDKit can re-parse the assembled SMILES. So a
+    record is either valid with ALL descriptor keys, or valid with NONE of them (the
+    latter happens if `graph_to_mol` sanitised a graph whose SMILES round-trip then
+    fails). Requiring the full set makes that invariant explicit instead of relying on
+    `"qed" in r` as a proxy, and the count of valid-but-unscored records is REPORTED so a
+    genuine inconsistency surfaces rather than being silently filtered away.
+    """
+    return bool(record.get("valid")) and all(k in record for k in DESCRIPTOR_KEYS)
+
+
 def summarise_cell(rows, *, baseline=None) -> dict[str, Any]:
     """Validity, QED, aromaticity, size, uniqueness; paired deltas against a baseline."""
     total = len(rows)
-    valid = [r for r in rows if r.get("valid") and "qed" in r]
+    valid = [r for r in rows if scored(r)]
+    unscored = sum(1 for r in rows if r.get("valid") and not scored(r))
     block: dict[str, Any] = {
         "attempts": total,
         "valid": len(valid),
         "validity": len(valid) / max(1, total),
-        "fallback_rate": sum(r["fallback"] for r in rows) / max(1, total),
+        # > 0 means a record passed the assembler's validity check but RDKit could not
+        # re-parse its SMILES. Expected to be 0; investigate if it is not.
+        "valid_but_unscored": int(unscored),
+        "fallback_rate": sum(bool(r.get("fallback", False)) for r in rows) / max(1, total),
         "unique_smiles": len({r["smiles"] for r in valid}) if valid else 0,
         "uniqueness_over_valid": (len({r["smiles"] for r in valid}) / len(valid)
                                   if valid else None),
     }
-    for key in ("qed", "aromatic_rings", "rings", "heavy_atoms"):
+    for key in DESCRIPTOR_KEYS:
         series = [r[key] for r in valid]
         block[f"{key}_mean"] = float(np.mean(series)) if series else None
     if baseline is not None:
         # PAIRED by sample index: the same eps / same molecule at shift 0 vs shift delta.
-        pairs = [(b, r) for b, r in zip(baseline, rows)
-                 if b.get("valid") and "qed" in b and r.get("valid") and "qed" in r]
+        # Both sides must be scored, so every paired statistic uses the SAME molecules.
+        pairs = [(b, r) for b, r in zip(baseline, rows) if scored(b) and scored(r)]
         deltas = [r["qed"] - b["qed"] for b, r in pairs]
         size_deltas = [r["heavy_atoms"] - b["heavy_atoms"] for b, r in pairs]
         block["paired_jointly_valid"] = len(pairs)
         block["paired_qed_delta"] = bootstrap_ci(deltas)
         block["paired_heavy_atom_delta"] = bootstrap_ci(size_deltas)
-        block["paired_note"] = ("paired on jointly-valid samples at identical sample "
+        block["paired_note"] = ("paired on jointly-scored samples at identical sample "
                                 "index, so the shift is the only difference")
     return block
 
@@ -376,13 +396,15 @@ def real_arm(flow, autoencoder, val_set, *, n, qed_ref, qed_low, halfwidth, scal
         sanity = {}
         for d in decoders:
             rows = zero_shift_reference[d]
-            valid = [r for r in rows if r.get("valid") and "qed" in r]
+            valid = [r for r in rows if scored(r)]
             sanity[d] = {
                 "validity": len(valid) / max(1, len(rows)),
+                "valid_but_unscored": int(sum(1 for r in rows
+                                              if r.get("valid") and not scored(r))),
                 "qed_mean": float(np.mean([r["qed"] for r in valid])) if valid else None,
                 "qed_mae_vs_true": (
                     float(np.mean([abs(r["qed"] - t) for r, t in zip(rows, truths)
-                                   if r.get("valid") and "qed" in r])) if valid else None),
+                                   if scored(r)])) if valid else None),
                 "note": ("delta=0 is x -> f -> f^-1 -> decode. A large MAE here means the "
                          "pipeline itself is lossy and every shifted number inherits it."),
             }
@@ -495,8 +517,10 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
-        out_dir = Path(args.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # Validate BEFORE creating anything, so an invalid configuration leaves no
+        # output directory behind. Failure is signalled by the return code (4), which is
+        # this repository's CLI contract: every script is `def main(...) -> int` wrapped
+        # by `sys.exit(main())`. Do not change that to a raise.
         targets = [int(v) for v in args.target_n.split(",") if v.strip()]
         deltas = [float(v) for v in args.shift_deltas.split(",") if v.strip()]
         decoders = [d.strip() for d in args.decoders.split(",") if d.strip()]
@@ -508,6 +532,8 @@ def main(argv=None) -> int:
         unknown = [d for d in wanted if d not in DIRECTIONS]
         if unknown:
             raise ValueError(f"unknown directions {unknown}; known {list(DIRECTIONS)}")
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
     except (OSError, ValueError) as error:
         print(f"FATAL: {error}", file=sys.stderr, flush=True)
         return 4
