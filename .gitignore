@@ -32,6 +32,10 @@ data/processed/
 *.ckpt
 
 # Generated outputs
+# Relabeling pools hold raw generated embedding TENSORS and their manifests. They are
+# model output, are large, and must never be committed -- the whole directory is excluded
+# (not just *.pt) so the manifest cannot be added by accident either.
+outputs/relabel_pool/
 outputs/checkpoints/*
 outputs/embeddings/*
 outputs/metrics/*
