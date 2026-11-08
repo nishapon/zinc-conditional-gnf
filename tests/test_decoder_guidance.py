@@ -271,7 +271,10 @@ def test_pooling_uses_no_square_root_in_a_gradient_path():
     The only norms left in the module are on DETACHED tensors (step normalisation and
     reporting), so no square root sits on the backward path.
     """
-    assert [call for call in _calls_in(MODULE_PATH) if "sqrt" in call] == []
+    # the only square root in the module is `math.sqrt` on a PLAIN PYTHON FLOAT, used to
+    # size the float32 projection margin. No tensor square root exists anywhere.
+    square_roots = [call for call in _calls_in(MODULE_PATH) if "sqrt" in call]
+    assert square_roots == ["math.sqrt"] * len(square_roots)
     graph_functions = {"decoder_statistics", "feature_vector", "features_with_grad",
                        "manifold_loss", "guidance_loss", "_masked_mean"}
     tree = ast.parse(MODULE_PATH.read_text())
@@ -339,29 +342,72 @@ def test_the_returned_embeddings_carry_no_graph(autoencoder):
 # 4. Trust region, masking, size preservation, non-finite accounting.
 # ====================================================================================
 def test_displacement_never_exceeds_the_trust_radius(autoencoder):
+    """The ENFORCED displacement is bounded outright, with no tolerance at all.
+
+    The projection targets `trust_radius * (1 - 32*sqrt(numel)*eps)`, a shrink that
+    dominates float32 round-off, so the bound is an inequality rather than an
+    approximate one. The externally remeasured value is allowed only the
+    `eps * ||x_0||` precision limit of recovering a small difference of large vectors,
+    which the module reports itself.
+    """
     node, pair = masks([9, 6])
     radius = 0.4
     guided, report = guide(autoencoder, embeddings_for(node, seed=13), node, pair,
                            readout=fitted_readout(autoencoder), targets=None,
                            qed_target=5.0, lambda_qed=1.0, lambda_manifold=0.0,
                            steps=40, step_size=0.9, trust_radius=radius)
-    start = embeddings_for(node, seed=13)
-    per_molecule = (guided - start).flatten(1).norm(dim=1)
-    assert float(per_molecule.max()) <= radius * (1.0 + 1e-5)
-    assert report["displacement_max"] <= radius * (1.0 + 1e-5)
+    assert report["displacement_max"] <= radius
+    floor = report["displacement_measurement_floor"]
+    assert 0.0 < floor < 0.01 * radius          # the limit is real but negligible here
+    per_molecule = (guided - embeddings_for(node, seed=13)).flatten(1).norm(dim=1)
+    assert float(per_molecule.max()) <= radius + floor
+    assert report["displacement_max_remeasured"] <= radius + floor
     # an absurd target with a long schedule should actually reach the boundary,
-    # otherwise the test above would pass trivially
+    # otherwise the bound above would hold trivially
     assert report["trust_region_saturated_fraction"] > 0.0
+    assert report["steps_applied"] == 40
 
 
 def test_a_tiny_trust_radius_confines_guidance_to_a_tiny_ball(autoencoder):
+    """The case that exposed the old bug: a 1e-3 radius around a start of norm ~12.
+
+    Enforcing the region on `(x_k - x_0)` meant measuring a 1e-3 displacement by
+    cancelling two vectors of norm ~12, which in float32 cannot resolve it better than
+    about 0.1%; the clip therefore overshot. Carrying the displacement as the state makes
+    the enforced bound exact, and the remeasured value is still only accurate to the
+    reported floor -- which is why the two are asserted at different tolerances.
+    """
     node, pair = masks([9])
     guided, report = guide(autoencoder, embeddings_for(node, seed=13), node, pair,
                            readout=fitted_readout(autoencoder), targets=None,
                            qed_target=5.0, lambda_qed=1.0, lambda_manifold=0.0,
                            steps=30, step_size=0.5, trust_radius=1e-3)
-    assert report["displacement_max"] <= 1e-3 * (1.0 + 1e-5)
+    assert report["displacement_max"] <= 1e-3
+    assert report["displacement_max_remeasured"] <= (
+        1e-3 + report["displacement_measurement_floor"])
+    # the bound is not met by refusing to move
+    assert report["steps_applied"] == 30 and report["displacement_max"] > 0.0
     assert torch.isfinite(guided).all()
+
+
+def test_the_trust_region_shrink_is_numerically_motivated_and_scientifically_nil():
+    """The projection margin must be round-off scale, not a hidden reduction in radius."""
+    epsilon = float(torch.finfo(torch.float32).eps)
+    for elements in (9 * DIM, 30 * 128):
+        shrink = 32.0 * (elements ** 0.5) * epsilon
+        assert shrink < 1e-3, (elements, shrink)     # below any measurable effect
+        assert shrink > 16.0 * epsilon, (elements, shrink)   # above float32 round-off
+
+
+def test_the_enforced_radius_is_reported_next_to_the_requested_one(autoencoder):
+    node, pair = masks([9])
+    _, report = guide(autoencoder, embeddings_for(node, seed=13), node, pair,
+                      readout=fitted_readout(autoencoder), targets=None,
+                      qed_target=5.0, lambda_qed=1.0, lambda_manifold=0.0, steps=2,
+                      step_size=0.5, trust_radius=0.5)
+    assert report["trust_radius"] == 0.5
+    assert report["trust_radius_effective"] < report["trust_radius"]
+    assert report["trust_radius_effective"] > 0.9999 * report["trust_radius"]
 
 
 def test_padding_stays_exactly_zero_and_the_size_is_preserved(autoencoder):
@@ -395,16 +441,49 @@ def test_zero_steps_reproduces_the_native_sample_exactly(autoencoder):
                            step_size=0.3, trust_radius=1.0)
     assert torch.equal(guided, x)
     assert report["displacement_max"] == 0.0 and report["nonfinite_steps"] == 0
+    assert report["steps_applied"] == 0 and report["constant_objective_steps"] == 0
 
 
 def test_both_lambdas_zero_is_a_no_op_rather_than_a_crash(autoencoder):
-    """The degenerate objective has no gradient; it must not raise."""
+    """The degenerate objective is CONSTANT, so there is no gradient to take.
+
+    `allow_unused=True` does not cover this: the error is that the OUTPUT has no
+    `grad_fn`, not that an input went unused. It has to be detected before
+    `torch.autograd.grad` is called, counted, and reported.
+    """
     node, pair = masks([9])
     x = embeddings_for(node, seed=19)
     guided, report = guide(autoencoder, x, node, pair, readout=None, targets=None,
                            qed_target=0.6, lambda_qed=0.0, lambda_manifold=0.0, steps=3,
                            step_size=0.3, trust_radius=1.0)
-    assert torch.equal(guided, x) and report["displacement_max"] == 0.0
+    assert torch.equal(guided, x)                        # EXACTLY the native sample
+    assert report["displacement_max"] == 0.0
+    assert report["displacement_max_remeasured"] == 0.0
+    assert report["constant_objective_steps"] == 3        # counted, not silently zeroed
+    assert report["nonfinite_steps"] == 0                 # it is not a numerical failure
+    assert report["steps_applied"] == 0
+
+
+def test_a_constant_objective_is_counted_rather_than_crashing_or_hiding(autoencoder,
+                                                                       monkeypatch):
+    """The same path guards a caller that wrapped `guide` in `no_grad` by mistake.
+
+    Without the check that is a silent wrong answer: the report would read as "guidance
+    had no effect" when in fact no gradient was ever available.
+    """
+    def detached_loss(readout, features, statistics, targets, **kwargs):
+        return torch.zeros(features.shape[0], dtype=features.dtype), {}
+
+    monkeypatch.setattr(dg, "guidance_loss", detached_loss)
+    node, pair = masks([9])
+    x = embeddings_for(node, seed=19)
+    guided, report = guide(autoencoder, x, node, pair,
+                           readout=fitted_readout(autoencoder), targets=None,
+                           qed_target=0.6, lambda_qed=1.0, lambda_manifold=0.0, steps=4,
+                           step_size=0.3, trust_radius=1.0)
+    assert report["constant_objective_steps"] == 4
+    assert report["steps_applied"] == 0 and torch.equal(guided, x)
+    assert "constant_objective_steps" in report["fallback_behaviour"]
 
 
 def test_negative_steps_is_rejected(autoencoder):
@@ -516,8 +595,11 @@ def test_one_molecule_cannot_set_the_step_for_the_batch(autoencoder):
                            qed_target=0.9, lambda_qed=1.0, lambda_manifold=0.0, steps=3,
                            step_size=0.2, trust_radius=0.5)
     per_molecule = (guided - x * node.unsqueeze(-1)).flatten(1).norm(dim=1)
-    assert float(per_molecule.min()) > 0.0
-    assert float(per_molecule.max()) <= 0.5 * (1.0 + 1e-5)
+    assert float(per_molecule.min()) > 0.0           # BOTH molecules actually moved
+    # the bound is checked on the enforced quantity: remeasuring molecule 2 against a
+    # start of norm ~600 is only accurate to eps * 600, which is the reported floor
+    assert report["displacement_max"] <= 0.5
+    assert float(per_molecule.max()) <= 0.5 + report["displacement_measurement_floor"]
 
 
 def test_the_report_states_the_fallback_behaviour_explicitly(autoencoder):
@@ -525,10 +607,16 @@ def test_the_report_states_the_fallback_behaviour_explicitly(autoencoder):
     _, report = guide(autoencoder, embeddings_for(node), node, pair, readout=None,
                       targets=None, qed_target=0.6, lambda_qed=0.0,
                       lambda_manifold=0.0, steps=2, step_size=0.1, trust_radius=1.0)
-    for key in ("nonfinite_steps", "nonfinite_rate", "fallback_behaviour",
-                "trust_radius", "step_size", "direction", "displacement_mean",
-                "displacement_max", "trust_region_saturated_fraction"):
+    for key in ("steps_requested", "steps_applied", "nonfinite_steps", "nonfinite_rate",
+                "constant_objective_steps", "fallback_behaviour", "trust_radius",
+                "trust_radius_effective", "step_size", "direction",
+                "displacement_mean", "displacement_max", "displacement_max_remeasured",
+                "displacement_measurement_floor", "trust_region_saturated_fraction",
+                "lambda_qed", "lambda_manifold", "history"):
         assert key in report
+    # the three ways a step can fail to apply are each named in the prose
+    for phrase in ("nonfinite_steps", "constant_objective_steps", "steps_applied"):
+        assert phrase in report["fallback_behaviour"]
 
 
 # ====================================================================================

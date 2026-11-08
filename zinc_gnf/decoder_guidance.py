@@ -107,6 +107,7 @@ so exploitation appears as the two diverging.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 import numpy as np
@@ -415,27 +416,52 @@ def guide(autoencoder, embeddings: torch.Tensor, node_mask: torch.Tensor,
     the outcome.
 
     Safeguards: the decoder and the readout are frozen; `f^-1` is never involved; the
-    gradient is clipped per molecule; the displacement from `x_0` is projected onto a
+    gradient is normalised per molecule; the displacement from `x_0` is projected onto a
     ball of radius `trust_radius`; padding is re-zeroed every step; a non-finite step
-    REVERTS to the last finite state and is counted.
+    REVERTS to the last finite state and is counted; a CONSTANT objective is counted
+    separately and never silently treated as a zero gradient.
+
+    THE STATE IS THE DISPLACEMENT, NOT THE POINT
+    --------------------------------------------
+    `delta = x_k - x_0` is carried explicitly instead of being re-derived as
+    `(x_k - x_0)` from the point. The reason is that the trust region has to be ENFORCED
+    on a quantity it can MEASURE. In float32 (eps = 1.19e-7), recovering a displacement
+    of 1e-3 by subtracting two vectors of norm ~10 carries an absolute error of order
+    eps * ||x_0||, i.e. percent-level relative error on the displacement itself, so the
+    projection would be clipping to a radius it could not resolve. Measuring ||delta||
+    directly is accurate to a few ulps OF DELTA, independent of ||x_0||.
+
+    The projection therefore targets `trust_radius * (1 - 32 * sqrt(numel) * eps)`. That
+    deliberate shrink -- 0.005% at N=9/D=16, 0.02% at N=30/D=128, scientifically nil --
+    provably dominates the float32 round-off of the two norm reductions, the division and
+    the rescale, which makes `displacement_max <= trust_radius` hold OUTRIGHT rather than
+    up to a fudge factor. `displacement_max_remeasured` reports the same quantity
+    recovered from the returned tensors, and `displacement_measurement_floor` reports the
+    eps * ||x_0|| precision limit of doing so, so the gap is visible instead of hidden.
     """
     if steps < 0:
         raise ValueError("steps must be >= 0")
-    start = (embeddings * node_mask.unsqueeze(-1).to(embeddings.dtype)).detach()
-    current = start.clone()
+    node_weights = node_mask.unsqueeze(-1).to(embeddings.dtype)
+    start = (embeddings * node_weights).detach()
     batch = start.shape[0]
-    node_weights = node_mask.unsqueeze(-1).to(start.dtype)
+    epsilon = float(torch.finfo(start.dtype).eps)
+    elements = max(1, int(start[0].numel()))
+    # shrink the projection target by the realistic float32 norm error, ~sqrt(n) * eps
+    effective_radius = float(trust_radius) * (1.0 - 32.0 * math.sqrt(elements) * epsilon)
+    delta = torch.zeros_like(start)
     nonfinite_steps = 0
+    constant_objective_steps = 0
+    applied_steps = 0
     history: list[dict[str, float]] = []
 
     for _ in range(int(steps)):
         if direction == "random":
             if generator is None:
                 raise ValueError("direction='random' needs a generator")
-            update = torch.randn(current.shape, device=current.device,
-                                 dtype=current.dtype, generator=generator)
+            update = torch.randn(start.shape, device=start.device,
+                                 dtype=start.dtype, generator=generator)
         else:
-            probe = current.clone().requires_grad_(True)
+            probe = (start + delta).detach().requires_grad_(True)
             features, statistics = features_with_grad(
                 autoencoder, probe, node_mask, pair_mask, feature_set=feature_set)
             loss, diagnostics = guidance_loss(
@@ -445,11 +471,20 @@ def guide(autoencoder, embeddings: torch.Tensor, node_mask: torch.Tensor,
             if not torch.isfinite(objective):
                 nonfinite_steps += 1
                 continue
+            # A CONSTANT objective has no gradient to take. This is reachable in two
+            # legitimate ways: lambda_qed = lambda_manifold = 0 (the explicit no-op), and
+            # a caller that wrapped `guide` in `torch.no_grad()`, which would otherwise
+            # silently return the native sample and look like "guidance had no effect".
+            # Counting it keeps that mistake visible in the report instead of mute.
+            if not objective.requires_grad:
+                constant_objective_steps += 1
+                continue
             (gradient,) = torch.autograd.grad(objective, probe, retain_graph=False,
                                               allow_unused=True)
-            # allow_unused covers the degenerate lambda_qed = lambda_manifold = 0 call,
-            # where the objective is constant and there is nothing to descend.
-            update = -(torch.zeros_like(probe) if gradient is None else gradient)
+            if gradient is None:          # objective ignores the embeddings entirely
+                constant_objective_steps += 1
+                continue
+            update = -gradient                     # DESCEND the target-matching loss
             history.append({
                 "loss": float(loss.detach().mean()),
                 "surrogate_qed": float(diagnostics["surrogate_qed"].detach().mean())
@@ -464,37 +499,49 @@ def guide(autoencoder, embeddings: torch.Tensor, node_mask: torch.Tensor,
             continue
         # per-molecule normalisation, so one molecule cannot set the step for the batch
         norms = update.flatten(1).norm(dim=1).clamp(min=1e-12).view(batch, 1, 1)
-        scaled = update / norms * float(step_size) * float(trust_radius)
-        proposal = current + scaled
-        # trust region around the UNGUIDED sample
-        displacement = (proposal - start) * node_weights
-        magnitude = displacement.flatten(1).norm(dim=1).view(batch, 1, 1)
-        factor = torch.clamp(float(trust_radius) / magnitude.clamp(min=1e-12), max=1.0)
-        proposal = start + displacement * factor
-        proposal = proposal * node_weights
+        step = update / norms * float(step_size) * float(trust_radius)
+        # trust region around the UNGUIDED sample, enforced on the displacement itself
+        proposal = (delta + step) * node_weights
+        magnitude = proposal.flatten(1).norm(dim=1).view(batch, 1, 1)
+        factor = torch.clamp(effective_radius / magnitude.clamp(min=1e-12), max=1.0)
+        proposal = proposal * factor
         if not torch.isfinite(proposal).all():
             nonfinite_steps += 1
             continue
-        current = proposal.detach()
+        delta = proposal.detach()
+        applied_steps += 1
 
-    displacement = ((current - start) * node_weights).flatten(1).norm(dim=1)
+    # Zero guidance is an EXACT no-op: if no step was ever applied, the native sample is
+    # returned untouched rather than reconstructed as `start + 0`.
+    current = start.clone() if applied_steps == 0 else ((start + delta) * node_weights)
+    displacement = delta.flatten(1).norm(dim=1)                   # the ENFORCED quantity
+    remeasured = ((current - start) * node_weights).flatten(1).norm(dim=1)
     report = {
         "steps_requested": int(steps),
+        "steps_applied": int(applied_steps),
         "nonfinite_steps": int(nonfinite_steps),
         "nonfinite_rate": nonfinite_steps / max(1, int(steps)),
+        "constant_objective_steps": int(constant_objective_steps),
         "trust_radius": float(trust_radius),
+        "trust_radius_effective": effective_radius,
         "step_size": float(step_size),
         "direction": direction,
         "lambda_qed": float(lambda_qed),
         "lambda_manifold": float(lambda_manifold),
         "displacement_mean": float(displacement.mean()),
         "displacement_max": float(displacement.max()),
+        "displacement_max_remeasured": float(remeasured.max()),
+        "displacement_measurement_floor": float(
+            epsilon * start.flatten(1).norm(dim=1).max()),
         "trust_region_saturated_fraction": float(
             (displacement >= 0.999 * float(trust_radius)).to(torch.float64).mean()),
         "history": history,
-        "fallback_behaviour": ("a non-finite loss, gradient or proposal reverts to the "
-                              "last finite state and is counted in nonfinite_steps; the "
-                              "guidance is never silently continued on a bad state"),
+        "fallback_behaviour": (
+            "a non-finite loss, gradient or proposal reverts to the last finite state "
+            "and is counted in nonfinite_steps; a constant objective (no gradient to "
+            "take) reverts and is counted in constant_objective_steps; the guidance is "
+            "never silently continued on a bad state, and steps_applied says how many "
+            "steps actually moved the sample"),
     }
     return current, report
 
