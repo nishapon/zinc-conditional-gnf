@@ -1,0 +1,382 @@
+{
+  "_readme": [
+    "Content for the results deck. Edit this file, then run:",
+    "  python scripts/38_build_slides.py --content docs/slides_content.json --output docs/final_results_slides.pptx",
+    "A table cell set to null renders as an em dash and the slide grows a labelled",
+    "'Pending' line naming the artefact it comes from. Do not replace a null with a",
+    "guess: the gap is visible on purpose."
+  ],
+  "slides": [
+    {
+      "title": "Conditional Graph Normalizing Flows for N+QED-Controlled Molecular Generation",
+      "kicker": "ZINC250K \u00b7 joint (heavy-atom count, QED) conditioning",
+      "bullets": [
+        {"text": "Nisha Ponnambalam", "plain": true, "bold": true},
+        {"text": "Supervisor: Prof. Simran Kaur", "plain": true},
+        {"text": "", "plain": true},
+        {"text": "All experiments complete. This deck is for discussion of results.", "plain": true, "bold": true, "tone": "accent"},
+        {"text": "Cells shown as \u2014 are numbers still on the cluster, listed on the 'Data still needed' slide.", "plain": true}
+      ]
+    },
+    {
+      "title": "Summary",
+      "bullets": [
+        {"text": "WORKS: the autoencoder reconstructs real molecules well.", "bold": true, "tone": "good"},
+        {"text": "WORKS: the conditional flow learns a strongly condition-dependent density \u2014 +3.70 nats/node between QED 0.4 and 0.8, about 14x the baseline.", "bold": true, "tone": "good"},
+        {"text": "DOES NOT WORK: that signal does not survive decoding into controlled QED. Requesting QED 0.4 vs 0.8 at fixed molecule size changes the decoded molecules very little.", "bold": true, "tone": "warn"},
+        {"text": "Four interventions tried, each with a pass/fail criterion fixed in code BEFORE the data existed. All four failed their criterion.", "level": 1},
+        {"text": "Three of the four were rejected by a cheap read-only gate before any training was spent.", "level": 1},
+        {"text": "CONTRIBUTION: a decomposition of where conditional control is lost in a flow-plus-autoencoder pipeline, with each candidate repair falsified at the cheapest level that could refute it.", "bold": true, "tone": "accent"}
+      ]
+    },
+    {
+      "title": "Pipeline, and where the signal is lost",
+      "bullets": [
+        {"text": "SMILES \u2192 encoder \u2192 node embeddings \u2192 flow f(x,c) \u2192 latent z", "plain": true, "bold": true},
+        {"text": "Generation: sample z | c \u2192 flow inverse \u2192 embeddings \u2192 decoder \u2192 argmax \u2192 valence-constrained assembly \u2192 molecule", "plain": true, "bold": true},
+        {"text": "", "plain": true},
+        {"text": "Conditioning enters through FiLM blocks inside the flow and through the latent prior."},
+        {"text": "The decoder is FROZEN and was trained only for reconstruction, never for control.", "tone": "warn"},
+        {"text": "The final discrete step (argmax, then valence/degree-constrained assembly) is not differentiable and was never trained jointly with the flow.", "tone": "warn"},
+        {"text": "Our evidence points at this last step as where the conditional signal is discarded.", "bold": true, "tone": "accent"}
+      ]
+    },
+    {
+      "title": "Baselines: what to compare us against",
+      "kicker": "Prof. Kaur's question \u2014 this is the calibration slide",
+      "table": {
+        "headers": ["Model (ZINC250K)", "Validity", "Reports QED control?", "Note"],
+        "rows": [
+          ["Real ZINC250K data", "100%", "\u2014", "mean QED \u2248 0.73"],
+          ["GraphNVP", "42.6%", "no", ""],
+          ["MoFlow", "50.3%", "no", "correction on by default"],
+          ["GraphAF", "68.0%", "no", ""],
+          ["GraphDF", "89.0%", "no", "best of the four"],
+          ["Teammates (QM9)", null, "no", "different dataset"],
+          ["Ours, corrected decoding", null, "yes \u2014 and it is weak", "the comparable column"]
+        ],
+        "highlight": [[4, 1], [6, 2]]
+      },
+      "source": "GraphDF paper, Table 1 (ZINC250K rows)",
+      "note": "Published validity is not measured identically across papers and most use a correction step, so our corrected column is the one to compare.",
+      "pending_from": "teammates' final slide; relabel_evaluation.json"
+    },
+    {
+      "title": "None of those papers reports conditional QED control",
+      "kicker": "The closest published numbers are for property control, not validity",
+      "table": {
+        "headers": ["Work", "Control metric", "Value"],
+        "rows": [
+          ["DriftingMol", "Spearman rho, requested vs achieved", "0.493 \u2013 0.515"],
+          ["DriftingMol", "slope / MAE", "0.796 / 0.200"],
+          ["DriftingMol", "rho with gradient blocked (ablation)", "0.011"],
+          ["Reward Transport", "rho group-level", "1.000"],
+          ["Reward Transport", "rho per-molecule", "0.22"],
+          ["Ours", "paired dQED at fixed N (0.4 \u2192 0.8)", null]
+        ],
+        "highlight": [[0, 2], [4, 2]]
+      },
+      "note": "Even papers that target property control report per-molecule correlations near 0.5, and one reports per-molecule rho 0.22 against a perfect group-level score. Per-molecule control is weak across the literature. That is the honest frame for our result.",
+      "pending_from": "definitive_table.md"
+    },
+    {
+      "title": "Result 1 \u2014 Autoencoder reconstruction works",
+      "table": {
+        "headers": ["Metric (real molecules)", "Ours", "Reference"],
+        "rows": [
+          ["Reconstruction accuracy", null, "\u2014"],
+          ["Atom-type accuracy", null, "\u2014"],
+          ["Bond accuracy", null, "\u2014"],
+          ["Valence / aromaticity audit", null, "\u2014"]
+        ]
+      },
+      "bullets": [
+        {"text": "Reading: the representation can carry the chemistry. The bottleneck found later is NOT the autoencoder's capacity on real molecules.", "bold": true, "tone": "good"},
+        {"text": "Caveat to state out loud: good reconstruction of REAL embeddings does not imply good decoding of GENERATED embeddings. That gap is Result 3.", "tone": "warn"}
+      ],
+      "source": "scripts/03 reconstruction_analysis.json; scripts/29 ae_chemistry_audit.json",
+      "pending_from": "reconstruction_analysis.json, ae_chemistry_audit.json"
+    },
+    {
+      "title": "Result 2 \u2014 The flow does learn a conditional density",
+      "kicker": "Conditional log-likelihood gap, QED 0.4 vs 0.8, nats per node",
+      "table": {
+        "headers": ["Checkpoint", "D latent (z)", "D prior", "D log-det", "Total"],
+        "rows": [
+          ["Baseline", "+0.2785", "+0.0067", "-0.0182", "+0.2670"],
+          ["Early (step 4,000)", "+0.6398", "+0.0746", "+0.2022", "+0.9165"],
+          ["Final (step 50,000)", "+2.8366", "-0.0233", "+0.8836", "+3.6969"]
+        ],
+        "highlight": [[2, 4]]
+      },
+      "bullets": [
+        {"text": "Conditioning is emphatically NOT being ignored: the separation grows about 14x from baseline to final.", "bold": true, "tone": "good"},
+        {"text": "Whatever is wrong, it is not that the flow failed to learn the condition.", "bold": true}
+      ],
+      "source": "qed_gap_decomposition.json, job 366922 \u2014 telescoping identity verified to 8.9e-15"
+    },
+    {
+      "title": "Result 3 \u2014 ...but decoded QED barely responds",
+      "kicker": "Final checkpoint geometry: the central puzzle of the thesis",
+      "table": {
+        "headers": ["N", "Alignment with real-QED direction", "Delivered / required displacement", "Prior-route QED projection"],
+        "rows": [
+          ["15", "-0.009", "0.705", "+0.0202"],
+          ["23", "+0.568", "1.526", "-0.0089"],
+          ["30", "+0.895", "1.492", "+0.0360"]
+        ],
+        "highlight": [[2, 1], [2, 2]]
+      },
+      "bullets": [
+        {"text": "At N=30 the model moves in almost exactly the right direction (+0.895) with more than enough magnitude (1.49x) \u2014 and decoded QED still hardly changes.", "bold": true, "tone": "warn"},
+        {"text": "Our interpretation, suggested not proven: the discrete assembly step collapses a large volume of embedding space onto the same molecule, so a correct latent displacement can produce no change in the output graph.", "tone": "accent"}
+      ],
+      "source": "job 366922"
+    },
+    {
+      "title": "Result 4 \u2014 Decoder dependence: corrected vs raw validity",
+      "kicker": "Corrected leads, because that is what the teammates and the published papers report",
+      "table": {
+        "headers": ["N", "Corrected (degree)", "Corrected (constrained)", "Raw", "Gap"],
+        "rows": [
+          ["15", null, null, null, null],
+          ["23", null, null, null, null],
+          ["30", null, null, null, null]
+        ]
+      },
+      "bullets": [
+        {"text": "Raw validity is kept beside corrected because the raw-corrected gap IS one of our findings \u2014 'strong reliance on corrected decoding, especially at larger N'. Removing the column removes the finding.", "tone": "accent"},
+        {"text": "Discussion question: keep raw here, or move it to the appendix?", "bold": true}
+      ],
+      "source": "qed_support_rerank.json (scripts/33), per-decoder validity by N",
+      "pending_from": "qed_support_rerank.json"
+    },
+    {
+      "title": "Result 4b \u2014 The same embedding decodes to different QED",
+      "table": {
+        "headers": ["Decoder pair", "median |dQED|", "fraction > 0.10", "same molecule"],
+        "rows": [
+          ["constrained vs degree", null, null, null],
+          ["raw vs degree", null, null, null],
+          ["raw vs constrained", null, null, null]
+        ]
+      },
+      "bullets": [
+        {"text": "Measured per generated embedding, not between population means: each saved record holds all three decodings of the SAME embedding.", "level": 1},
+        {"text": "If the same embedding gets materially different QED from different assemblers, then 'the QED of a generated embedding' is a property of the postprocessing, not of the model.", "bold": true, "tone": "warn"}
+      ],
+      "source": "qed_support_rerank.json (scripts/33)",
+      "pending_from": "qed_support_rerank.json"
+    },
+    {
+      "title": "Result 5 \u2014 High-QED molecules are present, so support is not the problem",
+      "table": {
+        "headers": ["Source", "median QED", "IQR", "fraction >= 0.75"],
+        "rows": [
+          ["Real ZINC250K (matched N)", null, null, null],
+          ["Generated, final ckpt, N=15", null, null, null],
+          ["Generated, final ckpt, N=23", null, null, null],
+          ["Generated, final ckpt, N=30", null, null, null]
+        ]
+      },
+      "bullets": [
+        {"text": "The model CAN produce high-QED molecules. It cannot produce them ON REQUEST.", "bold": true, "tone": "warn"},
+        {"text": "That separates a capacity problem from a controllability problem \u2014 the cleanest single argument that the failure is in conditioning rather than in chemistry.", "tone": "accent"}
+      ],
+      "source": "qed_support.json (scripts/14); qed_support_rerank.json (scripts/33)",
+      "pending_from": "qed_support.json, qed_support_rerank.json"
+    },
+    {
+      "title": "Result 6 \u2014 Four interventions, four pre-registered failures",
+      "table": {
+        "headers": ["Intervention", "Criterion fixed in advance", "Outcome"],
+        "rows": [
+          ["1. QED-consistency loss (v1)", "finite training", "Numerically failed at ~step 5,400; traced to 4 inverse-only sites"],
+          ["2. Anchored Conditional Prior", "dQED under a latent shift", "NO-GO at all three N (job 368791)"],
+          ["3. Decoder-aware guidance", "surrogate must transfer to generated embeddings", "Gate failed, QED arms correctly skipped (job 369665)"],
+          ["4. Generated-QED relabeling", "paired response improvement", "Not established"]
+        ]
+      },
+      "bullets": [
+        {"text": "Every criterion was fixed in code before the data existed, so none of these is a post-hoc rationalisation.", "bold": true, "tone": "accent"},
+        {"text": "Interventions 2 and 3 cost under 10 minutes of CPU each to reject.", "level": 1}
+      ]
+    },
+    {
+      "title": "Intervention 2 \u2014 Anchored Conditional Prior gate",
+      "kicker": "dRDKit QED under a +1.0 shift along the real-QED direction",
+      "table": {
+        "headers": ["N", "Real-embedding arm", "Generated arm", "Native"],
+        "rows": [
+          ["15", "+0.1278", "+0.0343", "+0.0336"],
+          ["23", "+0.1121", "-0.0147", "-0.0601"],
+          ["30", "-0.0172", "+0.0133", "+0.0268"]
+        ],
+        "highlight": [[0, 1], [1, 1]]
+      },
+      "bullets": [
+        {"text": "On REAL embeddings a latent shift moves QED (N=15, 23). On GENERATED embeddings it does not. No monotonic response anywhere.", "bold": true},
+        {"text": "Honest limitation: the N=15 real arm had only 14 samples and is underpowered. We do not lean on it.", "tone": "warn"}
+      ],
+      "source": "job 368791, 8m09s, read-only gate"
+    },
+    {
+      "title": "Intervention 3 \u2014 Why the surrogate gate mattered",
+      "kicker": "QED surrogate validated BEFORE any guidance was applied",
+      "table": {
+        "headers": ["Feature set", "Real held-out MAE", "Generated MAE", "Generated correlation"],
+        "rows": [
+          ["Moments (first moments only)", "0.1062", "0.2251", "0.0204"],
+          ["Structural (+ ring / edge terms)", "0.0891", "0.1519", "0.1156"],
+          ["Threshold set in advance", "\u2014", "<= 0.12", ">= 0.30"]
+        ],
+        "highlight": [[0, 3], [1, 3]]
+      },
+      "bullets": [
+        {"text": "Both feature sets failed on generated embeddings, so the QED-guidance arms were skipped by design rather than run against an unreliable critic.", "bold": true},
+        {"text": "The manifold-only arm (no learned critic) did run: it improved QED MAE in 2 of 9 conditions.", "tone": "warn"}
+      ],
+      "source": "job 369665, 2m50s"
+    },
+    {
+      "title": "The trap we avoided \u2014 why a response number alone is not success",
+      "kicker": "Manifold-arm guidance at N=30: native vs guided decoded QED",
+      "table": {
+        "headers": ["QED request", "Native", "Manifold-guided", "Moved toward target?"],
+        "rows": [
+          ["0.4", "0.428", "0.234", "no \u2014 overshot far below"],
+          ["0.6", "0.609", "0.419", "no"],
+          ["0.8", "0.558", "0.489", "no \u2014 moved away"]
+        ],
+        "highlight": [[0, 2], [2, 2]]
+      },
+      "bullets": [
+        {"text": "Headline 'response' rose from +0.130 to +0.255 \u2014 which looks like success.", "tone": "warn"},
+        {"text": "It came entirely from pushing LOW-QED samples lower, not from reaching 0.8. A response number without the per-request breakdown would have been reported as an improvement.", "bold": true, "tone": "warn"},
+        {"text": "This is why our success criterion requires the paired response AND preserved chemical quality, never MAE alone.", "tone": "accent"}
+      ],
+      "source": "job 369665"
+    },
+    {
+      "title": "Scale dependence \u2014 what looked good small, and what held up",
+      "kicker": "The slide I would most like your advice on",
+      "table": {
+        "headers": ["Experiment", "Samples / condition", "At that scale", "After scaling"],
+        "rows": [
+          ["Decoder-guidance pilot", "8", null, "did not hold"],
+          ["Best-of-k rerank", "100", null, "postprocessing only, not conditioning"],
+          ["Relabeling evaluation", "100", null, "not established"]
+        ]
+      },
+      "bullets": [
+        {"text": "Several promising-looking numbers appeared at 8-10 samples per condition and did not survive at 100.", "bold": true},
+        {"text": "At n=10 the confidence interval on a QED mean is roughly +/-0.1 \u2014 the same size as the effect we are chasing. A small-sample headline would not survive the first question about n.", "tone": "warn"},
+        {"text": "Discussion question: is the sample-size sensitivity itself worth a thesis section? It is a real, reusable finding about evaluating conditional generators.", "bold": true, "tone": "accent"}
+      ],
+      "pending_from": "guidance_pilot.json, qed_support_rerank.json, definitive_table.md"
+    },
+    {
+      "title": "A statistical error we found and fixed in our own evaluation",
+      "bullets": [
+        {"text": "BEFORE: 'improvement' was declared when the fine-tuned model's response interval excluded ZERO.", "bold": true, "tone": "warn"},
+        {"text": "Why that is wrong: it asks whether the new model responds at all. It does not ask whether it responds MORE than the old model. Two models can both exclude zero and be statistically indistinguishable from each other.", "level": 1},
+        {"text": "AFTER: the test is on the DIFFERENCE between models, with Holm correction across the three N.", "bold": true, "tone": "good"},
+        {"text": "Limitation we state rather than hide: the per-molecule deltas were not saved, so the exact paired test is unavailable. We report a conservative bound \u2014 shared prior noise makes the models positively correlated, so assuming independence overstates the error.", "level": 1},
+        {"text": "Consequence: a non-significant result here is INCONCLUSIVE, not proof that the models are equal.", "bold": true, "tone": "accent"}
+      ],
+      "source": "scripts/37_final_consolidation.py, final_consolidation.txt"
+    },
+    {
+      "title": "Definitive comparison table",
+      "table": {
+        "headers": ["Checkpoint", "Step", "paired dQED", "95% CI", "pairs", "vs final", "Significant"],
+        "rows": [
+          ["early", "4,000", null, null, null, "\u2014", "\u2014"],
+          ["final", "50,000", null, null, null, "reference", "\u2014"],
+          ["relabel fine-tune", "+400", null, null, null, null, null]
+        ]
+      },
+      "bullets": [
+        {"text": "Protocol identical for every row: one prior-noise draw per N reused across all checkpoints and all QED requests; temperature 0.2; 100 samples per cell; degree-corrected decoder; response = per-molecule QED difference between highest and lowest request at fixed N, over JOINTLY VALID pairs only.", "level": 1},
+        {"text": "Seeds: the evaluation noise stream is distinct from the relabeling pool stream, and the code refuses to run if they coincide. Earlier stages used their own seeds, so their numbers are NOT sample-matched to this table and must not be pooled with it.", "level": 1, "tone": "warn"}
+      ],
+      "source": "outputs/metrics/final_consolidation/definitive_table.md \u2014 paste directly",
+      "pending_from": "definitive_table.md (run slurm/37_final_consolidation.sh)"
+    },
+    {
+      "title": "The early-vs-final trade-off",
+      "table": {
+        "headers": ["", "Early (step 4,000)", "Final (step 50,000)"],
+        "rows": [
+          ["Conditional separation (nats/node)", "+0.9165", "+3.6969"],
+          ["QED responsiveness", "better", "worse"],
+          ["Raw validity", "worse", "better"],
+          ["Chemical quality", "worse", "better"]
+        ],
+        "highlight": [[0, 2], [1, 1]]
+      },
+      "bullets": [
+        {"text": "Caveat we must state: the early checkpoint's responsiveness advantage is confounded with its lower validity. Low-validity models produce different molecule-size distributions, and we showed that unpaired scoring inflates QED comparisons by up to 25 percentage points.", "tone": "warn"},
+        {"text": "Our paired, jointly-valid protocol is designed to remove exactly that bias.", "level": 1},
+        {"text": "Discussion question: report the trade-off as a finding, or control it away as a confound? We currently do the former, with the caveat attached.", "bold": true, "tone": "accent"}
+      ]
+    },
+    {
+      "title": "What the work establishes, suggests, and leaves open",
+      "bullets": [
+        {"text": "ESTABLISHES", "bold": true, "plain": true, "tone": "good"},
+        {"text": "The autoencoder is not the limiting factor on real molecules.", "level": 1},
+        {"text": "The conditional flow learns a strongly condition-dependent density (+3.70 nats/node).", "level": 1},
+        {"text": "That signal does not translate into controlled decoded QED.", "level": 1},
+        {"text": "Four interventions fail criteria that were fixed in advance.", "level": 1},
+        {"text": "Decoding depends heavily on correction, increasingly at larger N.", "level": 1},
+        {"text": "SUGGESTS, NOT PROVEN", "bold": true, "plain": true, "tone": "accent"},
+        {"text": "The loss is concentrated at the discrete assembly step: correct direction (+0.895), sufficient magnitude (1.49x), no effect on the output.", "level": 1},
+        {"text": "Pooled decoder statistics barely predict decoded QED on generated embeddings (correlation 0.02-0.12).", "level": 1},
+        {"text": "OPEN", "bold": true, "plain": true, "tone": "warn"},
+        {"text": "Whether the fine-tuned model differs from the original at all \u2014 the test inputs were not saved.", "level": 1},
+        {"text": "Whether any gain is intrinsic or specific to the degree decoder.", "level": 1},
+        {"text": "Whether joint decoder training, or direct discrete graph generation, would retain the signal. We did not test this.", "level": 1}
+      ]
+    },
+    {
+      "title": "Questions for you",
+      "bullets": [
+        {"text": "1. FRAMING. Is 'where conditional control is lost in a flow+AE pipeline, with four falsified repairs' a defensible contribution, or do you want a different frame?", "bold": true},
+        {"text": "2. BASELINES. Are the ZINC250K validity numbers (GraphDF Table 1) the right comparison set, or should we compare against the teammates' QM9 pipeline despite the dataset difference?", "bold": true},
+        {"text": "3. RAW VS CORRECTED. We lead with corrected for comparability. Keep raw as a secondary column, or move it to the appendix?", "bold": true},
+        {"text": "4. SCALE DEPENDENCE. Promote to a findings section, or keep as a methodological note?", "bold": true},
+        {"text": "5. SCOPE. We have stopped running new training interventions. Agreed?", "bold": true}
+      ]
+    },
+    {
+      "title": "Data still needed to finish this deck",
+      "kicker": "Every em dash in the deck comes from one of these files, all on the cluster",
+      "table": {
+        "headers": ["File", "Produced by", "Fills"],
+        "rows": [
+          ["definitive_table.md", "slurm/37_final_consolidation.sh", "definitive table, literature comparison, scale slide"],
+          ["qed_support_rerank.txt / .json", "slurm/33_qed_support_and_rerank.sh", "decoder dependence, QED support, scale slide"],
+          ["reconstruction_analysis.json", "scripts/03 (already run)", "Result 1"],
+          ["ae_chemistry_audit.json", "scripts/29 (already run)", "Result 1"],
+          ["qed_support.json", "scripts/14 (already run)", "real-data QED support"],
+          ["relabel_evaluation.txt", "slurm/36_evaluate_relabel.sh (already run)", "our validity row in the baselines table"],
+          ["finetune_report.txt", "slurm/35_finetune_relabel.sh (already run)", "fine-tune trace"],
+          ["pool_summary.txt", "job 370418 (already run)", "relabeling ceiling"]
+        ]
+      },
+      "note": "Only the first two still need a job submitted, and both are read-only and take minutes. The rest already exist and just need to be pasted or sent."
+    },
+    {
+      "title": "Appendix \u2014 definitions, so numbers are comparable",
+      "bullets": [
+        {"text": "Raw validity \u2014 sanitisable AND a single connected component, with no repair step.", "bold": true},
+        {"text": "Corrected validity \u2014 after valence/degree-constrained assembly. This is what the teammates and MoFlow report; MoFlow has --correct_validity on by default.", "bold": true},
+        {"text": "Paired dQED at fixed N \u2014 per-molecule QED difference between the highest and lowest QED request, same prior draw, jointly valid pairs only.", "bold": true},
+        {"text": "Condition gap \u2014 validation NLL under permuted conditions minus under own conditions. Greater than 0 means conditioning is alive; about 0 means it is ignored.", "bold": true},
+        {"text": "Internal diversity \u2014 1 minus mean pairwise Tanimoto over unique valid molecules.", "bold": true},
+        {"text": "nats per node \u2014 log-likelihood differences are reported per node so molecules of different size are comparable.", "bold": true}
+      ]
+    }
+  ]
+}
