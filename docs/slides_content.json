@@ -30,6 +30,47 @@
       ]
     },
     {
+      "title": "The baseline our MAE has to beat (and does not)",
+      "kicker": "A conditional model must beat the trivial strategies before its MAE means anything",
+      "table": {
+        "headers": ["Strategy", "QED MAE", "Needs conditioning?"],
+        "rows": [
+          ["Always emit QED = 0.6 (best constant)", "0.1333", "no"],
+          ["Our model, cell means", "0.1508", "yes"],
+          ["Our model, per sample (reported)", "0.1848", "yes"],
+          ["Our model, best-of-10 selection", "0.0327", "no \u2014 postprocessing"]
+        ],
+        "highlight": [[0, 1], [2, 1], [3, 1]]
+      },
+      "bullets": [
+        {"text": "For targets {0.4, 0.6, 0.8} the best constant predictor is the MEDIAN target, 0.6, scoring MAE 0.1333. Our native MAE of 0.1848 is 39% WORSE than that.", "bold": true, "tone": "warn"},
+        {"text": "It still loses on cell means (0.1508 vs 0.1333), so this is not just within-cell scatter.", "level": 1},
+        {"text": "Best-of-10 reaches 0.0327 \u2014 but a constant predictor has no spread, so selection could not help it at all. The gain therefore proves the output distribution already covers the targets: we have the SUPPORT and lack the STEERING.", "bold": true, "tone": "accent"}
+      ],
+      "source": "scripts/39_conditioning_diagnostics.py on the reported per-condition means"
+    },
+    {
+      "title": "Is decoded QED tracking the request, or the molecule size?",
+      "table": {
+        "headers": ["Grouping", "Mean achieved QED", "Spread"],
+        "rows": [
+          ["N = 15", "0.604", "size spread"],
+          ["N = 23", "0.582", "0.107"],
+          ["N = 30", "0.497", ""],
+          ["Request 0.4", "0.568", "request spread"],
+          ["Request 0.6", "0.534", "0.048"],
+          ["Request 0.8", "0.582", "and NOT monotone"]
+        ],
+        "highlight": [[1, 2], [4, 2]]
+      },
+      "bullets": [
+        {"text": "Molecule size moves decoded QED 2.2x more than the QED request does \u2014 and size moves it monotonically, while the request does not (0.568 \u2192 0.534 \u2192 0.582).", "bold": true, "tone": "warn"},
+        {"text": "All nine achieved values sit in 0.491\u20130.644. The model emits an almost constant QED of about 0.56 whatever is asked of it.", "bold": true},
+        {"text": "This is the cleanest statement of the failure: N is acting as a control variable, QED is not.", "tone": "accent"}
+      ],
+      "source": "scripts/39_conditioning_diagnostics.py"
+    },
+    {
       "title": "Pipeline, and where the signal is lost",
       "bullets": [
         {"text": "SMILES \u2192 encoder \u2192 node embeddings \u2192 flow f(x,c) \u2192 latent z", "plain": true, "bold": true},
@@ -48,18 +89,19 @@
         "headers": ["Model (ZINC250K)", "Validity", "Reports QED control?", "Note"],
         "rows": [
           ["Real ZINC250K data", "100%", "\u2014", "mean QED \u2248 0.73"],
-          ["GraphNVP", "42.6%", "no", ""],
-          ["MoFlow", "50.3%", "no", "correction on by default"],
-          ["GraphAF", "68.0%", "no", ""],
+          ["GraphNVP", "42.6%", "no", "GraphDF Table 1"],
+          ["MoFlow", "50.3% or 81.76%", "no", "SOURCES DISAGREE \u2014 see note"],
+          ["GraphAF", "68.0%", "no", "GraphDF Table 1"],
           ["GraphDF", "89.0%", "no", "best of the four"],
-          ["Teammates (QM9)", null, "no", "different dataset"],
-          ["Ours, corrected decoding", null, "yes \u2014 and it is weak", "the comparable column"]
+          ["Teammates (QM9)", null, "no", "different dataset, not comparable"],
+          ["Ours, corrected", "97\u2013100%", "yes \u2014 and it is weak", "the comparable column"],
+          ["Ours, raw (N=30)", "0\u20131%", "yes", "see the validity slide"]
         ],
         "highlight": [[4, 1], [6, 2]]
       },
-      "source": "GraphDF paper, Table 1 (ZINC250K rows)",
-      "note": "Published validity is not measured identically across papers and most use a correction step, so our corrected column is the one to compare.",
-      "pending_from": "teammates' final slide; relabel_evaluation.json"
+      "source": "GraphDF paper, Table 1 (ZINC250K rows); MoFlow paper for the 81.76% figure",
+      "note": "UNRESOLVED DISCREPANCY: MoFlow's own paper reports about 81.76% validity without correction, while GraphDF Table 1 reports MoFlow at 50.3%. That is a 31-point gap for the same model on the same dataset. We have not picked a side; the source tables, sample counts and correction settings need to be read first. The brief flags this too.",
+      "pending_from": "teammates' final slide; MoFlow and GraphDF source tables"
     },
     {
       "title": "None of those papers reports conditional QED control",
@@ -72,12 +114,12 @@
           ["DriftingMol", "rho with gradient blocked (ablation)", "0.011"],
           ["Reward Transport", "rho group-level", "1.000"],
           ["Reward Transport", "rho per-molecule", "0.22"],
-          ["Ours", "paired dQED at fixed N (0.4 \u2192 0.8)", null]
+          ["Ours", "mean response, 0.4 \u2192 0.8 request", "+0.014 of an ideal +0.400"],
+          ["Ours", "fraction of ideal response delivered", "3.5%"]
         ],
-        "highlight": [[0, 2], [4, 2]]
+        "highlight": [[0, 2], [4, 2], [6, 2]]
       },
-      "note": "Even papers that target property control report per-molecule correlations near 0.5, and one reports per-molecule rho 0.22 against a perfect group-level score. Per-molecule control is weak across the literature. That is the honest frame for our result.",
-      "pending_from": "definitive_table.md"
+      "note": "Even papers that target property control report per-molecule correlations near 0.5, and one reports per-molecule rho 0.22 against a perfect group-level score. Per-molecule control is weak across the literature \u2014 but 3.5% of the ideal response is weak even by that standard, so we do not claim parity."
     },
     {
       "title": "Result 1 \u2014 Autoencoder reconstruction works",
@@ -137,19 +179,20 @@
       "title": "Result 4 \u2014 Decoder dependence: corrected vs raw validity",
       "kicker": "Corrected leads, because that is what the teammates and the published papers report",
       "table": {
-        "headers": ["N", "Corrected (degree)", "Corrected (constrained)", "Raw", "Gap"],
+        "headers": ["N", "Corrected validity", "Raw validity", "Share of molecules the repair created"],
         "rows": [
-          ["15", null, null, null, null],
-          ["23", null, null, null, null],
-          ["30", null, null, null, null]
-        ]
+          ["15", "97\u2013100%", "18\u201353%", "roughly half to four fifths"],
+          ["23", "97\u2013100%", "4\u201310%", "about 90%"],
+          ["30", "97\u2013100%", "0\u20131%", "essentially all of them"]
+        ],
+        "highlight": [[2, 2], [2, 3]]
       },
       "bullets": [
-        {"text": "Raw validity is kept beside corrected because the raw-corrected gap IS one of our findings \u2014 'strong reliance on corrected decoding, especially at larger N'. Removing the column removes the finding.", "tone": "accent"},
-        {"text": "Discussion question: keep raw here, or move it to the appendix?", "bold": true}
+        {"text": "At N=30 raw validity is 0\u20131% while corrected is 97\u2013100%. Essentially every reported N=30 molecule is a product of the MILP repair, not of the flow.", "bold": true, "tone": "warn"},
+        {"text": "Consequence for every other N=30 number in this deck, including the QED values: they describe the repair's output, so we cannot separate 'the flow cannot condition' from 'the repair erases the conditioning' at that size.", "bold": true, "tone": "warn"},
+        {"text": "Raw validity is kept beside corrected because this gap IS one of our findings. Removing the column removes the finding.", "tone": "accent"}
       ],
-      "source": "qed_support_rerank.json (scripts/33), per-decoder validity by N",
-      "pending_from": "qed_support_rerank.json"
+      "source": "reported per-N validity; recompute from qed_support_rerank.json (scripts/33)"
     },
     {
       "title": "Result 4b \u2014 The same embedding decodes to different QED",
@@ -185,6 +228,25 @@
       ],
       "source": "qed_support.json (scripts/14); qed_support_rerank.json (scripts/33)",
       "pending_from": "qed_support.json, qed_support_rerank.json"
+    },
+    {
+      "title": "Aromaticity gap, and a hypothesis worth testing",
+      "table": {
+        "headers": ["N", "Raw validity", "QED response (0.4\u21920.8)", "% of ideal"],
+        "rows": [
+          ["15", "18\u201353%", "+0.044", "+11.0%"],
+          ["23", "4\u201310%", "-0.012", "-3.0%"],
+          ["30", "0\u20131%", "+0.010", "+2.5%"]
+        ],
+        "highlight": [[0, 1], [0, 3]]
+      },
+      "bullets": [
+        {"text": "Aromatic rings: 1.15 generated vs 1.88 in real ZINC \u2014 a 39% deficit. Not yet broken down by N; that breakdown is the next thing to compute.", "bold": true},
+        {"text": "HYPOTHESIS (three points only, so weak): QED responsiveness and raw validity collapse together as N grows. The only clearly positive response is at the N with the best raw validity.", "tone": "accent"},
+        {"text": "If that holds up, both symptoms share one cause \u2014 the discrete assembly step \u2014 rather than being two separate problems. It also predicts that fixing conditioning without fixing assembly will not work, which is consistent with all four failed interventions.", "tone": "accent"},
+        {"text": "Caveat: n=3, so this is a hypothesis to test, not a result to report.", "level": 1, "tone": "warn"}
+      ],
+      "source": "reported aromaticity and per-N validity; responsiveness from scripts/39"
     },
     {
       "title": "Result 6 \u2014 Four interventions, four pre-registered failures",
@@ -264,7 +326,8 @@
         "headers": ["Experiment", "Samples / condition", "At that scale", "After scaling"],
         "rows": [
           ["Decoder-guidance pilot", "8", null, "did not hold"],
-          ["Best-of-k rerank", "100", null, "postprocessing only, not conditioning"],
+          ["Best-of-10 selection", "100 \u2192 10 kept", "MAE 0.0327", "postprocessing, not conditioning"],
+          ["Native generation", "100", "MAE 0.1848", "worse than a constant predictor"],
           ["Relabeling evaluation", "100", null, "not established"]
         ]
       },

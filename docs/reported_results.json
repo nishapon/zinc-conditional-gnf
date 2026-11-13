@@ -1,0 +1,32 @@
+{
+  "source": "numbers reported in the project brief of 2026-11-10",
+  "status": "REPORTED, NOT YET RECOMPUTED from the evaluation artefacts. The brief itself asks for recomputation and exact metric definitions; until that is done every derived number inherits this caveat.",
+  "qed_targets": [0.4, 0.6, 0.8],
+  "node_counts": [15, 23, 30],
+  "achieved_qed_by_n": {
+    "15": {"0.4": 0.600, "0.6": 0.569, "0.8": 0.644},
+    "23": {"0.4": 0.609, "0.6": 0.541, "0.8": 0.597},
+    "30": {"0.4": 0.495, "0.6": 0.491, "0.8": 0.505}
+  },
+  "native_qed_mae": 0.1848,
+  "selected_qed_mae": {"10": 0.0327},
+  "selection_protocol": "100 candidates per condition, degree-constrained decoder, split into 10 disjoint groups of 10, nearest-to-target kept from each group; 10 accepted molecules per condition",
+  "corrected_validity_range": [0.97, 1.0],
+  "raw_validity_by_n": {
+    "15": [0.18, 0.53],
+    "23": [0.04, 0.10],
+    "30": [0.00, 0.01]
+  },
+  "uniqueness_range": [0.95, 1.0],
+  "internal_diversity_range": [0.81, 0.91],
+  "aromatic_rings_generated": 1.15,
+  "aromatic_rings_real_zinc": 1.88,
+  "checkpoint": "128-D embeddings, 50,000 training steps",
+  "literature_reference_disagreement": {
+    "moflow_raw_validity": {
+      "moflow_paper": 0.8176,
+      "graphdf_table1_reporting_moflow": 0.503,
+      "status": "UNRESOLVED. The two sources disagree by over 31 percentage points for the same model on the same dataset. Do not pick one. The source tables, sample counts and correction settings must be read before either number is used."
+    }
+  }
+}
