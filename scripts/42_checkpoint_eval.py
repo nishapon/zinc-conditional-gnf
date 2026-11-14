@@ -63,7 +63,8 @@ from zinc_gnf.conditioning import (  # noqa: E402
 )
 from zinc_gnf.generation import decode_embeddings  # noqa: E402
 from zinc_gnf.trainer_autoencoder import ResumeMismatchError, load_autoencoder  # noqa: E402
-from zinc_gnf.trainer_flow import file_sha256, load_flow  # noqa: E402
+from zinc_gnf.experiment_arms import draw_latents, load_arm_flow  # noqa: E402
+from zinc_gnf.trainer_flow import file_sha256  # noqa: E402
 from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 
 # TWO SEPARATE GENERATION STREAMS. Selection ranks candidates on one stream;
@@ -190,8 +191,8 @@ def pair_masks(node_mask: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def generate_cell(flow, autoencoder, *, scaler, n, qed, eps, temperature, device,
-                  batch_size):
+def generate_cell(flow, autoencoder, *, scaler, n, qed, eps, shared, temperature,
+                  device, batch_size):
     """One cell. Records carry `noise_id` so every comparison can be paired."""
     from rdkit import Chem, rdBase
     from rdkit.Chem import QED, rdMolDescriptors
@@ -200,6 +201,7 @@ def generate_cell(flow, autoencoder, *, scaler, n, qed, eps, temperature, device
     total = eps.shape[0]
     for start in range(0, total, batch_size):
         chunk = eps[start:start + batch_size, :n, :]
+        graph = shared[start:start + batch_size]
         size = chunk.shape[0]
         mask = torch.ones((size, n), dtype=torch.bool, device=device)
         values = torch.from_numpy(
@@ -207,9 +209,10 @@ def generate_cell(flow, autoencoder, *, scaler, n, qed, eps, temperature, device
                                   n=[n] * size, qed=[qed] * size)).to(device)
         condition = condition_embedding_for(flow, values, torch.ones_like(values),
                                             size, device)
-        mu, sigma = flow.prior.parameters_for(size, condition, device)
-        z = (mu.unsqueeze(1) + float(temperature) * sigma.unsqueeze(1) * chunk) \
-            * mask.unsqueeze(-1)
+        # prior-agnostic: includes the shared component for a coupled prior, which a
+        # manual mu + T*sigma*eps would silently omit
+        z = draw_latents(flow, mask, condition, eps=chunk, shared=graph,
+                         temperature=temperature)
         embeddings = flow.inverse(z, mask, condition)
         decoded = decode_embeddings(autoencoder, embeddings, [n] * size,
                                     decoders=DECODERS)
@@ -379,15 +382,22 @@ def shared_noise(targets_n, *, dimension, samples, seed, device) -> dict[str, An
     """
     import hashlib
 
-    tensors, fingerprints = {}, {}
+    tensors, shared, fingerprints = {}, {}, {}
     for n in targets_n:
         generator = torch.Generator(device=device).manual_seed(int(seed) + 7919 * n)
         eps = torch.randn((samples, max(targets_n), dimension), device=device,
                           generator=generator)
-        tensors[n] = eps
+        # the per-molecule shared component, drawn from the SAME stream so a coupled
+        # prior is evaluated on fixed noise too
+        graph = torch.randn((samples, 1, dimension), device=device,
+                            generator=generator)
+        tensors[n], shared[n] = eps, graph
         fingerprints[str(n)] = hashlib.sha256(
             eps.detach().cpu().numpy().tobytes()).hexdigest()[:16]
-    return {"tensors": tensors, "fingerprints": fingerprints, "seed": int(seed),
+        fingerprints[f"{n}_shared"] = hashlib.sha256(
+            graph.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+    return {"tensors": tensors, "shared": shared, "fingerprints": fingerprints,
+            "seed": int(seed),
             "shape": [samples, max(targets_n), dimension],
             "note": ("one draw per N, reused for every checkpoint and every requested "
                      "QED; noise_id is the row index into this tensor")}
@@ -592,7 +602,9 @@ def main(argv=None) -> int:
         for label, path in checkpoints.items():
             if not path.is_file():
                 raise FileNotFoundError(f"{label}: checkpoint not found: {path}")
-            flow, probe = load_flow(path, device=device)
+            # arm-aware: wraps the prior when the checkpoint carries
+            # prior.pre_rho, so a coupled checkpoint loads into the right module
+            flow, probe = load_arm_flow(path, device=device)
             flow.eval().requires_grad_(False)
             loaded[label] = {"flow": flow, "probe": probe, "path": path}
         first_probe = next(iter(loaded.values()))["probe"]
@@ -615,7 +627,8 @@ def main(argv=None) -> int:
         dimension = int(next(iter(loaded.values()))["flow"].config.node_embedding_dim)
         noise = shared_noise(targets_n, dimension=dimension, samples=args.samples,
                              seed=seed, device=device)
-        payload["shared_noise"] = {k: v for k, v in noise.items() if k != "tensors"}
+        payload["shared_noise"] = {k: v for k, v in noise.items()
+                                   if k not in ("tensors", "shared")}
         print(f"shared noise fingerprints: {noise['fingerprints']}", flush=True)
 
         all_records: dict[str, Any] = {}
@@ -627,10 +640,11 @@ def main(argv=None) -> int:
             records_by_cell: dict[str, Any] = {}
             for n in targets_n:
                 eps = noise["tensors"][n]          # the SAME tensor for every checkpoint
+                graph = noise["shared"][n]
                 for qed in qed_values:
                     records = generate_cell(
                         flow, autoencoder, scaler=scaler, n=n, qed=qed, eps=eps,
-                        temperature=args.temperature, device=device,
+                        shared=graph, temperature=args.temperature, device=device,
                         batch_size=args.batch_size)
                     key = f"N{n}_QED{qed:g}"
                     records_by_cell[key] = records

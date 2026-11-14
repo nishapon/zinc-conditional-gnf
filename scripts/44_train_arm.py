@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import shutil
 import sys
 import time
 import traceback
@@ -36,16 +35,37 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from zinc_gnf.dataset import MolecularGraphDataset, load_training_splits  # noqa: E402
+from zinc_gnf.balanced_sampler import BalancedSampler  # noqa: E402
+from zinc_gnf.dataset import DeterministicBatcher  # noqa: E402
 from zinc_gnf.experiment_arms import (  # noqa: E402
     ARMS,
     ArmConfig,
     ArmTrainer,
     imbalance_report,
+    prepare_warm_start,
 )
 from zinc_gnf.flow import FlowConfig  # noqa: E402
 from zinc_gnf.trainer_flow import FlowTrainConfig  # noqa: E402
 from zinc_gnf.utils.logging import JobLogger  # noqa: E402
 from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
+
+
+def _fresh_sampler_state(arm, train_set, train_config):
+    """The arm's OWN sampler state, chosen deliberately rather than inherited.
+
+    `_restore` restores the batcher state unconditionally, so the warm-start checkpoint
+    must carry a state the arm's sampler can actually load. A DeterministicBatcher state
+    handed to a BalancedSampler is now refused outright by the sampler.
+    """
+    if arm.uses_balanced_sampler:
+        return BalancedSampler(
+            np.asarray(train_set.n_node), np.asarray(train_set.qed),
+            batch_size=train_config.batch_size, seed=train_config.seed,
+            alpha=arm.balanced_alpha, min_cell_count=arm.min_cell_count,
+            max_exposure_ratio=arm.max_exposure_ratio,
+            qed_bin_width=arm.qed_bin_width).state_dict()
+    return DeterministicBatcher(len(train_set), train_config.batch_size,
+                                train_config.seed).state_dict()
 
 
 def parse_args(argv=None):
@@ -110,32 +130,52 @@ def main(argv=None) -> int:
             print(f"FATAL: {report['verdict']}", file=sys.stderr)
             return 3
 
+        import torch
+
         start = Path(args.start_checkpoint)
         if not start.is_file():
             raise FileNotFoundError(f"starting checkpoint not found: {start}")
-        # resume reads last.pt from the output directory, so the shared warm start is
-        # COPIED in. The original is never opened for writing.
         resume_target = out_dir / "last.pt"
-        if not resume_target.exists():
-            shutil.copy2(start, resume_target)
-            print(f"warm start copied: {start} -> {resume_target}")
-
-        probe = __import__("torch").load(start, map_location="cpu", weights_only=False)
+        interrupted = resume_target.exists()
+        probe = torch.load(start, map_location="cpu", weights_only=False)
         flow_config = FlowConfig.from_dict(probe["flow_config"])
         train_config = FlowTrainConfig(
             data_dir=args.data_dir, output_dir=str(out_dir),
             ae_checkpoint=args.ae_checkpoint, seed=args.seed, device=args.device,
             batch_size=args.batch_size,
-            max_steps=int(probe.get("step", 0)) + args.screening_steps,
+            # step is reset to 0 by the warm-start translation, so max_steps IS the
+            # number of additional optimizer steps and the warm-up is experiment-local
+            max_steps=args.screening_steps,
             learning_rate=args.learning_rate, warmup_steps=args.warmup_steps,
             eval_every=args.eval_every, save_every=args.save_every,
             val_molecules=args.val_molecules, early_stopping_patience=None)
         train_config.validate()
 
+        # PATH 1: new experiment from the common parent. The parent is TRANSLATED into
+        # an arm-compatible last.pt so every strict _restore check passes honestly.
+        # PATH 2: an interrupted experiment already has its own last.pt; resume it as-is
+        # and verify the arm configuration has not changed.
+        warm_start = None
+        if not interrupted:
+            sampler_state = _fresh_sampler_state(arm, train_set, train_config)
+            warm_start = prepare_warm_start(
+                start, resume_target, arm_config=arm, train_config=train_config,
+                flow_config=flow_config, sampler_state=sampler_state)
+            print("PATH 1 (new experiment from parent):")
+            print(json.dumps(warm_start, indent=2, default=str))
+        else:
+            existing = torch.load(resume_target, map_location="cpu",
+                                   weights_only=False)
+            print(f"PATH 2 (resuming interrupted experiment at step "
+                  f"{existing.get('step')})")
+
         logger = JobLogger(f"arm_{arm.arm}", out_dir, filename="train.log")
         trainer = ArmTrainer(flow_config, train_config, logger=logger,
                              datasets=(train_set, val_set, fingerprint),
                              arm_config=arm)
+        if interrupted:
+            trainer.verify_arm(torch.load(resume_target, map_location="cpu",
+                                           weights_only=False))
         summary = trainer.train(resume="auto")
         atomic_write_json(
             {"arm": arm.to_dict(), "arm_report": trainer.arm_report,
@@ -143,6 +183,7 @@ def main(argv=None) -> int:
              "screening_steps": args.screening_steps,
              "max_steps": train_config.max_steps,
              "learning_rate": args.learning_rate,
+             "interrupted_resume": interrupted, "warm_start": warm_start,
              "imbalance": report, "summary": summary,
              "elapsed_seconds": time.perf_counter() - started},
             out_dir / "arm_summary.json")

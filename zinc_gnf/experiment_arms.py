@@ -47,7 +47,7 @@ import torch
 from zinc_gnf.balanced_sampler import BalancedSampler, joint_distribution
 from zinc_gnf.coupled_prior import INIT_RHO, CoupledNodePrior
 from zinc_gnf.dataset import DeterministicBatcher
-from zinc_gnf.trainer_flow import FlowTrainer
+from zinc_gnf.trainer_flow import FlowTrainer, ResumeMismatchError
 
 ARMS = ("control", "balanced", "prior_frozen", "prior_learned")
 
@@ -178,6 +178,32 @@ class ArmTrainer(FlowTrainer):
         self.arm_config.validate()
         self.arm_report: dict[str, Any] = {"arm": self.arm_config.arm}
 
+    # -- arm identity is persisted and verified on resume --------------
+    def _state(self, step: int) -> dict[str, Any]:
+        state = super()._state(step)
+        state["arm"] = self.arm_config.to_dict()
+        return state
+
+    def verify_arm(self, checkpoint: dict[str, Any]) -> None:
+        """Reject resuming an interrupted run under a DIFFERENT arm."""
+        saved = checkpoint.get("arm")
+        if saved is None:
+            raise ResumeMismatchError(
+                "this checkpoint carries no arm block, so it was not written by an arm "
+                "run; start a new experiment with prepare_warm_start instead of "
+                "resuming")
+        current = self.arm_config.to_dict()
+        differing = [key for key in ("arm", "balanced_alpha", "coupled_init_rho",
+                                      "min_cell_count", "max_exposure_ratio",
+                                      "qed_bin_width")
+                     if saved.get(key) != current.get(key)]
+        if differing:
+            raise ResumeMismatchError(
+                f"cannot resume: the checkpoint's arm configuration differs in "
+                f"{differing} (checkpoint "
+                f"{ {k: saved.get(k) for k in differing} } vs now "
+                f"{ {k: current.get(k) for k in differing} })")
+
     # -- hook 1: wrap the prior BEFORE the optimizer is built ----------
     def _prepare_flow(self, flow):
         if not self.arm_config.uses_coupled_prior:
@@ -231,16 +257,239 @@ class ArmTrainer(FlowTrainer):
             f"fraction {weighting['effective_sample_fraction']:.3f}")
         return sampler
 
-    # -- optimizer-state-aware restore ---------------------------------
-    def _restore(self, path, flow, optimizer):
-        """Delegate, but adapt the optimizer state when the arm added a parameter."""
-        if not self.arm_config.uses_coupled_prior:
-            return super()._restore(path, flow, optimizer)
-        blob = torch.load(path, map_location="cpu", weights_only=False)
-        saved = blob.get("optimizer_state_dict")
-        step, history = super()._restore(path, flow, None)
-        self.arm_report["optimizer_restore"] = adapt_optimizer_state(optimizer, saved)
-        return step, history
+
+# --------------------------------------------------- warm start translation ---
+def parameter_order(flow_config_dict: dict[str, Any]) -> list[tuple[str, tuple]]:
+    """`(name, shape)` in the exact order `flow.parameters()` yields them.
+
+    Rebuilding the parent model from its own saved `flow_config` reconstructs the
+    ordering its optimizer used, which is what makes a POSITIONAL Adam state
+    interpretable by NAME. Nothing here depends on assuming an order.
+    """
+    from zinc_gnf.flow import FlowConfig, NodeFlow
+
+    model = NodeFlow(FlowConfig.from_dict(flow_config_dict))
+    return [(name, tuple(tensor.shape))
+            for name, tensor in model.named_parameters()]
+
+
+def map_optimizer_state(parent_blob: dict[str, Any], arm_flow, *,
+                        learning_rate: float | None = None) -> dict[str, Any]:
+    """Re-index the parent's Adam moments onto the arm's parameters BY NAME.
+
+    Adam stores state positionally, so the parent's indices are meaningless against a
+    model with an extra tensor. The parent's ordering is reconstructed from its own
+    `flow_config`, turned into index -> name, then name -> the arm's index. Every parent
+    name must exist in the arm with an identical shape or this raises; a new parameter is
+    left with no moments, which Adam creates on its first step.
+    """
+    saved = parent_blob.get("optimizer_state_dict")
+    if not saved:
+        return {"optimizer_state_dict": None,
+                "mapping": {"restored": False, "reason": "parent has no optimizer state"}}
+    parent_order = parameter_order(parent_blob["flow_config"])
+    arm_order = [(name, tuple(t.shape)) for name, t in arm_flow.named_parameters()]
+    arm_index = {name: position for position, (name, _) in enumerate(arm_order)}
+    arm_shape = dict(arm_order)
+
+    groups = saved.get("param_groups") or []
+    positional = [index for group in groups for index in group["params"]]
+    if len(positional) != len(parent_order):
+        raise ValueError(
+            f"parent optimizer state covers {len(positional)} parameters but its "
+            f"flow_config reconstructs {len(parent_order)}; refusing to guess the "
+            f"mapping")
+
+    remapped_state: dict[int, Any] = {}
+    mapped, missing, reshaped = [], [], []
+    for position, (name, shape) in enumerate(parent_order):
+        if name not in arm_index:
+            missing.append(name)
+            continue
+        if arm_shape[name] != shape:
+            reshaped.append({"name": name, "parent": list(shape),
+                             "arm": list(arm_shape[name])})
+            continue
+        entry = (saved.get("state") or {}).get(position)
+        if entry is not None:
+            remapped_state[arm_index[name]] = entry
+        mapped.append(name)
+    if missing or reshaped:
+        raise ValueError(
+            f"parameter-name mapping failed: missing from the arm {missing}; shape "
+            f"mismatches {reshaped}")
+
+    template = dict(groups[0]) if groups else {}
+    template["params"] = list(range(len(arm_order)))
+    # Adam's state_dict carries `lr` inside param_groups, so loading the parent's state
+    # would silently reinstate the PARENT's learning rate. The experiment rate is written
+    # in explicitly, after the moments are mapped.
+    previous_lr = template.get("lr")
+    if learning_rate is not None:
+        template["lr"] = float(learning_rate)
+    added = [name for name, _ in arm_order if name not in dict(parent_order)]
+    return {
+        "optimizer_state_dict": {"state": remapped_state, "param_groups": [template]},
+        "mapping": {
+            "restored": True,
+            "parent_parameters": len(parent_order),
+            "arm_parameters": len(arm_order),
+            "moments_mapped": len(remapped_state),
+            "names_mapped": len(mapped),
+            "new_parameters_without_moments": added,
+            "method": ("parent ordering reconstructed from its own flow_config, then "
+                       "index -> name -> arm index, with shapes validated"),
+            "learning_rate_in_param_groups": {
+                "parent": previous_lr, "applied": template.get("lr"),
+                "note": ("set explicitly after mapping, because Adam's state_dict "
+                         "carries lr in param_groups and would otherwise reinstate the "
+                         "parent's rate"),
+            },
+        },
+    }
+
+
+def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
+                       train_config, flow_config, sampler_state: dict[str, Any],
+                       device: str = "cpu") -> dict[str, Any]:
+    """Translate the common parent into an ARM-COMPATIBLE `last.pt`. PATH 1.
+
+    `FlowTrainer._restore` is strict, and deliberately so: it compares the checkpoint's
+    `seed`, `batch_size` and LEARNING RATE against the live config, restores the batcher
+    state unconditionally, and inherits `best_loss` / `best_step` / `bad_evals`. A naive
+    warm start therefore fails three ways -- the experiment learning rate is an override,
+    a BalancedSampler cannot take a DeterministicBatcher state, and inherited
+    best-checkpoint bookkeeping from a 50k run would stop a 3k run at lr 1e-5 ever
+    writing `best.pt`.
+
+    Rather than weaken those checks, this writes a checkpoint that satisfies them
+    honestly:
+
+      * `train_config` is the EXPERIMENT's, so the learning-rate override is recorded in
+        the artefact and the strict comparison passes by agreement rather than by
+        exemption;
+      * `batcher` is the arm's OWN fresh sampler state, chosen deliberately;
+      * `best_loss` / `best_step` / `bad_evals` / `history` are RESET, so selection and
+        early stopping are experiment-local;
+      * `step` is 0, so `max_steps = 3000` means exactly 3,000 additional optimizer steps
+        and the warm-up is experiment-local;
+      * parent weights are loaded into the base prior BEFORE it is wrapped, so no key
+        remapping of model weights is needed at all;
+      * Adam moments are re-indexed by verified parameter NAME;
+      * RNG and noise-generator states are deliberately OMITTED, so every arm starts
+        from `set_seed(cfg.seed)` and the four arms share identical randomness;
+      * the parent is recorded separately under `parent`, never conflated with this
+        run's own identity.
+
+    Vocabulary, flow config, autoencoder and data fingerprints are carried over from the
+    parent unchanged, so those compatibility checks remain fully active.
+    """
+    import torch as _torch
+    from zinc_gnf.flow import NodeFlow
+    from zinc_gnf.trainer_flow import file_sha256, vocabulary_fingerprint
+
+    parent_path, target_path = Path(parent_path), Path(target_path)
+    blob = _torch.load(parent_path, map_location="cpu", weights_only=False)
+    if blob.get("vocabulary_fingerprint") != vocabulary_fingerprint():
+        raise ResumeMismatchError("parent checkpoint uses a different atom vocabulary")
+    if FlowConfigLike(blob["flow_config"]) != FlowConfigLike(flow_config.to_dict()):
+        raise ResumeMismatchError(
+            "parent flow configuration differs from the arm's; the architecture must be "
+            "identical for the comparison to mean anything")
+
+    flow = NodeFlow(flow_config, init_seed=train_config.seed)
+    # weights FIRST, wrapping SECOND: no model-key remapping is ever required
+    flow.load_state_dict(blob["model_state_dict"])
+    if arm_config.uses_coupled_prior:
+        flow.prior = CoupledNodePrior.from_node_prior(
+            flow.prior, init_rho=arm_config.coupled_init_rho,
+            learnable=arm_config.rho_learnable)
+    flow.to(device)
+
+    optimizer = map_optimizer_state(
+        blob, flow, learning_rate=train_config.learning_rate)
+    record = {
+        "step": 0,
+        "epoch": 0,
+        "best_metric": float("inf"),
+        "best_loss": None,
+        "best_step": -1,
+        "bad_evals": 0,
+        "history": [],
+        "batcher": sampler_state,
+        "model_state_dict": flow.state_dict(),
+        "optimizer_state_dict": optimizer["optimizer_state_dict"],
+        "configuration": {"flow": flow_config.to_dict(),
+                          "training": train_config.to_dict()},
+        "flow_config": flow_config.to_dict(),
+        "train_config": train_config.to_dict(),
+        "vocabulary_fingerprint": blob.get("vocabulary_fingerprint"),
+        "autoencoder": blob.get("autoencoder"),
+        "data_fingerprint": blob.get("data_fingerprint"),
+        "embedding_statistics": blob.get("embedding_statistics"),
+        "arm": arm_config.to_dict(),
+        "parent": {
+            "checkpoint": str(parent_path),
+            "sha256": file_sha256(parent_path),
+            "step": blob.get("step"),
+            "learning_rate": (blob.get("train_config") or {}).get("learning_rate"),
+            "best_loss": blob.get("best_loss"),
+            "note": ("the parent's identity, kept separate from this run's. Its "
+                     "best_loss and step are NOT inherited."),
+        },
+        "warm_start": {
+            "learning_rate_override": {
+                "parent": (blob.get("train_config") or {}).get("learning_rate"),
+                "experiment": train_config.learning_rate,
+                "recorded_because": ("_restore compares learning_rate strictly; the "
+                                     "override is written into train_config so the "
+                                     "check passes by agreement, not by exemption"),
+            },
+            "optimizer_mapping": optimizer["mapping"],
+            "reset": ["step", "best_loss", "best_step", "bad_evals", "history",
+                      "batcher", "torch_rng_state", "noise_generator_state"],
+            "prior_wrapped_after_loading_weights": arm_config.uses_coupled_prior,
+        },
+    }
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    _torch.save(record, target_path)
+    return {"target": str(target_path), "parent": record["parent"],
+            "warm_start": record["warm_start"]}
+
+
+def FlowConfigLike(value):            # noqa: N802 - tiny normaliser, not a class
+    """Compare flow configs as plain dicts without caring about key order."""
+    return tuple(sorted((str(k), str(v)) for k, v in dict(value).items()))
+
+
+# ------------------------------------------------- prior-agnostic latent draw ---
+def draw_latents(flow, mask, condition, *, eps, shared, temperature: float = 1.0):
+    """Build `z` from EXTERNALLY supplied noise, correctly for either prior.
+
+    Evaluation needs the noise held fixed across checkpoints, so it cannot call
+    `prior.sample`, which draws its own. Building `z` as `mu + T*sigma*eps` is correct
+    for `NodePrior` but SILENTLY WRONG for `CoupledNodePrior`: it omits the shared
+    graph-level component entirely, so a coupled checkpoint would be evaluated as though
+    rho were zero and the intervention would look like it did nothing.
+
+    This reproduces each prior's own sampler exactly while taking both noise tensors from
+    the caller, so pairing by noise id survives:
+
+        NodePrior          z = mu + T * sigma * eps
+        CoupledNodePrior   z = mu + T * sigma * ( sqrt(1-rho)*eps + sqrt(rho)*shared )
+
+    `eps` is `[B, N, D]` and `shared` is `[B, 1, D]`, both from the evaluation's own
+    seeded stream.
+    """
+    mu, sigma = flow.prior.parameters_for(eps.shape[0], condition, eps.device)
+    rho_fn = getattr(flow.prior, "rho", None)
+    if callable(rho_fn):
+        rho = rho_fn().view(1, 1, -1)
+        deviation = torch.sqrt(1.0 - rho) * eps + torch.sqrt(rho) * shared
+    else:
+        deviation = eps
+    z = mu.unsqueeze(1) + float(temperature) * sigma.unsqueeze(1) * deviation
+    return z * mask.unsqueeze(-1).to(z.dtype)
 
 
 # ----------------------------------------------------------- generation side ---
@@ -276,6 +525,10 @@ __all__ = [
     "ArmConfig",
     "ArmTrainer",
     "adapt_optimizer_state",
+    "draw_latents",
+    "map_optimizer_state",
+    "parameter_order",
+    "prepare_warm_start",
     "imbalance_report",
     "load_arm_flow",
 ]
