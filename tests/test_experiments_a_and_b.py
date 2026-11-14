@@ -266,9 +266,10 @@ def test_a_tiny_cell_has_exposure_ratio_one_before_clipping():
     diagnostics = sampler.report()["weighting"]
     assert diagnostics["cells_tiny_held_at_natural_mass"] == 1
     assert diagnostics["molecules_in_tiny_cells"] == 4
-    assert diagnostics["max_exposure_ratio_among_tiny_cells_before_clip"] == \
+    assert diagnostics["max_exposure_ratio_among_tiny_cells"] == \
         pytest.approx(1.0, abs=1e-9)
-    assert diagnostics["max_exposure_ratio_among_tiny_cells"] <= 1.0 + 1e-9
+    assert diagnostics["min_exposure_ratio_among_tiny_cells"] == \
+        pytest.approx(1.0, abs=1e-9)
 
 
 def test_the_report_gives_final_cell_probabilities_that_sum_to_one():
@@ -291,13 +292,64 @@ def test_a_rare_eligible_cell_is_the_one_that_gains_exposure():
     assert exposure[rare] > 1.0 > exposure[common]
 
 
-def test_the_exposure_clip_binds():
+def test_the_exposure_bound_binds_on_the_reported_failing_case():
+    """Regression: clip-then-renormalise gave 8.94 here against a bound of 5."""
     n_node, qed = synthetic({(15, 5): 5000, (23, 6): 60})
     diagnostics = BalancedSampler(n_node, qed, batch_size=8, seed=3, alpha=1.0,
                                   min_cell_count=50,
                                   max_exposure_ratio=5.0).report()["weighting"]
-    assert diagnostics["max_exposure_ratio_realised"] <= 5.0 + 1e-6
-    assert diagnostics["min_exposure_ratio_realised"] >= 1.0 / 5.0 - 1e-6
+    assert diagnostics["max_exposure_ratio_realised"] <= 5.0 + 1e-9
+    assert diagnostics["min_exposure_ratio_realised"] >= 1.0 / 5.0 - 1e-9
+    assert sum(diagnostics["final_cell_probability"]) == pytest.approx(1.0, abs=1e-12)
+    assert diagnostics["solve"]["residual"] < 1e-9
+
+
+@pytest.mark.parametrize("cells,alpha,min_cell,bound", [
+    ({(15, 5): 5000, (23, 6): 60}, 1.0, 50, 5.0),
+    ({(15, 5): 20000, (23, 6): 5000, (30, 7): 80}, 1.0, 50, 5.0),
+    ({(15, 5): 4000, (23, 6): 600, (30, 7): 10, (30, 8): 7, (23, 2): 3}, 1.0, 50, 20.0),
+    ({(15, 5): 10, (23, 6): 8, (30, 7): 5}, 1.0, 50, 5.0),
+    ({(15, 5): 5000, (23, 6): 60, (30, 7): 900}, 0.0, 50, 5.0),
+    ({(15, 5): 100000, (30, 9): 51}, 1.0, 50, 2.0),
+])
+def test_the_allocation_satisfies_all_three_requirements(cells, alpha, min_cell, bound):
+    """Mass sums to one, tiny cells stay natural, and eligible bounds hold."""
+    n_node, qed = synthetic(cells)
+    sampler = BalancedSampler(n_node, qed, batch_size=4, seed=12, alpha=alpha,
+                              min_cell_count=min_cell, max_exposure_ratio=bound)
+    diagnostics = sampler.report()["weighting"]
+    final = diagnostics["final_cell_probability"]
+    exposure = diagnostics["exposure_ratio_by_cell"]
+    populations = sampler.distribution["cell_populations"]
+    assert sum(final) == pytest.approx(1.0, abs=1e-12)
+    for population, ratio in zip(populations, exposure):
+        if population < min_cell:
+            assert ratio == pytest.approx(1.0, abs=1e-9)
+        else:
+            assert 1.0 / bound - 1e-9 <= ratio <= bound + 1e-9
+    # the actual sampling input must agree with the declared cell masses
+    assert float(sampler.weights.sum()) == pytest.approx(1.0, abs=1e-12)
+    assert float(sampler.weights.min()) > 0.0
+
+
+def test_alpha_zero_returns_the_natural_allocation_through_the_solve():
+    n_node, qed = synthetic({(15, 5): 5000, (23, 6): 60, (30, 7): 900})
+    diagnostics = BalancedSampler(n_node, qed, batch_size=8, seed=13,
+                                  alpha=0.0, min_cell_count=50).report()["weighting"]
+    assert all(value == pytest.approx(1.0, abs=1e-9)
+               for value in diagnostics["exposure_ratio_by_cell"])
+    assert diagnostics["natural_cell_probability"] == pytest.approx(
+        diagnostics["final_cell_probability"], abs=1e-12)
+
+
+def test_an_all_tiny_distribution_falls_back_to_natural():
+    n_node, qed = synthetic({(15, 5): 10, (23, 6): 8})
+    diagnostics = BalancedSampler(n_node, qed, batch_size=4, seed=14, alpha=1.0,
+                                  min_cell_count=50).report()["weighting"]
+    assert diagnostics["solve"]["eligible_cells"] == 0
+    assert "only feasible allocation" in diagnostics["solve"]["note"]
+    assert all(value == pytest.approx(1.0, abs=1e-9)
+               for value in diagnostics["exposure_ratio_by_cell"])
 
 
 def test_balancing_raises_the_rare_cells_share():
@@ -376,6 +428,38 @@ def test_qed_labels_are_never_modified():
 
 
 def test_cell_index_bins_qed_and_keeps_n_exact():
+    """Regression: 0.60 / 0.1 is 5.999999999999999, so plain floor filed it as bin 5."""
     counts, buckets = cell_index([15, 23, 30], [0.41, 0.60, 0.79], qed_bin_width=0.1)
     assert list(counts) == [15, 23, 30]
     assert list(buckets) == [4, 6, 7]
+
+
+def test_every_bin_boundary_lands_in_the_higher_bin():
+    """Bins are left-closed, right-open, so a boundary belongs to the bin above."""
+    values = [round(0.1 * k, 10) for k in range(10)]
+    _, buckets = cell_index([15] * 10, values, qed_bin_width=0.1)
+    assert list(buckets) == list(range(10))
+
+
+def test_values_just_below_and_just_above_a_boundary_separate():
+    _, below = cell_index([15] * 3, [0.0999, 0.3999, 0.5999], qed_bin_width=0.1)
+    _, above = cell_index([15] * 3, [0.1001, 0.4001, 0.6001], qed_bin_width=0.1)
+    assert list(below) == [0, 3, 5]
+    assert list(above) == [1, 4, 6]
+
+
+def test_the_qed_endpoints_are_handled_explicitly():
+    _, buckets = cell_index([15, 15], [0.0, 1.0], qed_bin_width=0.1)
+    assert list(buckets) == [0, 10]
+
+
+def test_the_tolerance_does_not_move_values_clearly_inside_a_bin():
+    """A broad epsilon would snap these; 1e-9 must not."""
+    _, buckets = cell_index([15] * 4, [0.4000001, 0.5999999, 0.300001, 0.899999],
+                            qed_bin_width=0.1)
+    assert list(buckets) == [4, 5, 3, 8]
+
+
+def test_a_finer_bin_width_is_also_exact_at_boundaries():
+    _, buckets = cell_index([15] * 4, [0.05, 0.15, 0.45, 0.70], qed_bin_width=0.05)
+    assert list(buckets) == [1, 3, 9, 14]

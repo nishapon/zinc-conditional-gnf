@@ -202,8 +202,10 @@ class CoupledNodePrior(nn.Module):
         return cls(base, init_rho=init_rho, learnable=learnable)
 
     def summary(self) -> dict[str, Any]:
+        # detach before any float() conversion so a diagnostic never
+        # touches the autograd graph
         with torch.no_grad():
-            rho = self.rho()
+            rho = self.rho().detach()
         return {
             "rho_max": RHO_MAX,
             "init_rho": float(self.init_rho),

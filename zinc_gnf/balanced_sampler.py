@@ -44,10 +44,30 @@ covering their region. `exposure_ratio_by_cell` and
 `max_exposure_ratio_among_tiny_cells` are both returned so this is verified against the
 realised numbers instead of inferred from the construction.
 
-EXPOSURE CLIP. `e_c` is clipped to `[1/max_exposure_ratio, max_exposure_ratio]` and the
-masses renormalised. Without it the rarest eligible cell in ZINC250K sits orders of
-magnitude below the mode and a handful of molecules would be drawn thousands of times per
-epoch. Clipping only ever pulls ratios toward 1, so it cannot create a new outlier.
+EXPOSURE BOUNDS ARE SOLVED FOR, NOT CLIPPED AFTERWARDS
+-----------------------------------------------------
+An earlier version clipped the exposure ratios and then renormalised the whole vector to
+sum to one. That does not work: the renormalisation scales every cell, so a clipped cell
+immediately leaves its bound again. On populations (5000, 60) with alpha = 1 and a bound
+of 5 it produced a realised ratio of 8.94.
+
+The masses are now the solution of a one-dimensional monotone problem with the clipping
+INSIDE it. Hold the tiny-cell mass fixed at natural, then find the scalar s with
+
+    sum_{c in E} clip( s * t_c,  L * p_c,  U * p_c )  =  S_E,
+    t_c = n_c^(1 - alpha),   L = 1 / max_exposure_ratio,   U = max_exposure_ratio
+
+where S_E is the mass left over for the eligible cells. The left side is continuous and
+non-decreasing in s, equals `L * S_E` at s = 0 and saturates at `U * S_E`, and since
+L <= 1 <= U the target S_E is bracketed, so a solution exists and bisection finds it.
+Setting q_c = p_c is itself feasible, which is why the natural allocation is always
+available when the bounds include 1 -- in particular at alpha = 0 the solve returns the
+natural probabilities exactly.
+
+The result satisfies all three requirements simultaneously: the masses sum to one, tiny
+cells keep their natural probability, and every eligible exposure ratio lies inside
+[L, U]. Verified on the failing case (realised maximum exactly 5.0), on a three-cell
+strong imbalance, with several tiny cells, with every cell tiny, and at alpha = 0.
 
 A cell with zero molecules has no index and can never be drawn, so the sampler cannot
 invent support for conditions the data does not contain.
@@ -72,13 +92,32 @@ DEFAULT_ALPHA = 0.5
 DEFAULT_MIN_CELL_COUNT = 50
 DEFAULT_MAX_EXPOSURE_RATIO = 20.0
 DEFAULT_QED_BIN_WIDTH = 0.1
+# Narrow on purpose: ~1e7 x double precision, ~1e-6 of a bucket. It absorbs the
+# representation error at a boundary without moving a value that is clearly inside a bin.
+BOUNDARY_TOLERANCE = 1e-9
 
 
-def cell_index(n_node, qed, *, qed_bin_width: float = DEFAULT_QED_BIN_WIDTH):
-    """(N, QED bucket) label for each molecule. N is exact; QED is binned."""
+def cell_index(n_node, qed, *, qed_bin_width: float = DEFAULT_QED_BIN_WIDTH,
+               boundary_tolerance: float = BOUNDARY_TOLERANCE):
+    """(N, QED bucket) label for each molecule. N is exact; QED is binned.
+
+    BINS ARE LEFT-CLOSED, RIGHT-OPEN: bucket k is [k*w, (k+1)*w), so a value sitting
+    exactly on a boundary belongs to the HIGHER bucket. QED = 1.0 therefore lands in
+    bucket 1/w, which is its own bucket, and QED = 0.0 lands in bucket 0.
+
+    `floor(q / w)` alone is wrong in floating point: 0.60 / 0.1 evaluates to
+    5.999999999999999, so floor gives 5 and a molecule at the 0.6 boundary is filed with
+    the 0.5-0.6 bucket. The fix snaps q / w to an integer only when it is within
+    `boundary_tolerance` of one. That tolerance is 1e-9 -- about 1e7 times double
+    precision, so it absorbs the representation error, and about 1e-6 of a bucket, so it
+    cannot move a value that is clearly inside one. A broader epsilon would.
+    """
     counts = np.asarray(n_node, dtype=np.int64)
     values = np.asarray(qed, dtype=np.float64)
-    buckets = np.floor(values / float(qed_bin_width)).astype(np.int64)
+    scaled = values / float(qed_bin_width)
+    nearest = np.round(scaled)
+    on_boundary = np.abs(scaled - nearest) <= float(boundary_tolerance)
+    buckets = np.where(on_boundary, nearest, np.floor(scaled)).astype(np.int64)
     return counts, buckets
 
 
@@ -160,15 +199,8 @@ class BalancedSampler:
         else:
             mass = natural.copy()
 
-        exposure = np.divide(mass, natural, out=np.ones_like(mass),
-                             where=natural > 0)            # e_c
-        tiny_exposure_before_clip = (float(exposure[tiny].max()) if tiny.any()
-                                     else None)
-        # clipping only pulls ratios toward 1, so it cannot create a new outlier
-        clipped = np.clip(exposure, 1.0 / self.max_exposure_ratio,
-                          self.max_exposure_ratio)
-        mass = natural * clipped
-        mass = mass / mass.sum()
+        bounds = (1.0 / self.max_exposure_ratio, self.max_exposure_ratio)
+        mass, solve = self._solve_eligible_mass(natural, populations, tiny, bounds)
         exposure = np.divide(mass, natural, out=np.ones_like(mass),
                              where=natural > 0)
 
@@ -187,18 +219,68 @@ class BalancedSampler:
             "natural_cell_probability": [float(v) for v in natural],
             "final_cell_probability": [float(v) for v in mass],
             "exposure_ratio_by_cell": [float(v) for v in exposure],
-            "max_exposure_ratio_among_tiny_cells_before_clip":
-                tiny_exposure_before_clip,
             "max_exposure_ratio_among_tiny_cells": (
                 float(exposure[tiny].max()) if tiny.any() else None),
+            "min_exposure_ratio_among_tiny_cells": (
+                float(exposure[tiny].min()) if tiny.any() else None),
+            "solve": solve,
             "max_exposure_ratio_realised": float(exposure.max()),
             "min_exposure_ratio_realised": float(exposure.min()),
             "effective_sample_size": effective,
             "effective_sample_fraction": effective / max(1, self.size),
             "note": ("exposure_ratio is q_c / p_c, how many times more often a cell is "
-                     "seen than under natural sampling. Tiny cells are 1.0 before "
-                     "clipping by construction and the realised value is reported so "
-                     "that is checked, not assumed. effective_sample_size is Kish's."),
+                     "seen than under natural sampling. Tiny cells are exactly 1.0, and "
+                     "eligible cells lie inside [1/max_exposure_ratio, "
+                     "max_exposure_ratio] because the bound is enforced inside the "
+                     "solve rather than by clipping and renormalising. "
+                     "effective_sample_size is Kish's."),
+        }
+
+    def _solve_eligible_mass(self, natural, populations, tiny, bounds):
+        """Bisect for the scale `s` that makes the bounded eligible masses fill S_E.
+
+        f(s) = sum_E clip(s * t_c, L p_c, U p_c) is continuous and non-decreasing, with
+        f(0) = L * S_E and f(inf) = U * S_E. Because L <= 1 <= U the target S_E is
+        bracketed, so a solution exists; q_c = p_c is itself feasible, which is why
+        alpha = 0 returns the natural probabilities exactly.
+        """
+        low_ratio, high_ratio = bounds
+        mass = np.zeros_like(natural)
+        mass[tiny] = natural[tiny]
+        eligible = ~tiny
+        remaining = float(max(0.0, 1.0 - float(mass[tiny].sum())))
+        if not eligible.any():
+            total = float(mass.sum())
+            return (mass / total if total > 0 else natural.copy()), {
+                "eligible_cells": 0, "scale": None, "iterations": 0, "residual": 0.0,
+                "note": ("every cell is below min_cell_count, so the natural "
+                         "probabilities are the only feasible allocation"),
+            }
+        shape = populations[eligible] ** (1.0 - self.alpha)
+        floor = low_ratio * natural[eligible]
+        ceiling = high_ratio * natural[eligible]
+
+        def filled(scale):
+            return float(np.clip(scale * shape, floor, ceiling).sum())
+
+        low, high = 0.0, float((ceiling / np.maximum(shape, 1e-300)).max()) * 1.000001
+        iterations = 0
+        for iterations in range(1, 201):
+            middle = 0.5 * (low + high)
+            if filled(middle) < remaining:
+                low = middle
+            else:
+                high = middle
+        scale = 0.5 * (low + high)
+        mass[eligible] = np.clip(scale * shape, floor, ceiling)
+        return mass, {
+            "eligible_cells": int(eligible.sum()),
+            "scale": float(scale),
+            "iterations": iterations,
+            "residual": float(abs(mass.sum() - 1.0)),
+            "note": ("bisection on a monotone bounded allocation; the clip is inside "
+                     "the solve, so the bounds hold in the final normalised masses "
+                     "rather than being undone by a global renormalisation"),
         }
 
     def _draw(self, epoch: int) -> np.ndarray:
@@ -242,6 +324,7 @@ __all__ = [
     "DEFAULT_ALPHA",
     "DEFAULT_MAX_EXPOSURE_RATIO",
     "DEFAULT_MIN_CELL_COUNT",
+    "BOUNDARY_TOLERANCE",
     "DEFAULT_QED_BIN_WIDTH",
     "BalancedSampler",
     "cell_index",
