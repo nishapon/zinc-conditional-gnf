@@ -55,6 +55,7 @@ class Cell:
     heavy_atoms: int | None
     aromatic_rings: int | None
     status: str = "ok"            # ok | invalid | undrawable
+    stored_mismatch: dict[str, Any] | None = None
 
     def legend(self) -> list[str]:
         """Two short lines. Every quantity the reviewer needs is on the image."""
@@ -84,19 +85,65 @@ def select_noise_ids(noise_ids: Sequence[Any], count: int) -> list[Any]:
 
 
 def cell_from_record(record: dict[str, Any], *, model: str, decoder: str,
-                     requested_qed: float) -> Cell:
-    """Build a Cell from one decoder's entry, marking failure explicitly."""
-    entry = (record.get(decoder) or {}) if decoder in record else record
+                     requested_qed: float, recompute: bool = True) -> Cell:
+    """Build a Cell from one decoder's entry, marking failure explicitly.
+
+    TWO FIXES HERE, KEPT APART BECAUSE THEY ARE DIFFERENT BUGS.
+
+    (a) NO SILENT FALLBACK. A missing decoder key used to fall back to treating the whole
+        record as the entry, so a mistyped decoder name rendered plausible garbage. It
+        now raises.
+
+    (b) DESCRIPTORS ARE RECOMPUTED FROM THE MOLECULE THAT IS ACTUALLY DRAWN. The stored
+        fields may have been written by a different code path, a different decoder, or an
+        earlier definition, so a label taken from the record is not guaranteed to
+        describe the depicted structure. With `recompute=True` the QED, heavy-atom count
+        and aromatic-ring count come from parsing the same SMILES the renderer draws.
+        This is NOT advanced as an explanation of the project's aromaticity gap -- that
+        gap is a property of the generated molecules, not of the labelling, and
+        `stored_mismatch` is reported so any disagreement is visible rather than assumed
+        away.
+    """
+    if decoder not in record:
+        raise KeyError(
+            f"record has no {decoder!r} entry; available: "
+            f"{sorted(k for k, v in record.items() if isinstance(v, dict))}")
+    entry = record.get(decoder) or {}
     smiles = entry.get("smiles")
     valid = bool(entry.get("valid")) and bool(smiles)
+    qed = entry.get("qed")
+    atoms = entry.get("heavy_atoms")
+    rings = entry.get("aromatic_rings")
+    mismatch = None
+    if valid and recompute:
+        fresh = descriptors_from_smiles(str(smiles))
+        if fresh is None:
+            return Cell(smiles=str(smiles), model=model, decoder=decoder,
+                        requested_qed=float(requested_qed), actual_qed=None,
+                        heavy_atoms=None, aromatic_rings=None, status="undrawable")
+        if qed is not None and abs(float(qed) - fresh["qed"]) > 1e-4:
+            mismatch = {"stored_qed": float(qed), "recomputed_qed": fresh["qed"]}
+        qed, atoms, rings = fresh["qed"], fresh["heavy_atoms"], fresh["aromatic_rings"]
     return Cell(
         smiles=smiles if valid else None,
         model=model, decoder=decoder, requested_qed=float(requested_qed),
-        actual_qed=entry.get("qed"),
-        heavy_atoms=entry.get("heavy_atoms"),
-        aromatic_rings=entry.get("aromatic_rings"),
-        status="ok" if valid else "invalid",
+        actual_qed=qed, heavy_atoms=atoms, aromatic_rings=rings,
+        status="ok" if valid else "invalid", stored_mismatch=mismatch,
     )
+
+
+def descriptors_from_smiles(smiles: str) -> dict[str, Any] | None:
+    """QED, heavy atoms and aromatic rings of the molecule the renderer will draw."""
+    from rdkit import Chem, rdBase
+    from rdkit.Chem import QED, rdMolDescriptors
+
+    with rdBase.BlockLogs():
+        molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        return None
+    return {"qed": float(QED.qed(molecule)),
+            "heavy_atoms": int(molecule.GetNumHeavyAtoms()),
+            "aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(molecule))}
 
 
 # ------------------------------------------------------------------- rendering ---
@@ -286,6 +333,7 @@ __all__ = [
     "best_of_k_gallery",
     "cell_from_record",
     "comparison_grid",
+    "descriptors_from_smiles",
     "render_grid",
     "select_noise_ids",
 ]

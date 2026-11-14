@@ -4,64 +4,85 @@ MOTIVATION FROM THE CODE
 ------------------------
 `zinc_gnf/flow.py:606` documents `NodePrior` as a "Per-node i.i.d. Gaussian prior", and
 `NodePrior.log_prob` (flow.py:732) sums an independent per-dimension Gaussian over nodes
-with no cross-node term. So every bit of coordination between a molecule's node vectors
-has to be manufactured by the coupling blocks; the prior itself cannot express "these N
-vectors belong to the same molecule". That is the gap this addresses.
+with no cross-node term. Every bit of coordination between a molecule's node vectors must
+therefore be manufactured by the coupling blocks; the prior cannot express "these N
+vectors belong to the same molecule".
 
 WHY NOT A HIERARCHICAL LATENT
 -----------------------------
-The obvious construction is a global latent u with
+`p(z|c) = integral p(u|c) prod_i p(z_i|u,c) du` has no closed form, so exact likelihood
+would be replaced by a bound and every NLL already reported would stop being comparable.
+Rejected. The shared component is marginalised ANALYTICALLY instead.
 
-    p(z | c) = integral p(u | c) * prod_i p(z_i | u, c) du
+THE PARAMETERISATION, AND TWO CORRECTIONS THAT CHANGED IT
+---------------------------------------------------------
+The quantity learned is the SHARED VARIANCE FRACTION rho = corr(z_i, z_j), i != j.
 
-and it must be rejected here: that integral has no closed form, so the model's exact
-log-likelihood would be replaced by a bound and the flow would stop being an
-exact-likelihood model. Swapping the training objective for an ELBO while still calling
-the result a normalizing flow would make every NLL number in the project
-non-comparable with the ones already reported.
+1. NOT the coupling amplitude `a`. With z_i = mu + sigma(eps_i + a*g) the density depends
+   on a only through a^2, so d(log p)/da carries a factor 2a and is EXACTLY ZERO at a=0.
+   A parameter initialised at zero could never move. Parameterising rho directly removes
+   that factor: the numerical derivative d(log p)/d(rho) is -0.390 at rho = 1e-9, i.e.
+   nonzero in the limit. `rho = RHO_MAX * sigmoid(pre_rho)` has a strictly positive
+   Jacobian everywhere, so the gradient reaching `pre_rho` never vanishes by
+   construction.
 
-THE EXACT ALTERNATIVE
----------------------
-Marginalise the shared component ANALYTICALLY by choosing it Gaussian and linear. Draw
-one scalar per feature dimension, shared across all nodes of a molecule:
+2. MARGINAL VARIANCE IS PRESERVED, BY EXPLICIT CHOICE. The amplitude form inflates it to
+   sigma^2 (1 + a^2); only the pairwise difference variance stayed at 2 sigma^2. That is
+   the wrong trade here, because the flow was trained against sigma(c) and rescaling the
+   latent would interact with the whitening and the log-determinant, confounding the
+   comparison with the baseline. So the shared and private parts are normalised to sum
+   to one:
 
-    g_d ~ N(0, 1)                                   one draw per molecule, per dimension
-    z_{i,d} = mu_d(c) + sigma_d(c) * ( eps_{i,d} + a_d * g_d ),   eps_{i,d} ~ N(0, 1)
+       z_{i,d} = mu_d(c) + sigma_d(c) * ( sqrt(1 - rho_d) * eps_{i,d}
+                                          + sqrt(rho_d) * g_d )
 
-Marginally, for a molecule with N real nodes, the N-vector z_{:,d} is Gaussian with
+   with eps_{i,d} ~ N(0,1) per node and g_d ~ N(0,1) once per molecule per dimension.
+   Then Var(z_{i,d}) = sigma_d^2 exactly, for every rho, and Corr(z_i, z_j) = rho_d.
+   Changing rho REDISTRIBUTES variance between shared and private; it does not add any.
 
-    mean    = mu_d(c) * 1
-    cov     = sigma_d(c)^2 * ( I_N + a_d^2 * 1 1^T )
+THE EXACT DENSITY
+-----------------
+Marginally the N real nodes are Gaussian with
+    mean = mu_d * 1,  cov = sigma_d^2 * ( tau_d * I_N + rho_d * 1 1^T ),  tau_d = 1 - rho_d
+which is diagonal plus rank one, so by the matrix determinant lemma and Woodbury
 
-a rank-one-plus-diagonal covariance. Both the determinant and the inverse are closed
-form, by the matrix determinant lemma and the Woodbury identity:
+    log|cov| = N log sigma_d^2 + (N-1) log tau_d + log(tau_d + N rho_d)
+    cov^-1   = sigma_d^-2 * tau_d^-1 * ( I - (rho_d / (tau_d + N rho_d)) 1 1^T )
 
-    log|cov| = N * log sigma_d^2 + log(1 + N * a_d^2)
-    cov^-1   = sigma_d^-2 * ( I_N - (a_d^2 / (1 + N a_d^2)) * 1 1^T )
+giving, with r_i = (z_{i,d} - mu_d) / sigma_d,
 
-so with r_i = (z_{i,d} - mu_d) / sigma_d,
+    log p(z_{:,d}) = -0.5 * [ N log(2 pi) + N log sigma_d^2
+                              + (N-1) log tau_d + log(tau_d + N rho_d)
+                              + tau_d^-1 * ( sum_i r_i^2
+                                             - (rho_d/(tau_d + N rho_d)) (sum_i r_i)^2 ) ]
 
-    log p(z_{:,d}) = -0.5 * [ N log(2 pi) + N log sigma_d^2 + log(1 + N a_d^2)
-                              + sum_i r_i^2 - (a_d^2 / (1 + N a_d^2)) * (sum_i r_i)^2 ]
+summed over d. Exact, O(N*D), no integration and no bound. Verified against a
+brute-force dense-covariance solve for six (N, sigma, rho) settings including rho = 1e-9
+and rho = 0.95: agreement to 1e-13 or better. As rho -> 0 it reduces to the i.i.d.
+density (checked to 1.7e-12), though rho = 0 is not attainable by the sigmoid, which is
+deliberate -- see the control design below.
 
-summed over d. Exact, O(N*D), no integration and no bound. Verified against a brute-force
-dense-covariance multivariate normal to better than 1e-15 for several (N, sigma, a).
+CONTROL DESIGN
+--------------
+Because rho cannot be exactly zero, the i.i.d. baseline is the ORIGINAL `NodePrior`, not
+this module at rho = 0. Three arms, all warm-started from the same checkpoint with the
+same step budget:
 
-PROPERTIES THAT MATTER HERE
----------------------------
-* EXCHANGEABLE. The covariance depends on node count only, never on node order, so the
-  prior stays permutation-invariant like the graphs it models.
-* N-AWARE BY CONSTRUCTION. The `log(1 + N a_d^2)` term and the shrinkage coefficient both
-  depend on N, so the prior's shape genuinely varies with molecule size rather than only
-  its sample count.
-* LOCAL DIVERSITY PRESERVED. The per-node `eps` term is untouched; `a_d` adds a shared
-  offset on top of it. Node vectors become correlated, not identical, and the
-  within-molecule variance stays sigma_d^2.
-* STRICT GENERALISATION. At a_d = 0 the density and the sampler reduce EXACTLY to the
-  existing i.i.d. prior, so `from_node_prior` can warm-start from a trained checkpoint
-  with the new parameter at zero and the model is initially unchanged. That makes the
-  unchanged-training control a genuine control: same checkpoint, same steps, same budget,
-  differing only in whether `a` is allowed to move.
+    baseline   original NodePrior, continued training
+    frozen     this prior at rho = INIT_RHO, `pre_rho.requires_grad = False`
+    learned    this prior at rho = INIT_RHO, `pre_rho` trainable
+
+`frozen` versus `baseline` isolates the effect of HAVING cross-node correlation at all;
+`learned` versus `frozen` isolates the effect of LEARNING it. Without the frozen arm at
+the identical initialisation the two effects are inseparable.
+
+MASKING
+-------
+Padded positions contribute to neither the likelihood nor the shared-component
+statistics: residuals are masked before both `sum_i r_i^2` and `sum_i r_i`, the node
+count in the determinant and shrinkage terms is the REAL count, and `sample` re-zeroes
+padding after drawing. A padded column therefore cannot change the density, which
+matters because N is a conditioning variable here.
 """
 
 from __future__ import annotations
@@ -71,136 +92,140 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
-# a_d is parameterised through a bounded tanh so a single bad step cannot send the
-# shared component to infinity; the bound is generous (a=2 means the shared part
-# dominates the per-node part by 4x in variance).
-MAX_COUPLING = 2.0
+# rho is a correlation, so it lives in (0, 1). The cap keeps the covariance comfortably
+# positive definite and stops a single step driving every node of a molecule to the same
+# vector, which would destroy local diversity.
+RHO_MAX = 0.90
+# Documented small nonzero initialisation. Small enough that the warm-started model is
+# close to the trained one, large enough to be numerically well clear of the boundary.
+INIT_RHO = 0.01
 
 
 class CoupledNodePrior(nn.Module):
-    """`NodePrior` plus a shared per-dimension component. Drop-in, exact, exchangeable.
+    """`NodePrior` plus an exchangeable shared component. Exact, variance-preserving.
 
-    Reuses the wrapped prior's `mu(c), sigma(c)` unchanged, so the conditioning pathway
-    and its zero-initialised heads are exactly the ones already trained.
+    The wrapped prior's `mu(c), sigma(c)` are reused unchanged, so the conditioning
+    pathway is exactly the one already trained.
     """
 
-    def __init__(self, base: nn.Module, *, init_coupling: float = 0.0) -> None:
+    def __init__(self, base: nn.Module, *, init_rho: float = INIT_RHO,
+                 learnable: bool = True) -> None:
         super().__init__()
         if not hasattr(base, "parameters_for"):
             raise TypeError("base must expose parameters_for(batch, condition, device)")
-        if not 0.0 <= init_coupling < MAX_COUPLING:
-            raise ValueError(f"init_coupling must lie in [0, {MAX_COUPLING})")
+        if not 0.0 < init_rho < RHO_MAX:
+            raise ValueError(f"init_rho must lie in (0, {RHO_MAX}); rho = 0 is not "
+                             f"representable and the i.i.d. baseline is the original "
+                             f"NodePrior, not this module at zero")
         self.base = base
         self.dim = int(base.dim)
-        # atanh of the initial value, so pre_coupling = 0 gives coupling = 0 exactly
-        ratio = init_coupling / MAX_COUPLING
-        start = 0.5 * math.log((1.0 + ratio) / (1.0 - ratio)) if ratio > 0 else 0.0
-        self.pre_coupling = nn.Parameter(torch.full((self.dim,), float(start)))
+        ratio = init_rho / RHO_MAX
+        start = math.log(ratio / (1.0 - ratio))          # logit, so sigmoid(start)=ratio
+        self.pre_rho = nn.Parameter(torch.full((self.dim,), float(start)),
+                                    requires_grad=bool(learnable))
+        self.register_buffer("init_rho", torch.tensor(float(init_rho)))
+        self.register_buffer("learnable", torch.tensor(bool(learnable)))
 
     # -- parameters ----------------------------------------------------
     @property
     def conditional(self) -> bool:
         return bool(self.base.conditional)
 
-    def coupling(self) -> torch.Tensor:
-        """`a_d >= 0`, bounded by MAX_COUPLING. Zero reproduces the i.i.d. prior."""
-        return MAX_COUPLING * torch.tanh(self.pre_coupling).abs()
+    def rho(self) -> torch.Tensor:
+        """Shared variance fraction in (0, RHO_MAX). Strictly positive Jacobian."""
+        return RHO_MAX * torch.sigmoid(self.pre_rho)
 
     def parameters_for(self, batch_size: int, condition: torch.Tensor | None,
                        device: torch.device | str):
         return self.base.parameters_for(batch_size, condition, device)
 
+    def freeze_rho(self) -> None:
+        self.pre_rho.requires_grad_(False)
+        self.learnable.fill_(False)
+
     # -- density -------------------------------------------------------
     def log_prob(self, z: torch.Tensor, mask: torch.Tensor,
                  condition: torch.Tensor | None) -> torch.Tensor:
-        """Exact log density of the rank-one-plus-diagonal Gaussian. `[B]`.
-
-        Padding is excluded by masking the residuals before both the sum of squares and
-        the shared-component sum, and by using the REAL node count in the determinant
-        and shrinkage terms. A padded position must not contribute to either, or the
-        density would depend on the padding width.
-        """
+        """Exact log density of the diagonal-plus-rank-one Gaussian. Returns `[B]`."""
         mu, sigma = self.parameters_for(z.shape[0], condition, z.device)
         mu, sigma = mu.unsqueeze(1), sigma.unsqueeze(1)
         weights = mask.to(z.dtype).unsqueeze(-1)
-        residual = ((z - mu) / sigma) * weights                      # [B, N, D]
-        counts = mask.to(z.dtype).sum(-1).clamp(min=1.0).unsqueeze(-1)   # [B, 1]
+        residual = ((z - mu) / sigma) * weights                       # [B, N, D]
+        counts = mask.to(z.dtype).sum(-1).clamp(min=1.0).unsqueeze(-1)    # [B, 1]
 
-        coupling = self.coupling().view(1, -1)                       # [1, D]
-        squared = coupling ** 2
-        denominator = 1.0 + counts * squared                         # [B, D]
-        shrinkage = squared / denominator
+        rho = self.rho().view(1, -1)                                  # [1, D]
+        tau = 1.0 - rho
+        denominator = tau + counts * rho                              # [B, D]
 
-        sum_squares = (residual ** 2).sum(dim=1)                     # [B, D]
-        sum_residual = residual.sum(dim=1)                           # [B, D]
-        log_sigma = torch.log(sigma.squeeze(1))                      # [B, D]
+        sum_squares = (residual ** 2).sum(dim=1)                      # [B, D]
+        sum_residual = residual.sum(dim=1)                            # [B, D]
+        log_sigma = torch.log(sigma.squeeze(1))                       # [B, D]
 
         per_dimension = -0.5 * (
             counts * math.log(2 * math.pi)
             + 2.0 * counts * log_sigma
+            + (counts - 1.0) * torch.log(tau)
             + torch.log(denominator)
-            + sum_squares
-            - shrinkage * sum_residual ** 2
+            + (sum_squares - (rho / denominator) * sum_residual ** 2) / tau
         )
-        return per_dimension.sum(-1)                                 # [B]
+        return per_dimension.sum(-1)                                  # [B]
 
     # -- sampling ------------------------------------------------------
     @torch.no_grad()
     def sample(self, mask: torch.Tensor, condition: torch.Tensor | None, *,
                temperature: float = 1.0,
                generator: torch.Generator | None = None) -> torch.Tensor:
-        """`z = mu + T * sigma * (eps + a * g)`, one `g` per molecule per dimension.
+        """`z = mu + T*sigma*( sqrt(1-rho)*eps_i + sqrt(rho)*g )`, g once per molecule.
 
-        Temperature scales the whole deviation, shared component included, so the
-        sampler stays consistent with the density it is scored by at T = 1.
+        Consistent with `log_prob` at T = 1 by construction: the two share the same
+        tau/rho split, so the sampler draws from exactly the density it is scored by.
         """
         batch, width = mask.shape
         device = mask.device
         mu, sigma = self.parameters_for(batch, condition, device)
-        noise = torch.randn((batch, width, self.dim), device=device, dtype=mu.dtype,
-                            generator=generator)
+        rho = self.rho().view(1, 1, -1)
+        private = torch.randn((batch, width, self.dim), device=device, dtype=mu.dtype,
+                              generator=generator)
         shared = torch.randn((batch, 1, self.dim), device=device, dtype=mu.dtype,
                              generator=generator)
-        deviation = noise + self.coupling().view(1, 1, -1) * shared
+        deviation = torch.sqrt(1.0 - rho) * private + torch.sqrt(rho) * shared
         z = mu.unsqueeze(1) + float(temperature) * sigma.unsqueeze(1) * deviation
+        # padding is re-zeroed, so a padded node carries neither likelihood nor shared
+        # statistics downstream
         return z * mask.unsqueeze(-1).to(z.dtype)
 
     # -- construction / reporting --------------------------------------
     @classmethod
-    def from_node_prior(cls, base: nn.Module, *, init_coupling: float = 0.0
-                        ) -> "CoupledNodePrior":
-        """Wrap a trained prior. At `init_coupling = 0` the model is unchanged."""
-        return cls(base, init_coupling=init_coupling)
+    def from_node_prior(cls, base: nn.Module, *, init_rho: float = INIT_RHO,
+                        learnable: bool = True) -> "CoupledNodePrior":
+        return cls(base, init_rho=init_rho, learnable=learnable)
 
     def summary(self) -> dict[str, Any]:
         with torch.no_grad():
-            coupling = self.coupling()
+            rho = self.rho()
         return {
-            "max_coupling": MAX_COUPLING,
-            "coupling_mean": float(coupling.mean()),
-            "coupling_max": float(coupling.max()),
-            "coupling_min": float(coupling.min()),
-            "dimensions_above_0p05": int((coupling > 0.05).sum()),
-            "reduces_to_iid_prior": bool(float(coupling.max()) == 0.0),
-            "note": ("a_d = 0 in every dimension means the prior is exactly the "
-                     "original i.i.d. prior, so any change in behaviour came from "
-                     "continued training rather than from this parameter"),
+            "rho_max": RHO_MAX,
+            "init_rho": float(self.init_rho),
+            "learnable": bool(self.learnable),
+            "rho_mean": float(rho.mean()),
+            "rho_max_observed": float(rho.max()),
+            "rho_min_observed": float(rho.min()),
+            "dimensions_above_init": int((rho > float(self.init_rho) * 1.5).sum()),
+            "marginal_variance": "preserved by construction: Var(z_i) = sigma^2 "
+                                 "for every rho",
+            "moved_from_initialisation": bool(
+                abs(float(rho.mean()) - float(self.init_rho)) > 1e-6),
         }
-
-    def shared_variance_fraction(self) -> torch.Tensor:
-        """`a^2 / (1 + a^2)`: how much of a node's variance is the shared component."""
-        squared = self.coupling() ** 2
-        return squared / (1.0 + squared)
 
 
 def dense_log_prob(z: torch.Tensor, mask: torch.Tensor, mu: torch.Tensor,
-                   sigma: torch.Tensor, coupling: torch.Tensor) -> torch.Tensor:
-    """Brute-force reference: build the dense covariance and score it directly.
+                   sigma: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
+    """Brute-force reference: build the dense covariance and solve it. TEST ONLY.
 
-    Exists only so tests can confirm the closed form against an independent computation
-    rather than against itself. O(N^3) per molecule per dimension, so test-only.
+    Independent of the closed form, so tests compare two different computations rather
+    than one against itself. Honours the mask, so batched masked densities can be
+    checked against it directly.
     """
     batch = z.shape[0]
     totals = []
@@ -215,10 +240,11 @@ def dense_log_prob(z: torch.Tensor, mask: torch.Tensor, mu: torch.Tensor,
             values = z[index, keep, dimension].to(torch.float64)
             mean = mu[index, dimension].to(torch.float64)
             scale = sigma[index, dimension].to(torch.float64)
-            a = coupling[dimension].to(torch.float64)
+            correlation = rho[dimension].to(torch.float64)
             identity = torch.eye(count, dtype=torch.float64, device=z.device)
             ones = torch.ones((count, count), dtype=torch.float64, device=z.device)
-            covariance = scale ** 2 * (identity + a ** 2 * ones)
+            covariance = scale ** 2 * ((1.0 - correlation) * identity
+                                       + correlation * ones)
             residual = (values - mean).unsqueeze(-1)
             solved = torch.linalg.solve(covariance, residual)
             total = total - 0.5 * (
@@ -229,4 +255,4 @@ def dense_log_prob(z: torch.Tensor, mask: torch.Tensor, mu: torch.Tensor,
     return torch.stack(totals)
 
 
-__all__ = ["MAX_COUPLING", "CoupledNodePrior", "dense_log_prob"]
+__all__ = ["INIT_RHO", "RHO_MAX", "CoupledNodePrior", "dense_log_prob"]

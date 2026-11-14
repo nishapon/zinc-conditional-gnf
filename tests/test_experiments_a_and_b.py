@@ -28,7 +28,8 @@ from zinc_gnf.balanced_sampler import (  # noqa: E402
     joint_distribution,
 )
 from zinc_gnf.coupled_prior import (  # noqa: E402
-    MAX_COUPLING,
+    INIT_RHO,
+    RHO_MAX,
     CoupledNodePrior,
     dense_log_prob,
 )
@@ -37,9 +38,9 @@ from zinc_gnf.flow import NodePrior  # noqa: E402
 DIM = 4
 
 
-def prior(*, conditional=False, coupling=0.0):
+def prior(*, conditional=False, rho=INIT_RHO, learnable=True):
     base = NodePrior(DIM, condition_dim=8 if conditional else 0)
-    return CoupledNodePrior.from_node_prior(base, init_coupling=coupling)
+    return CoupledNodePrior.from_node_prior(base, init_rho=rho, learnable=learnable)
 
 
 def masks(counts, width=None):
@@ -51,157 +52,178 @@ def masks(counts, width=None):
 
 
 # ================================ B: exactness ===================================
-@pytest.mark.parametrize("coupling", [0.0, 0.25, 0.7, 1.3])
-def test_the_closed_form_density_matches_a_dense_covariance_solve(coupling):
-    """The claim the whole experiment rests on."""
-    model = prior(coupling=coupling)
+@pytest.mark.parametrize("rho", [1e-6, 0.01, 0.3, 0.85])
+def test_the_closed_form_density_matches_a_dense_covariance_solve(rho):
+    """The claim the whole experiment rests on, including masked batches."""
+    model = prior(rho=rho).double()
     mask = masks([5, 3, 7])
     torch.manual_seed(0)
-    z = torch.randn((3, 7, DIM), dtype=torch.float64)
-    model = model.double()
+    z = torch.randn((3, 7, DIM), dtype=torch.float64) * mask.unsqueeze(-1)
     mu, sigma = model.parameters_for(3, None, "cpu")
     closed = model.log_prob(z, mask, None)
-    brute = dense_log_prob(z, mask, mu, sigma, model.coupling())
+    brute = dense_log_prob(z, mask, mu, sigma, model.rho())
     assert torch.allclose(closed, brute, atol=1e-8), (closed, brute)
 
 
-def test_zero_coupling_reproduces_the_iid_prior_exactly():
-    """Required for the warm start and for the unchanged-training control to be fair."""
+def test_a_vanishing_rho_approaches_the_iid_density():
     base = NodePrior(DIM, condition_dim=0).double()
-    model = CoupledNodePrior.from_node_prior(base, init_coupling=0.0).double()
+    model = CoupledNodePrior.from_node_prior(base, init_rho=1e-8).double()
     mask = masks([6, 4])
     torch.manual_seed(1)
-    z = torch.randn((2, 6, DIM), dtype=torch.float64)
+    z = torch.randn((2, 6, DIM), dtype=torch.float64) * mask.unsqueeze(-1)
     assert torch.allclose(model.log_prob(z, mask, None),
-                          base.log_prob(z, mask, None), atol=1e-12)
-    assert model.summary()["reduces_to_iid_prior"] is True
+                          base.log_prob(z, mask, None), atol=1e-5)
 
 
-def test_the_density_ignores_the_padding_width():
-    """A padded column must not change the density, or N would be confounded."""
-    model = prior(coupling=0.6).double()
-    narrow_mask, wide_mask = masks([5], width=5), masks([5], width=11)
+def test_rho_zero_is_refused_because_the_baseline_is_the_original_prior():
+    base = NodePrior(DIM, condition_dim=0)
+    for bad in (0.0, -0.1, RHO_MAX, RHO_MAX + 1):
+        with pytest.raises(ValueError, match="init_rho"):
+            CoupledNodePrior.from_node_prior(base, init_rho=bad)
+
+
+def test_the_gradient_is_nonzero_at_the_initialisation():
+    """The bug this parameterisation fixes: d/da carries a factor 2a and dies at a=0."""
+    model = prior(rho=INIT_RHO)
+    mask = masks([5, 5])
     torch.manual_seed(2)
+    z = torch.randn((2, 5, DIM)) * mask.unsqueeze(-1)
+    model.log_prob(z, mask, None).sum().backward()
+    assert model.pre_rho.grad is not None
+    assert torch.isfinite(model.pre_rho.grad).all()
+    assert float(model.pre_rho.grad.abs().min()) > 0.0
+
+
+def test_rho_receives_gradient_from_correlated_data_and_rises():
+    """On data with a strong shared component the likelihood must push rho UP."""
+    model = prior(rho=INIT_RHO).double()
+    mask = masks([6] * 256)
+    generator = torch.Generator().manual_seed(3)
+    shared = torch.randn((256, 1, DIM), generator=generator, dtype=torch.float64)
+    private = torch.randn((256, 6, DIM), generator=generator, dtype=torch.float64)
+    z = (0.2 * private + 0.98 * shared) * mask.unsqueeze(-1)
+    before = float(model.rho().mean())
+    optimiser = torch.optim.Adam([model.pre_rho], lr=0.1)
+    for _ in range(40):
+        optimiser.zero_grad()
+        (-model.log_prob(z, mask, None).mean()).backward()
+        optimiser.step()
+    assert float(model.rho().mean()) > before
+    assert model.summary()["moved_from_initialisation"] is True
+
+
+def test_a_frozen_rho_does_not_move_under_the_same_data():
+    model = prior(rho=INIT_RHO, learnable=False).double()
+    assert model.pre_rho.requires_grad is False
+    mask = masks([6] * 64)
+    torch.manual_seed(4)
+    z = torch.randn((64, 6, DIM), dtype=torch.float64) * mask.unsqueeze(-1)
+    before = float(model.rho().mean())
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimiser = torch.optim.Adam(trainable or [torch.zeros(1, requires_grad=True)],
+                                 lr=0.1)
+    optimiser.zero_grad()
+    model.log_prob(z, mask, None).mean().backward()
+    optimiser.step()
+    assert float(model.rho().mean()) == pytest.approx(before)
+
+
+def test_the_new_parameter_is_registered_and_optimised_after_a_reload(tmp_path):
+    """It must reach the optimizer built from parameters() after checkpoint loading."""
+    model = prior(rho=0.05)
+    torch.save(model.state_dict(), tmp_path / "prior.pt")
+    fresh = prior(rho=INIT_RHO)
+    fresh.load_state_dict(torch.load(tmp_path / "prior.pt", weights_only=True))
+    assert float(fresh.rho().mean()) == pytest.approx(0.05, abs=1e-6)
+    names = [name for name, _ in fresh.named_parameters()]
+    assert "pre_rho" in names
+    optimiser = torch.optim.Adam(fresh.parameters(), lr=0.1)
+    tracked = {id(p) for group in optimiser.param_groups for p in group["params"]}
+    assert id(fresh.pre_rho) in tracked
+    mask = masks([5, 5])
+    torch.manual_seed(6)
+    z = torch.randn((2, 5, DIM)) * mask.unsqueeze(-1)
+    before = fresh.pre_rho.detach().clone()
+    optimiser.zero_grad()
+    (-fresh.log_prob(z, mask, None).mean()).backward()
+    optimiser.step()
+    assert not torch.allclose(before, fresh.pre_rho.detach())
+
+
+def test_padding_contributes_neither_likelihood_nor_shared_statistics():
+    model = prior(rho=0.4).double()
+    narrow_mask, wide_mask = masks([5], width=5), masks([5], width=11)
+    torch.manual_seed(7)
     core = torch.randn((1, 5, DIM), dtype=torch.float64)
-    narrow = torch.zeros((1, 5, DIM), dtype=torch.float64)
-    narrow[:, :5] = core
-    wide = torch.zeros((1, 11, DIM), dtype=torch.float64)
-    wide[:, :5] = core
-    wide[:, 5:] = 99.0                      # garbage in the padding
+    narrow = torch.zeros((1, 5, DIM), dtype=torch.float64); narrow[:, :5] = core
+    wide = torch.zeros((1, 11, DIM), dtype=torch.float64); wide[:, :5] = core
+    wide[:, 5:] = 99.0
     assert torch.allclose(model.log_prob(narrow, narrow_mask, None),
                           model.log_prob(wide, wide_mask, None), atol=1e-10)
 
 
 def test_the_density_is_exchangeable_over_nodes():
-    model = prior(coupling=0.8).double()
+    model = prior(rho=0.5).double()
     mask = masks([6])
-    torch.manual_seed(3)
+    torch.manual_seed(8)
     z = torch.randn((1, 6, DIM), dtype=torch.float64)
-    permuted = z[:, torch.randperm(6)]
     assert torch.allclose(model.log_prob(z, mask, None),
-                          model.log_prob(permuted, mask, None), atol=1e-10)
+                          model.log_prob(z[:, torch.randperm(6)], mask, None),
+                          atol=1e-10)
 
 
-def test_the_density_depends_on_the_node_count_not_only_the_sample_count():
-    """The N-dependent determinant term is what makes this prior size-aware."""
-    model = prior(coupling=0.9).double()
-    value = torch.full((1, 8, DIM), 0.4, dtype=torch.float64)
-    small = model.log_prob(value * masks([3], width=8).unsqueeze(-1),
-                           masks([3], width=8), None)
-    large = model.log_prob(value * masks([8], width=8).unsqueeze(-1),
-                           masks([8], width=8), None)
-    assert not torch.allclose(small, large)
-
-
-def test_the_density_normalises_by_monte_carlo_integration():
-    """An independent check that it is a density, not just a formula: sampling from the
-    stated generative process and scoring gives a mean log-prob matching the analytic
-    entropy of the same Gaussian."""
-    model = prior(coupling=0.5).double()
-    mask = masks([4] * 4096)
-    samples = model.sample(mask, None, temperature=1.0,
-                           generator=torch.Generator().manual_seed(5))
-    scored = model.log_prob(samples.double(), mask, None)
-    mu, sigma = model.parameters_for(1, None, "cpu")
-    coupling = model.coupling()
-    count = 4
-    entropy = 0.0
-    for dimension in range(DIM):
-        a2 = float(coupling[dimension]) ** 2
-        log_det = count * math.log(float(sigma[0, dimension]) ** 2) \
-            + math.log(1.0 + count * a2)
-        entropy += 0.5 * (count * math.log(2 * math.pi) + log_det + count)
-    assert float(scored.mean()) == pytest.approx(-entropy, rel=0.02)
-
-
-def test_sampling_induces_the_stated_cross_node_correlation():
-    """`a` must create correlation between nodes, not just extra variance."""
-    model = prior(coupling=1.0).double()
-    mask = masks([2] * 20000)
-    samples = model.sample(mask, None,
-                           generator=torch.Generator().manual_seed(7)).double()
-    first, second = samples[:, 0, 0], samples[:, 1, 0]
-    correlation = float(torch.corrcoef(torch.stack([first, second]))[0, 1])
-    a2 = float(model.coupling()[0]) ** 2
-    assert correlation == pytest.approx(a2 / (1.0 + a2), abs=0.03)
-
-
-def test_zero_coupling_leaves_nodes_uncorrelated():
-    model = prior(coupling=0.0).double()
-    mask = masks([2] * 20000)
-    samples = model.sample(mask, None,
-                           generator=torch.Generator().manual_seed(8)).double()
-    correlation = float(torch.corrcoef(
-        torch.stack([samples[:, 0, 0], samples[:, 1, 0]]))[0, 1])
-    assert abs(correlation) < 0.03
-
-
-def test_local_diversity_is_preserved():
-    """Per-node variance must stay sigma^2 * (1 + a^2), not collapse to a shared value."""
-    model = prior(coupling=0.8).double()
-    mask = masks([3] * 20000)
+def test_sampling_preserves_the_marginal_variance_and_induces_rho():
+    """The explicit choice: variance is REDISTRIBUTED, not added."""
+    model = prior(rho=0.4).double()
+    mask = masks([2] * 40000)
     samples = model.sample(mask, None,
                            generator=torch.Generator().manual_seed(9)).double()
-    within = (samples[:, 0, 0] - samples[:, 1, 0]).var()
     mu, sigma = model.parameters_for(1, None, "cpu")
-    assert float(within) == pytest.approx(2.0 * float(sigma[0, 0]) ** 2, rel=0.06)
+    scale = float(sigma[0, 0])
+    assert float(samples[:, 0, 0].var()) == pytest.approx(scale ** 2, rel=0.05)
+    correlation = float(torch.corrcoef(
+        torch.stack([samples[:, 0, 0], samples[:, 1, 0]]))[0, 1])
+    assert correlation == pytest.approx(0.4, abs=0.03)
 
 
-def test_the_coupling_is_bounded_and_non_negative():
-    model = prior(coupling=0.0)
+def test_sampling_respects_the_mask():
+    model = prior(rho=0.3)
+    mask = masks([3, 5], width=5)
+    samples = model.sample(mask, None,
+                           generator=torch.Generator().manual_seed(10))
+    assert torch.count_nonzero(samples[0, 3:]) == 0
+
+
+def test_rho_is_bounded():
+    model = prior(rho=0.5)
     with torch.no_grad():
-        model.pre_coupling.fill_(50.0)
-    assert float(model.coupling().max()) <= MAX_COUPLING
+        model.pre_rho.fill_(50.0)
+    assert float(model.rho().max()) <= RHO_MAX
     with torch.no_grad():
-        model.pre_coupling.fill_(-50.0)
-    assert float(model.coupling().min()) >= 0.0
-
-
-def test_an_out_of_range_initial_coupling_is_refused():
-    base = NodePrior(DIM, condition_dim=0)
-    for bad in (-0.1, MAX_COUPLING, MAX_COUPLING + 1):
-        with pytest.raises(ValueError):
-            CoupledNodePrior.from_node_prior(base, init_coupling=bad)
-
-
-def test_the_density_is_differentiable_in_the_coupling():
-    model = prior(coupling=0.3)
-    mask = masks([5, 5])
-    torch.manual_seed(11)
-    z = torch.randn((2, 5, DIM))
-    model.log_prob(z, mask, None).sum().backward()
-    assert model.pre_coupling.grad is not None
-    assert torch.isfinite(model.pre_coupling.grad).all()
-    assert float(model.pre_coupling.grad.abs().sum()) > 0.0
+        model.pre_rho.fill_(-50.0)
+    assert float(model.rho().min()) > 0.0
 
 
 def test_the_conditional_pathway_is_reused_unchanged():
-    model = prior(conditional=True, coupling=0.4)
+    model = prior(conditional=True, rho=0.2)
     assert model.conditional is True
     condition = torch.randn((3, 8))
     mu, sigma = model.parameters_for(3, condition, "cpu")
     base_mu, base_sigma = model.base.parameters_for(3, condition, "cpu")
     assert torch.allclose(mu, base_mu) and torch.allclose(sigma, base_sigma)
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================== A: balanced sampling =============================
@@ -232,26 +254,50 @@ def test_alpha_zero_reproduces_uniform_sampling():
     assert sampler.report()["reduces_to_uniform"] is True
     assert float(sampler.weights.max()) == pytest.approx(
         float(sampler.weights.min()), rel=1e-9)
+    exposure = sampler.report()["weighting"]["exposure_ratio_by_cell"]
+    assert all(value == pytest.approx(1.0, abs=1e-9) for value in exposure)
 
 
-def test_a_tiny_cell_is_not_upweighted():
-    """Upweighting three molecules memorises them; it does not cover their region."""
-    n_node, qed = synthetic({(15, 5): 2000, (30, 7): 4})
+def test_a_tiny_cell_has_exposure_ratio_one_before_clipping():
+    """Checked on the REALISED exposure ratio, not inferred from the construction."""
+    n_node, qed = synthetic({(15, 5): 2000, (23, 6): 600, (30, 7): 4})
     sampler = BalancedSampler(n_node, qed, batch_size=8, seed=2, alpha=1.0,
                               min_cell_count=50)
     diagnostics = sampler.report()["weighting"]
-    assert diagnostics["cells_held_at_natural_weight"] == 1
-    assert diagnostics["molecules_in_held_cells"] == 4
-    tiny = sampler.weights[n_node == 30]
-    big = sampler.weights[n_node == 15]
-    assert float(tiny.max()) <= float(big.max()) * 1.0001
+    assert diagnostics["cells_tiny_held_at_natural_mass"] == 1
+    assert diagnostics["molecules_in_tiny_cells"] == 4
+    assert diagnostics["max_exposure_ratio_among_tiny_cells_before_clip"] == \
+        pytest.approx(1.0, abs=1e-9)
+    assert diagnostics["max_exposure_ratio_among_tiny_cells"] <= 1.0 + 1e-9
 
 
-def test_the_weight_ratio_cap_binds():
+def test_the_report_gives_final_cell_probabilities_that_sum_to_one():
+    n_node, qed = synthetic({(15, 5): 900, (23, 6): 300, (30, 7): 100})
+    diagnostics = BalancedSampler(n_node, qed, batch_size=8, seed=3,
+                                  alpha=0.5).report()["weighting"]
+    assert sum(diagnostics["final_cell_probability"]) == pytest.approx(1.0, abs=1e-9)
+    assert sum(diagnostics["natural_cell_probability"]) == pytest.approx(1.0, abs=1e-9)
+    assert len(diagnostics["exposure_ratio_by_cell"]) == 3
+
+
+def test_a_rare_eligible_cell_is_the_one_that_gains_exposure():
+    n_node, qed = synthetic({(15, 5): 4000, (23, 6): 200})
+    diagnostics = BalancedSampler(n_node, qed, batch_size=8, seed=4, alpha=0.5,
+                                  min_cell_count=50).report()["weighting"]
+    natural = diagnostics["natural_cell_probability"]
+    exposure = diagnostics["exposure_ratio_by_cell"]
+    rare = natural.index(min(natural))
+    common = natural.index(max(natural))
+    assert exposure[rare] > 1.0 > exposure[common]
+
+
+def test_the_exposure_clip_binds():
     n_node, qed = synthetic({(15, 5): 5000, (23, 6): 60})
-    sampler = BalancedSampler(n_node, qed, batch_size=8, seed=3, alpha=1.0,
-                              min_cell_count=50, max_weight_ratio=5.0)
-    assert sampler.report()["weighting"]["realised_weight_ratio"] <= 5.0 + 1e-6
+    diagnostics = BalancedSampler(n_node, qed, batch_size=8, seed=3, alpha=1.0,
+                                  min_cell_count=50,
+                                  max_exposure_ratio=5.0).report()["weighting"]
+    assert diagnostics["max_exposure_ratio_realised"] <= 5.0 + 1e-6
+    assert diagnostics["min_exposure_ratio_realised"] >= 1.0 / 5.0 - 1e-6
 
 
 def test_balancing_raises_the_rare_cells_share():
@@ -303,7 +349,7 @@ def test_epochs_advance_and_differ():
 
 def test_invalid_configuration_is_refused():
     n_node, qed = synthetic({(15, 5): 100})
-    for kwargs in ({"alpha": 1.5}, {"alpha": -0.1}, {"max_weight_ratio": 0.5},
+    for kwargs in ({"alpha": 1.5}, {"alpha": -0.1}, {"max_exposure_ratio": 0.5},
                    {"min_cell_count": 0}):
         with pytest.raises(ValueError):
             BalancedSampler(n_node, qed, batch_size=4, seed=9, **kwargs)
@@ -318,6 +364,7 @@ def test_the_effective_sample_size_is_reported():
     diagnostics = sampler.report()["weighting"]
     assert 0.0 < diagnostics["effective_sample_fraction"] <= 1.0
     assert "Kish" in diagnostics["note"]
+    assert "per-CELL masses" in diagnostics["definition"]
 
 
 def test_qed_labels_are_never_modified():

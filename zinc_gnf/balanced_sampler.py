@@ -20,31 +20,39 @@ Does NOT change: the molecules themselves, their ACTUAL QED labels, the conditio
 vectors, or the architecture. This is not generated-sample relabeling -- every label
 stays the RDKit value computed in preprocessing from the stored graph.
 
-THE WEIGHTS, AND THE TWO GUARDS
--------------------------------
-For molecule i in cell c(i) with population n_{c(i)}:
+THE WEIGHTS ARE DEFINED PER CELL, THEN SPREAD UNIFORMLY INSIDE IT
+----------------------------------------------------------------
+The quantity being reweighted is the CELL probability mass, not an ad-hoc per-example
+factor. Within a cell every molecule is equally likely, so the per-example probability is
+just `q_c / n_c`. Writing it this way makes the guards checkable, which the earlier
+per-example factor did not.
 
-    w_i  proportional to  n_{c(i)}^(-alpha)
+With natural cell mass `p_c = n_c / M`:
 
-alpha = 0 reproduces the current uniform-over-molecules sampler exactly; alpha = 1 is
-full balance over populated cells. The default is deliberately partial.
+    eligible cells   (n_c >= min_cell_count):  q_c proportional to n_c^(1 - alpha)
+    tiny cells       (n_c <  min_cell_count):  q_c = p_c   EXACTLY
 
-Two guards, because naive inverse-frequency weighting on a long-tailed joint
-distribution is actively harmful here:
+The eligible masses are renormalised to fill whatever mass the tiny cells did not claim,
+so the vector sums to one. `alpha = 0` returns `q_c = p_c` for every cell, i.e. the
+current uniform-over-molecules sampler, bit for bit.
 
-  MINIMUM POPULATION. A cell with fewer than `min_cell_count` molecules is NOT upweighted
-  at all; it keeps its natural weight. Upweighting a cell of three molecules does not
-  teach the model that region, it teaches it those three molecules. This is also what
-  stops the sampler inventing support for conditions the data does not contain: a cell
-  with zero molecules has no index to draw and can never be sampled, by construction.
+The reported quantity is the EXPOSURE RATIO `e_c = q_c / p_c`: how many times more often
+a cell is seen than under natural sampling. By construction `e_c = 1` for every tiny
+cell BEFORE clipping, which is the property that matters -- a cell of four molecules is
+not upweighted at all, because upweighting four molecules memorises them rather than
+covering their region. `exposure_ratio_by_cell` and
+`max_exposure_ratio_among_tiny_cells` are both returned so this is verified against the
+realised numbers instead of inferred from the construction.
 
-  WEIGHT RATIO CAP. After weighting, the ratio between the largest and smallest
-  per-molecule weight is clipped to `max_weight_ratio`. Without it, the rarest eligible
-  cell in ZINC250K can be several orders of magnitude below the mode, and a single
-  molecule would be drawn thousands of times per epoch.
+EXPOSURE CLIP. `e_c` is clipped to `[1/max_exposure_ratio, max_exposure_ratio]` and the
+masses renormalised. Without it the rarest eligible cell in ZINC250K sits orders of
+magnitude below the mode and a handful of molecules would be drawn thousands of times per
+epoch. Clipping only ever pulls ratios toward 1, so it cannot create a new outlier.
 
-Both guards are reported in `BalancedSampler.report()` with the realised effective
-sample size, so the actual degree of rebalancing is measured rather than assumed.
+A cell with zero molecules has no index and can never be drawn, so the sampler cannot
+invent support for conditions the data does not contain.
+
+Kish's effective sample size is reported so the realised concentration is measured.
 
 RESUMABILITY
 ------------
@@ -62,7 +70,7 @@ import numpy as np
 
 DEFAULT_ALPHA = 0.5
 DEFAULT_MIN_CELL_COUNT = 50
-DEFAULT_MAX_WEIGHT_RATIO = 20.0
+DEFAULT_MAX_EXPOSURE_RATIO = 20.0
 DEFAULT_QED_BIN_WIDTH = 0.1
 
 
@@ -112,14 +120,14 @@ class BalancedSampler:
     def __init__(self, n_node, qed, *, batch_size: int, seed: int,
                  alpha: float = DEFAULT_ALPHA,
                  min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
-                 max_weight_ratio: float = DEFAULT_MAX_WEIGHT_RATIO,
+                 max_exposure_ratio: float = DEFAULT_MAX_EXPOSURE_RATIO,
                  qed_bin_width: float = DEFAULT_QED_BIN_WIDTH) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         if not 0.0 <= alpha <= 1.0:
             raise ValueError("alpha must lie in [0, 1]")
-        if max_weight_ratio < 1.0:
-            raise ValueError("max_weight_ratio must be >= 1")
+        if max_exposure_ratio < 1.0:
+            raise ValueError("max_exposure_ratio must be >= 1")
         if min_cell_count < 1:
             raise ValueError("min_cell_count must be >= 1")
         self.size = int(len(np.asarray(n_node)))
@@ -127,7 +135,7 @@ class BalancedSampler:
             raise ValueError("need at least batch_size molecules")
         self.batch_size, self.seed = int(batch_size), int(seed)
         self.alpha, self.min_cell_count = float(alpha), int(min_cell_count)
-        self.max_weight_ratio = float(max_weight_ratio)
+        self.max_exposure_ratio = float(max_exposure_ratio)
         self.distribution = joint_distribution(n_node, qed,
                                                qed_bin_width=qed_bin_width)
         self.weights, self.diagnostics = self._weights()
@@ -135,40 +143,62 @@ class BalancedSampler:
         self._order = self._draw(self.epoch)
 
     def _weights(self):
+        """Per-CELL masses, then uniform inside each cell. Returns per-example weights."""
         populations = np.asarray(self.distribution["cell_populations"],
                                  dtype=np.float64)
         assignment = self.distribution["assignment"]
-        # cells below the floor keep their NATURAL weight: upweighting a handful of
-        # molecules memorises them instead of covering their region
-        eligible = populations >= self.min_cell_count
-        factor = np.ones_like(populations)
-        factor[eligible] = populations[eligible] ** (-self.alpha)
-        # natural weight for an ineligible cell is the uniform-per-molecule weight,
-        # which in this parameterisation is population^0 = 1 scaled to match
-        reference = (populations[eligible] ** (-self.alpha)).mean() if eligible.any() \
-            else 1.0
-        factor[~eligible] = min(1.0, reference)
-        weights = factor[assignment]
-        # cap the spread so no single molecule can dominate an epoch
-        low = weights.min()
-        if low > 0:
-            weights = np.minimum(weights, low * self.max_weight_ratio)
+        total = populations.sum()
+        natural = populations / total                      # p_c
+
+        tiny = populations < self.min_cell_count
+        mass = np.zeros_like(natural)
+        mass[tiny] = natural[tiny]                         # q_c = p_c EXACTLY
+        remaining = max(0.0, 1.0 - mass[tiny].sum())
+        if (~tiny).any():
+            shape = populations[~tiny] ** (1.0 - self.alpha)
+            mass[~tiny] = remaining * shape / shape.sum()
+        else:
+            mass = natural.copy()
+
+        exposure = np.divide(mass, natural, out=np.ones_like(mass),
+                             where=natural > 0)            # e_c
+        tiny_exposure_before_clip = (float(exposure[tiny].max()) if tiny.any()
+                                     else None)
+        # clipping only pulls ratios toward 1, so it cannot create a new outlier
+        clipped = np.clip(exposure, 1.0 / self.max_exposure_ratio,
+                          self.max_exposure_ratio)
+        mass = natural * clipped
+        mass = mass / mass.sum()
+        exposure = np.divide(mass, natural, out=np.ones_like(mass),
+                             where=natural > 0)
+
+        weights = mass[assignment] / populations[assignment]   # uniform within cell
         weights = weights / weights.sum()
         effective = float(1.0 / np.square(weights).sum())
         return weights, {
             "alpha": self.alpha,
             "min_cell_count": self.min_cell_count,
-            "max_weight_ratio": self.max_weight_ratio,
-            "cells_upweighted": int(eligible.sum()),
-            "cells_held_at_natural_weight": int((~eligible).sum()),
-            "molecules_in_held_cells": int((~eligible)[assignment].sum()),
-            "realised_weight_ratio": float(weights.max() / weights.min())
-            if weights.min() > 0 else None,
+            "max_exposure_ratio": self.max_exposure_ratio,
+            "definition": ("weights are per-CELL masses q_c spread uniformly inside the "
+                           "cell, so the per-example probability is q_c / n_c"),
+            "cells_eligible": int((~tiny).sum()),
+            "cells_tiny_held_at_natural_mass": int(tiny.sum()),
+            "molecules_in_tiny_cells": int(populations[tiny].sum()),
+            "natural_cell_probability": [float(v) for v in natural],
+            "final_cell_probability": [float(v) for v in mass],
+            "exposure_ratio_by_cell": [float(v) for v in exposure],
+            "max_exposure_ratio_among_tiny_cells_before_clip":
+                tiny_exposure_before_clip,
+            "max_exposure_ratio_among_tiny_cells": (
+                float(exposure[tiny].max()) if tiny.any() else None),
+            "max_exposure_ratio_realised": float(exposure.max()),
+            "min_exposure_ratio_realised": float(exposure.min()),
             "effective_sample_size": effective,
             "effective_sample_fraction": effective / max(1, self.size),
-            "note": ("effective_sample_size is Kish's: the number of equally weighted "
-                     "molecules this weighting is worth. A large drop means the "
-                     "sampler is concentrating, which is what max_weight_ratio bounds."),
+            "note": ("exposure_ratio is q_c / p_c, how many times more often a cell is "
+                     "seen than under natural sampling. Tiny cells are 1.0 before "
+                     "clipping by construction and the realised value is reported so "
+                     "that is checked, not assumed. effective_sample_size is Kish's."),
         }
 
     def _draw(self, epoch: int) -> np.ndarray:
@@ -189,7 +219,7 @@ class BalancedSampler:
     def state_dict(self) -> dict[str, Any]:
         return {"size": self.size, "batch_size": self.batch_size, "seed": self.seed,
                 "alpha": self.alpha, "min_cell_count": self.min_cell_count,
-                "max_weight_ratio": self.max_weight_ratio,
+                "max_exposure_ratio": self.max_exposure_ratio,
                 "epoch": self.epoch, "position": self.position}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -210,7 +240,7 @@ class BalancedSampler:
 
 __all__ = [
     "DEFAULT_ALPHA",
-    "DEFAULT_MAX_WEIGHT_RATIO",
+    "DEFAULT_MAX_EXPOSURE_RATIO",
     "DEFAULT_MIN_CELL_COUNT",
     "DEFAULT_QED_BIN_WIDTH",
     "BalancedSampler",
