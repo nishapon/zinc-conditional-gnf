@@ -102,13 +102,13 @@ def test_rho_receives_gradient_from_correlated_data_and_rises():
     shared = torch.randn((256, 1, DIM), generator=generator, dtype=torch.float64)
     private = torch.randn((256, 6, DIM), generator=generator, dtype=torch.float64)
     z = (0.2 * private + 0.98 * shared) * mask.unsqueeze(-1)
-    before = float(model.rho().mean())
+    before = float(model.rho().mean().detach())
     optimiser = torch.optim.Adam([model.pre_rho], lr=0.1)
     for _ in range(40):
         optimiser.zero_grad()
         (-model.log_prob(z, mask, None).mean()).backward()
         optimiser.step()
-    assert float(model.rho().mean()) > before
+    assert float(model.rho().mean().detach()) > before
     assert model.summary()["moved_from_initialisation"] is True
 
 
@@ -118,14 +118,14 @@ def test_a_frozen_rho_does_not_move_under_the_same_data():
     mask = masks([6] * 64)
     torch.manual_seed(4)
     z = torch.randn((64, 6, DIM), dtype=torch.float64) * mask.unsqueeze(-1)
-    before = float(model.rho().mean())
+    before = float(model.rho().mean().detach())
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimiser = torch.optim.Adam(trainable or [torch.zeros(1, requires_grad=True)],
                                  lr=0.1)
     optimiser.zero_grad()
     model.log_prob(z, mask, None).mean().backward()
     optimiser.step()
-    assert float(model.rho().mean()) == pytest.approx(before)
+    assert float(model.rho().mean().detach()) == pytest.approx(before)
 
 
 def test_the_new_parameter_is_registered_and_optimised_after_a_reload(tmp_path):
@@ -134,7 +134,7 @@ def test_the_new_parameter_is_registered_and_optimised_after_a_reload(tmp_path):
     torch.save(model.state_dict(), tmp_path / "prior.pt")
     fresh = prior(rho=INIT_RHO)
     fresh.load_state_dict(torch.load(tmp_path / "prior.pt", weights_only=True))
-    assert float(fresh.rho().mean()) == pytest.approx(0.05, abs=1e-6)
+    assert float(fresh.rho().mean().detach()) == pytest.approx(0.05, abs=1e-6)
     names = [name for name, _ in fresh.named_parameters()]
     assert "pre_rho" in names
     optimiser = torch.optim.Adam(fresh.parameters(), lr=0.1)

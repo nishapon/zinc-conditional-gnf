@@ -395,6 +395,19 @@ class FlowTrainer:
         }
 
     # ------------------------------------------------------------------
+    # Extension hooks. Both are no-ops that reproduce the original behaviour exactly;
+    # `zinc_gnf/experiment_arms.ArmTrainer` overrides them. They exist so an experiment
+    # arm needs no edit inside the training loop.
+    def _prepare_flow(self, flow):
+        """Called after the flow is built and BEFORE the optimizer is constructed."""
+        return flow
+
+    def _make_batcher(self):
+        """The training index sampler. Default: the original deterministic batcher."""
+        return DeterministicBatcher(len(self.train_set), self.config.batch_size,
+                                    self.config.seed)
+
+    # ------------------------------------------------------------------
     def train(self, resume: str | Path | None = "auto", stop_flag: StopFlag | None = None) -> dict[str, Any]:
         cfg, log = self.config, self.logger
         set_seed(cfg.seed, deterministic=cfg.deterministic)
@@ -439,9 +452,13 @@ class FlowTrainer:
                  f"(blocks={self.flow_config.num_blocks} hidden={self.flow_config.hidden_dim} "
                  f"max_log_scale={self.flow_config.max_log_scale} "
                  f"conditional={self.flow_config.conditional})")
+        # Hook: subclasses may replace submodules here. MUST stay before the optimizer
+        # is constructed, so any parameter an experiment arm adds is in flow.parameters()
+        # and therefore optimised. Default implementation returns the flow unchanged.
+        flow = self._prepare_flow(flow)
         optimizer = torch.optim.Adam(flow.parameters(), lr=cfg.learning_rate,
                                      weight_decay=cfg.weight_decay)
-        self.batcher = DeterministicBatcher(len(self.train_set), cfg.batch_size, cfg.seed)
+        self.batcher = self._make_batcher()
         self.best_loss: float | None = None
         self.best_step = -1
         self.bad_evals = 0
