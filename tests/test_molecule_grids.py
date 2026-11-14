@@ -252,3 +252,41 @@ def test_the_module_documents_why_placeholders_are_not_substituted():
     assert "FAILURES ARE DRAWN, NOT DROPPED" in source
     assert "most raw cells are expected to be placeholders" in source
     assert "THE SAMPLE SELECTION IS FIXED AND QUALITY-BLIND" in source
+
+
+# ================== corrections: selection rate vs target-hit yield ==============
+def test_the_gallery_reports_selection_rate_and_target_hit_yield_separately(tmp_path):
+    """Two different quantities. Conflating them hides the cost of selection."""
+    pytest.importorskip("PIL")
+    pytest.importorskip("rdkit")
+    # 20 candidates, only 2 anywhere near 0.60; best-of-10 keeps 2 of 20
+    qeds = [0.10] * 9 + [0.61] + [0.12] * 9 + [0.59]
+    records = [record(i, qed=q) for i, q in enumerate(qeds)]
+    manifest = best_of_k_gallery(records, n=15, requested_qed=0.60, k=10,
+                                 decoder="degree", samples=2, tolerance=0.10,
+                                 output=tmp_path / "sel.png")
+    assert manifest["candidates_drawn"] == 20
+    assert manifest["kept"] == 2
+    assert manifest["selection_rate"] == pytest.approx(2 / 20)
+    # both kept molecules are within tolerance, so target-hit yield is 2/20 as well,
+    # but it is computed over ALL DRAWN and is a distinct number
+    assert manifest["target_hit_yield_over_all_drawn"] == pytest.approx(2 / 20)
+    assert manifest["tolerance"] == pytest.approx(0.10)
+
+
+def test_target_hit_yield_is_lower_than_selection_rate_when_picks_miss(tmp_path):
+    pytest.importorskip("PIL")
+    pytest.importorskip("rdkit")
+    records = [record(i, qed=0.20) for i in range(20)]      # nothing near 0.80
+    manifest = best_of_k_gallery(records, n=15, requested_qed=0.80, k=10,
+                                 decoder="degree", samples=2, tolerance=0.10,
+                                 output=tmp_path / "sel.png")
+    assert manifest["selection_rate"] == pytest.approx(2 / 20)
+    assert manifest["target_hit_yield_over_all_drawn"] == pytest.approx(0.0)
+
+
+def test_the_module_no_longer_claims_yield_is_unaffected():
+    source = (Path('/projects/sandbox/zinc-conditional-gnf') / "zinc_gnf"
+              / "molecule_grids.py").read_text()
+    assert "yield is unaffected" not in source
+    assert "SELECTION RATE" in source and "TARGET-HIT" in source

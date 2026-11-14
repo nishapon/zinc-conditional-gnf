@@ -236,7 +236,7 @@ def comparison_grid(baseline_records, candidate_records, *, n, requested_qed,
 
 
 def best_of_k_gallery(records, *, n, requested_qed, k, decoder="degree", samples=6,
-                      model_label="candidate", output) -> dict[str, Any]:
+                      model_label="candidate", tolerance=0.10, output) -> dict[str, Any]:
     """A SEPARATE figure for selected molecules, with the budget on the banner.
 
     Kept apart from native grids on purpose: these molecules were chosen by oracle RDKit
@@ -253,6 +253,12 @@ def best_of_k_gallery(records, *, n, requested_qed, k, decoder="degree", samples
         raise ValueError(f"fewer than one full group of {k} scorable records")
     kept = [min(group, key=lambda r: abs(r[decoder]["qed"] - requested_qed))
             for group in groups]
+    drawn = len(groups) * k
+    # SELECTION RATE is how many of the drawn candidates survive the filter. TARGET-HIT
+    # YIELD is a different quantity: how many of ALL drawn candidates are both valid and
+    # within tolerance of the request. Conflating them would hide the cost of selection.
+    on_target = sum(1 for r in kept
+                    if abs(r[decoder]["qed"] - requested_qed) <= tolerance)
     chosen = select_noise_ids([r["noise_id"] for r in kept], samples)
     index = {r["noise_id"]: r for r in kept}
     rows = [(noise_id,
@@ -260,11 +266,19 @@ def best_of_k_gallery(records, *, n, requested_qed, k, decoder="degree", samples
                                decoder=decoder, requested_qed=requested_qed)])
             for noise_id in chosen]
     subtitle = (f"SELECTION, NOT NATIVE GENERATION.  N={n}  requested QED="
-                f"{requested_qed:g}  |  budget {len(groups) * k} candidates drawn, "
-                f"{len(groups)} kept (best-of-{k} by oracle RDKit QED), "
-                f"{len(chosen)} shown  |  yield {len(groups)}/{len(groups) * k}")
-    return render_grid(rows, title=f"Best-of-{k} selected molecules \u2014 {model_label}",
-                       subtitle=subtitle, output=output)
+                f"{requested_qed:g}  |  {drawn} candidates drawn, {len(groups)} kept "
+                f"(best-of-{k} by oracle RDKit QED), {len(chosen)} shown  |  "
+                f"selection rate {len(groups)}/{drawn}  |  target-hit yield "
+                f"{on_target}/{drawn} (valid and within {tolerance:g} of request, over "
+                f"ALL drawn)")
+    manifest = render_grid(rows, title=f"Best-of-{k} selected molecules \u2014 "
+                                        f"{model_label}",
+                           subtitle=subtitle, output=output)
+    manifest.update({"candidates_drawn": drawn, "kept": len(groups),
+                     "selection_rate": len(groups) / drawn,
+                     "target_hit_yield_over_all_drawn": on_target / drawn,
+                     "tolerance": tolerance})
+    return manifest
 
 
 __all__ = [
