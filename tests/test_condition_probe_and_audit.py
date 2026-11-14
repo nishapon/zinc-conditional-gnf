@@ -61,8 +61,11 @@ def test_equal_counts_reproduce_the_uniform_floor():
 
 
 def test_unequal_counts_move_the_floor_and_the_shift_is_flagged():
-    """The failure mode this audit exists to catch: validity collapses with N, so the
-    pooled target distribution is skewed and the floor moves with it."""
+    """IF the chosen decoder's scored counts are skewed, the floor moves with them.
+
+    Whether they are skewed is counted, never inferred from raw validity: the QED metric
+    runs on the corrected decoder, whose validity is high at every N.
+    """
     module = audit()
     cells = {"big": cell(n=15, target=0.4, scored=96, qed=0.55),
              "small": cell(n=30, target=0.8, scored=4, qed=0.50)}
@@ -241,23 +244,44 @@ def test_the_probe_reports_correction_attenuation_in_both_directions():
     assert module._verdict_correction(0.001, 0.001).startswith("NOTHING TO ERASE")
 
 
-def test_the_probe_can_refute_the_n_dominance_hypothesis():
-    """The probe must be able to overturn my own earlier reading, not just confirm it."""
+def test_the_probe_issues_no_causal_verdict_about_n_conditioning():
+    """The two causal verdicts were unsupported and must stay deleted.
+
+    A larger latent response to the N direction is a sensitivity, not evidence that N
+    and QED compete for conditioner capacity. And mismatching the condition's N against
+    the mask is an out-of-distribution probe: a null response cannot distinguish an
+    unused channel from a saturated or badly extrapolating conditioner.
+    """
     module = probe()
-    assert module._verdict_dominance(3.0).startswith("YES")
-    assert module._verdict_dominance(1.4).startswith("MILDLY")
-    refuted = module._verdict_dominance(0.5)
-    assert refuted.startswith("NO")
-    assert "not supported" in refuted
+    assert not hasattr(module, "_verdict_dominance")
+    assert not hasattr(module, "_verdict_redundancy")
 
 
-def test_the_probe_only_calls_n_redundant_when_the_output_is_unchanged():
+def test_the_synthesis_labels_the_n_arm_as_out_of_distribution():
     module = probe()
-    assert module._verdict_redundancy(0.02, 0.0).startswith("YES")
-    assert module._verdict_redundancy(0.25, 0.0).startswith("PARTIALLY")
-    not_redundant = module._verdict_redundancy(0.9, 3.0)
-    assert not_redundant.startswith("NO")
-    assert "real ablation" in not_redundant
+    payload = {"by_n": {"15": {"arms": {
+        "qed_low_to_high": {"latent_snr_vs_noise": 1.2,
+                             "latent_rms_per_unit_condition": 0.01,
+                             "decoded": {"raw": {"delta_qed_mean": 0.0,
+                                                  "smiles_change_rate": 0.5,
+                                                  "delta_heavy_atoms": 0.0},
+                                          "degree": {"delta_qed_mean": 0.0}}},
+        "condition_n_15_to_30": {"latent_snr_vs_noise": 3.0,
+                                  "latent_rms_per_unit_condition": 0.05,
+                                  "decoded": {"raw": {"delta_qed_mean": 0.0,
+                                                       "smiles_change_rate": 0.02,
+                                                       "delta_heavy_atoms": 0.0},
+                                               "degree": {"delta_qed_mean": 0.0}}}}}}}
+    synthesis = module.synthesise(payload)
+    assert "n_dominates_the_conditional_representation" not in synthesis
+    assert "explicit_n_conditioning_is_redundant" not in synthesis
+    ood = synthesis["n_mismatch_ood_response"]["answer"]
+    assert "OUT-OF-DISTRIBUTION" in ood
+    assert "does NOT establish redundancy" in ood
+    assert "does NOT license removing" in ood
+    sensitivity = synthesis["latent_sensitivity_per_unit_condition"]
+    assert "no causal claim" in sensitivity["answer"]
+    assert "NOT evidence that the two inputs compete" in sensitivity["criterion"]
 
 
 def test_the_probe_latent_change_is_zero_for_an_identical_pair():
@@ -322,5 +346,28 @@ def test_the_probe_is_read_only_with_respect_to_models():
 
 def test_the_probe_states_what_it_cannot_settle():
     source = " ".join(PROBE_PATH.read_text().split())
-    assert "It CANNOT tell us whether the size effect" in source
-    assert "may well overturn that earlier reading" in source
+    assert "CANNOT: establish that the explicit N channel is redundant" in source
+    assert "OUT-OF-DISTRIBUTION SENSITIVITY TEST AND NOTHING MORE" in source
+    assert "explicitly declines to issue a recommendation about N conditioning" in source
+
+
+def test_the_audit_weights_from_the_chosen_decoders_scored_counts():
+    """Raw validity must not be used to infer a corrected-QED metric's weighting."""
+    module = audit()
+    # checked on runtime string values: adjacent-literal boundaries make raw source
+    # matching unreliable
+    import ast
+    strings = [n.value for n in ast.walk(ast.parse(AUDIT_PATH.read_text()))
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    blob = " ".join(" ".join(value.split()) for value in strings)
+    assert "SCORED BY THE DECODER NAMED IN --decoder" in blob
+    assert "Raw validity must not be used to infer the weighting" in blob
+    assert "That inference was invalid" in blob
+    result = module.constant_predictor_audit(
+        {"a": cell(n=15, target=0.4, scored=10, qed=0.5),
+         "b": cell(n=23, target=0.6, scored=10, qed=0.5),
+         "c": cell(n=30, target=0.8, scored=10, qed=0.5)})
+    # balanced corrected-decoder counts -> the uniform floor is the right one
+    assert result["weighting_matters"] is False
+    assert result["sample_weighted_floor"]["mae"] == pytest.approx(
+        result["uniform_weight_floor"]["mae"], abs=1e-3)

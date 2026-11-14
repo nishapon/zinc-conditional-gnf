@@ -14,11 +14,15 @@ THE DESIGN
 Three arms, all sharing one prior-noise draw per N so every comparison is per-molecule:
 
   QED ARM        mask N fixed, condition N fixed, requested QED varied.
-  N-CONDITION    mask N fixed, requested QED fixed, the CONDITION's N varied away from
-  ARM            the mask's N. This is the redundancy test and it needs no training:
-                 the decoder takes its node count from the MASK, so if changing only the
-                 condition's N leaves the output unchanged, the explicit N conditioning
-                 is carrying no information the mask does not already supply.
+  N-MISMATCH     mask N fixed, requested QED fixed, the CONDITION's N varied away from
+  ARM (OOD)      the mask's N. READ THIS AS AN OUT-OF-DISTRIBUTION SENSITIVITY TEST AND
+                 NOTHING MORE. The model never saw a condition whose N disagreed with the
+                 mask, so a null response is ambiguous: the channel may be unused, or the
+                 conditioner may simply be saturated or extrapolating badly off its
+                 training support. This arm CANNOT establish that the N channel is
+                 redundant, and it cannot license removing it -- removing N from the
+                 condition changes the training objective to p(x | QED) marginalised over
+                 N, which is a different model that only a training run can evaluate.
   NOISE ARM      condition fixed, a SECOND independent prior draw. This is the reference
                  scale: it is how much the output moves for reasons that have nothing to
                  do with conditioning.
@@ -27,24 +31,30 @@ Everything is reported as a ratio to the noise arm, which makes the three measur
 stages comparable even though they hold different kinds of object (a continuous tensor,
 then a discrete graph, then a repaired discrete graph).
 
-FAIR COMPARISON BETWEEN THE N AND QED DIRECTIONS
-------------------------------------------------
+COMPARING THE N AND QED DIRECTIONS, AND WHAT THAT COMPARISON IS NOT
+-------------------------------------------------------------------
 Comparing "N 15 -> 30" against "QED 0.4 -> 0.8" directly is meaningless: they are
-different units. Each arm therefore also records the norm of its perturbation in
-STANDARDISED condition space, the space the conditioning network actually sees, and the
-headline sensitivity is the latent displacement PER UNIT standardised condition change.
-That is what makes "is N dominating the conditional representation?" a measurable
-question rather than a rhetorical one.
+different units. Each arm therefore records the norm of its perturbation in STANDARDISED
+condition space and reports latent displacement PER UNIT of that change.
+
+That ratio is a DESCRIPTIVE sensitivity, not evidence about capacity. A larger latent
+response to the N direction does not mean N is "competing for" or "crowding out" QED
+capacity: the two inputs are not drawing on a shared budget that this measurement can
+see, and nothing here identifies a trade-off between them. Differences in decoded QED
+across N are likewise not evidence of competition -- molecules of different size have
+genuinely different QED distributions, which is chemistry, not conditioner allocation.
 
 WHAT THIS CAN AND CANNOT SETTLE
 -------------------------------
-It can localise the loss: a large latent displacement with an unchanged decoded molecule
-indicts the decoder; a changed raw molecule with an unchanged corrected one indicts the
-repair. It CANNOT tell us whether the size effect on decoded QED reported earlier is
-conditioning or chemistry -- bigger molecules genuinely have different QED distributions,
-so part of that 2.2x is real chemistry and not conditioner capacity. The N-condition arm
-isolates the part attributable to conditioning, and may well overturn that earlier
-reading.
+CAN: localise where a QED response is lost along the latent -> raw decode -> corrected
+decode path. A large latent displacement with an unchanged decoded molecule points at the
+decoder; a changed raw molecule with an unchanged corrected one points at the repair.
+
+CANNOT: establish that the explicit N channel is redundant, that removing it is harmless
+or beneficial, or that N and QED compete for conditioner capacity. It also cannot
+attribute the across-N differences in decoded QED between chemistry and conditioning.
+Those are training-time questions. This script therefore reports measurements and
+explicitly declines to issue a recommendation about N conditioning.
 
 Exit codes: 0 ok; 2 missing input; 3 provenance mismatch; 4 bad arguments; 1 unexpected.
 """
@@ -402,27 +412,32 @@ def synthesise(payload) -> dict[str, Any]:
             "attenuation": ratio(mean(degree_qed), mean(raw_qed)),
             "answer": _verdict_correction(mean(raw_qed), mean(degree_qed)),
         },
-        "n_dominates_the_conditional_representation": {
-            "latent_rms_per_unit_condition_n": mean(per_unit_n),
-            "latent_rms_per_unit_condition_qed": mean(per_unit_qed),
-            "n_over_qed_dominance": dominance,
-            "answer": _verdict_dominance(dominance),
-            "criterion": "per UNIT standardised condition change, so the two "
-                         "directions are comparable",
+        "latent_sensitivity_per_unit_condition": {
+            "n_direction": mean(per_unit_n),
+            "qed_direction": mean(per_unit_qed),
+            "n_over_qed_ratio": dominance,
+            "answer": "DESCRIPTIVE MEASUREMENT ONLY \u2014 no causal claim is made",
+            "criterion": ("latent displacement per unit of standardised condition "
+                          "change. This is a sensitivity, NOT evidence that the two "
+                          "inputs compete for conditioner capacity and NOT grounds for "
+                          "removing either."),
         },
-        "explicit_n_conditioning_is_redundant": {
-            "identity_change_rate_from_condition_n_only": mean(identity_n),
-            "heavy_atom_change_from_condition_n_only": mean(size_n),
-            "answer": _verdict_redundancy(mean(identity_n), mean(size_n)),
-            "criterion": "the mask fixes the node count, so if moving ONLY the "
-                         "condition's N leaves the decoded molecule unchanged, the "
-                         "explicit N channel carries nothing the mask does not",
+        "n_mismatch_ood_response": {
+            "identity_change_rate": mean(identity_n),
+            "heavy_atom_change": mean(size_n),
+            "answer": ("OUT-OF-DISTRIBUTION SENSITIVITY ONLY. The model never saw a "
+                       "condition N disagreeing with the mask, so a small response is "
+                       "ambiguous between an unused channel and a saturated or badly "
+                       "extrapolating conditioner. This does NOT establish redundancy "
+                       "and does NOT license removing explicit N conditioning."),
+            "criterion": ("reported because the magnitude is informative about "
+                          "robustness; it is not a test of redundancy"),
         },
-        "caveat": ("Three node counts and one checkpoint. The N-condition arm isolates "
-                   "the conditioning contribution of N; it does NOT measure the "
-                   "chemical effect of molecule size, which is real and separate. The "
-                   "earlier 2.2x size-dominance reading conflated the two and should be "
-                   "replaced by the per-unit numbers here."),
+        "caveat": ("Three node counts, one checkpoint, one seed. This script localises "
+                   "where a QED response is lost. It makes no claim about N-conditioning "
+                   "redundancy, about capacity competition between N and QED, or about "
+                   "the chemistry-versus-conditioning split of across-N differences in "
+                   "decoded QED. Those require a training run to answer."),
     }
 
 
@@ -463,28 +478,6 @@ def _verdict_correction(raw_delta, degree_delta):
     return "NO: the correction roughly preserves the response"
 
 
-def _verdict_dominance(dominance):
-    if dominance is None:
-        return "not measurable"
-    if dominance > 2.0:
-        return (f"YES: per unit of standardised condition change, N moves the latent "
-                f"{dominance:.1f}x more than QED does")
-    if dominance > 1.0:
-        return f"MILDLY: N is {dominance:.1f}x stronger than QED per unit"
-    return (f"NO: QED is the stronger direction per unit "
-            f"({1 / dominance:.1f}x) \u2014 the dominance hypothesis is not supported")
-
-
-def _verdict_redundancy(identity, size):
-    if identity is None:
-        return "not measurable"
-    if identity < 0.1 and (size is None or abs(size) < 0.5):
-        return ("YES: moving only the condition's N leaves the decoded molecule "
-                "essentially unchanged, so the channel is redundant given the mask")
-    if identity < 0.4:
-        return ("PARTIALLY: the condition's N changes some molecules but not their size")
-    return ("NO: the condition's N materially changes the output, so it is not "
-            "redundant and removing it would be a real ablation")
 
 
 def _f(value, spec=".4f"):
@@ -525,8 +518,10 @@ def format_report(payload) -> str:
             ("flow_responds_to_qed", "Does the flow respond to QED?"),
             ("decoder_preserves_the_response", "Does the decoder preserve it?"),
             ("degree_correction_alters_the_response", "Does degree correction erase it?"),
-            ("n_dominates_the_conditional_representation", "Is N dominating?"),
-            ("explicit_n_conditioning_is_redundant", "Is explicit N redundant?")):
+            ("latent_sensitivity_per_unit_condition",
+             "Latent sensitivity per unit condition (descriptive)"),
+            ("n_mismatch_ood_response",
+             "N-mismatch response (OOD sensitivity, not a redundancy test)")):
         block = synthesis[key]
         lines += [f"  {label}", f"    {block['answer']}"]
         for field, value in block.items():

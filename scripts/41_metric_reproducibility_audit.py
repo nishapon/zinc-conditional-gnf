@@ -6,10 +6,18 @@ exist. Torch is never imported except lazily for the optional real-ZINC referenc
 
 QUESTION 6 - THE CONSTANT-PREDICTOR FLOOR, PROPERLY WEIGHTED
 ------------------------------------------------------------
-My earlier floor of 0.1333 assumed the three QED targets carry EQUAL weight. The GNF
-evaluation does not: it averages |QED_i - target_i| over scored SAMPLES, and the number
-of scored samples per cell varies enormously because validity collapses with N. The
-pooled target distribution is therefore not uniform, and the minimiser of
+My earlier floor of 0.1333 assumed the three QED targets carry EQUAL weight. Whether
+that is right depends on the per-cell counts of samples SCORED BY THE DECODER THE METRIC
+USES, and those must be counted, not inferred.
+
+A correction to my earlier reasoning: I argued the weights would be badly skewed because
+RAW validity collapses with N. That inference was invalid. The reported QED metric is
+computed on the degree-corrected decoder, whose validity is 97-100% at every N, so its
+scored counts are probably close to balanced and the uniform-weight floor is probably
+close to right. Raw validity says nothing about the weighting of a corrected-QED metric.
+This script settles it by counting the decoder's own scored samples.
+
+The minimiser of
 
     MAE(c) = (1/M) * sum_i |c - target_i|
 
@@ -163,7 +171,8 @@ def constant_predictor_audit(cells) -> dict[str, Any]:
         "uniform_weight_floor": {
             "best_constant": uniform_best, "mae": uniform_floor,
             "note": ("the earlier 0.1333 figure; assumes the three targets carry equal "
-                     "weight, which the sample-level aggregation does not"),
+                     "weight. Correct whenever the decoder's scored counts are balanced "
+                     "across cells, which for the degree decoder they may well be."),
         },
         "target_weights_from_scored_samples": weights,
         "weighting_matters": bool(
@@ -172,10 +181,12 @@ def constant_predictor_audit(cells) -> dict[str, Any]:
         "model_beats_sample_weighted_floor": bool(
             model_mae is not None and model_mae < grid[best_constant]),
         "mae_by_constant": grid,
-        "note": ("Validity collapses with N, so cells contribute unequal numbers of "
-                 "scored samples and the pooled target distribution is not uniform. The "
-                 "minimiser of a sample-level L1 is the WEIGHTED median of the "
-                 "per-sample targets."),
+        "note": ("Weights come from the counts of samples SCORED BY THE DECODER NAMED "
+                 "IN --decoder, counted here rather than inferred. Raw validity must "
+                 "not be used to infer the weighting of a corrected-QED metric. The "
+                 "minimiser of a sample-level L1 is the weighted median of the "
+                 "per-sample targets; if the counts are balanced it coincides with the "
+                 "uniform-weight floor."),
     }
 
 
