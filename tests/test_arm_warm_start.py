@@ -26,6 +26,7 @@ from zinc_gnf.experiment_arms import (  # noqa: E402
     map_optimizer_state,
     parameter_order,
     prepare_warm_start,
+    wrapped_prior_name,
 )
 from zinc_gnf.flow import FlowConfig, NodeFlow  # noqa: E402
 from zinc_gnf.trainer_flow import FlowTrainConfig, vocabulary_fingerprint  # noqa: E402
@@ -183,24 +184,232 @@ def test_the_mapping_uses_names_reconstructed_from_the_parent_config(tmp_path):
 
     flow = NodeFlow(config, init_seed=0)
     flow.prior = CoupledNodePrior.from_node_prior(flow.prior, init_rho=0.01)
-    result = map_optimizer_state(blob, flow, learning_rate=EXPERIMENT_LR)
+    result = map_optimizer_state(blob, flow, learning_rate=EXPERIMENT_LR,
+                                 wrapped_prior=True)
     mapping = result["mapping"]
     assert mapping["restored"] is True
+    assert mapping["parameter_groups"] == 1
     assert mapping["arm_parameters"] == mapping["parent_parameters"] + 1
     assert mapping["new_parameters_without_moments"] == ["prior.pre_rho"]
     assert "index -> name -> arm index" in mapping["method"]
     assert result["optimizer_state_dict"]["param_groups"][0]["lr"] == EXPERIMENT_LR
+    # the parent's own prior parameters exist, so wrapping MUST have renamed some
+    assert mapping["renamed_by_prior_wrapper"] > 0
+    for entry in mapping["renamed_examples"]:
+        assert entry["parent"].startswith("prior.")
+        assert entry["arm"] == "prior.base." + entry["parent"][len("prior."):]
 
 
-def test_a_shape_mismatch_is_refused_rather_than_mapped(tmp_path):
+def test_a_coupled_arm_mapped_without_the_wrapper_flag_is_refused(tmp_path):
+    """Wrapping renames every prior parameter; forgetting to say so must not pass."""
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    flow = NodeFlow(config, init_seed=0)
+    flow.prior = CoupledNodePrior.from_node_prior(flow.prior, init_rho=0.01)
+    with pytest.raises(ValueError, match="mapping failed"):
+        map_optimizer_state(blob, flow, wrapped_prior=False)
+
+
+def test_wrapped_prior_name_renames_only_prior_parameters_and_only_once():
+    assert wrapped_prior_name("prior.mu_head.weight", wrapped=True) == \
+        "prior.base.mu_head.weight"
+    assert wrapped_prior_name("prior.mu_head.weight", wrapped=False) == \
+        "prior.mu_head.weight"
+    assert wrapped_prior_name("blocks.0.scale", wrapped=True) == "blocks.0.scale"
+    # idempotent: an already-wrapped name is not wrapped a second time
+    once = wrapped_prior_name("prior.mu_head.weight", wrapped=True)
+    assert wrapped_prior_name(once, wrapped=True) == once
+    # a name that merely starts with the same letters is untouched
+    assert wrapped_prior_name("priors.weight", wrapped=True) == "priors.weight"
+
+
+def test_moments_are_fetched_by_saved_id_not_by_enumeration_position(tmp_path):
+    """Adam keys its state by the ids in `param_groups[0]["params"]`.
+
+    Those ids are not required to be `0..n-1`. Reading `state[position]` instead of
+    `state[positional[position]]` would silently attach the wrong moments to every
+    parameter, so a non-contiguous id set is mapped here and checked against the
+    contiguous mapping of the identical moments.
+    """
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    flow = NodeFlow(config, init_seed=0)
+    contiguous = map_optimizer_state(blob, flow)
+
+    saved = blob["optimizer_state_dict"]
+    original = list(saved["param_groups"][0]["params"])
+    assert original == list(range(len(original))), "fixture is contiguous to begin with"
+    offset = 100
+    shifted = {
+        "param_groups": [dict(saved["param_groups"][0],
+                              params=[i + offset for i in original])],
+        "state": {key + offset: value for key, value in saved["state"].items()},
+    }
+    noncontiguous = map_optimizer_state(dict(blob, optimizer_state_dict=shifted), flow)
+
+    assert noncontiguous["mapping"]["saved_ids_contiguous"] is False
+    assert contiguous["mapping"]["saved_ids_contiguous"] is True
+    expected = contiguous["optimizer_state_dict"]["state"]
+    produced = noncontiguous["optimizer_state_dict"]["state"]
+    assert set(produced) == set(expected) and produced
+    for index, entry in expected.items():
+        for key in ("exp_avg", "exp_avg_sq"):
+            if entry.get(key) is not None:
+                assert torch.equal(produced[index][key], entry[key]), index
+
+
+def test_more_than_one_parameter_group_is_refused_not_merged(tmp_path):
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    saved = blob["optimizer_state_dict"]
+    group = saved["param_groups"][0]
+    half = len(group["params"]) // 2
+    two = {"state": saved["state"],
+           "param_groups": [dict(group, params=group["params"][:half]),
+                            dict(group, params=group["params"][half:])]}
+    with pytest.raises(ValueError, match="single optimizer parameter group"):
+        map_optimizer_state(dict(blob, optimizer_state_dict=two),
+                            NodeFlow(config, init_seed=0))
+
+
+def test_duplicate_saved_parameter_ids_are_refused(tmp_path):
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    saved = blob["optimizer_state_dict"]
+    params = list(saved["param_groups"][0]["params"])
+    params[1] = params[0]
+    duplicated = {"state": saved["state"],
+                  "param_groups": [dict(saved["param_groups"][0], params=params)]}
+    with pytest.raises(ValueError, match="not unique"):
+        map_optimizer_state(dict(blob, optimizer_state_dict=duplicated),
+                            NodeFlow(config, init_seed=0))
+
+
+def test_a_moment_tensor_of_the_wrong_shape_is_refused(tmp_path):
+    """Equal parameter counts do not prove the reconstruction matches the parent."""
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    saved = blob["optimizer_state_dict"]
+    corrupted = {"param_groups": saved["param_groups"],
+                 "state": {key: dict(value) for key, value in saved["state"].items()}}
+    first = sorted(corrupted["state"])[0]
+    corrupted["state"][first]["exp_avg"] = torch.zeros(
+        corrupted["state"][first]["exp_avg"].shape + (3,))
+    with pytest.raises(ValueError, match="moment-shape mismatches"):
+        map_optimizer_state(dict(blob, optimizer_state_dict=corrupted),
+                            NodeFlow(config, init_seed=0))
+
+
+def test_a_flow_config_that_does_not_describe_the_checkpoint_is_refused(tmp_path):
     parent, _ = parent_checkpoint(tmp_path)
     blob = torch.load(parent, map_location="cpu", weights_only=False)
     wider = FlowConfig(node_embedding_dim=DIM * 2, num_blocks=2, hidden_dim=16,
                        attention_dim=16, num_heads=2, node_autoregressive=True,
                        condition_features=("n", "qed"), condition_embedding_dim=8,
                        condition_hidden_dim=8)
-    with pytest.raises(ValueError, match="mapping failed|refusing to guess"):
+    with pytest.raises(ValueError, match="mapping failed|refusing to guess|"
+                                         "does not describe this checkpoint"):
         map_optimizer_state(blob, NodeFlow(wider, init_seed=0))
+
+
+def test_the_reconstructed_names_must_exist_in_the_parent_state_dict(tmp_path):
+    parent, config = parent_checkpoint(tmp_path)
+    blob = torch.load(parent, map_location="cpu", weights_only=False)
+    stripped = dict(blob["model_state_dict"])
+    # drop a genuine PARAMETER, not a buffer: buffers are not in `parameter_order`
+    stripped.pop(parameter_order(blob["flow_config"])[0][0])
+    with pytest.raises(ValueError, match="does not describe this checkpoint"):
+        map_optimizer_state(dict(blob, model_state_dict=stripped),
+                            NodeFlow(config, init_seed=0))
+
+
+# =========================== PATH 1 path safety ==================================
+def test_writing_back_onto_the_parent_is_refused(tmp_path):
+    """The parent is shared by all four arms; overwriting it destroys the experiment."""
+    parent, config = parent_checkpoint(tmp_path)
+    arm = ArmConfig(arm="control")
+    train_config = experiment_config(tmp_path)
+    with pytest.raises(ValueError, match="same file"):
+        prepare_warm_start(parent, parent, arm_config=arm,
+                           train_config=train_config, flow_config=config,
+                           sampler_state=sampler_state(arm, train_config))
+    # and via a path that only RESOLVES to the parent
+    indirect = tmp_path / "sub" / ".." / parent.name
+    with pytest.raises(ValueError, match="same file"):
+        prepare_warm_start(parent, indirect, arm_config=arm,
+                           train_config=train_config, flow_config=config,
+                           sampler_state=sampler_state(arm, train_config))
+    assert torch.load(parent, map_location="cpu",
+                      weights_only=False)["step"] == 50000
+
+
+def test_an_existing_target_is_refused_rather_than_clobbered(tmp_path):
+    parent, config = parent_checkpoint(tmp_path)
+    arm = ArmConfig(arm="control")
+    train_config = experiment_config(tmp_path)
+    target = tmp_path / "arm" / "last.pt"
+    prepare_warm_start(parent, target, arm_config=arm, train_config=train_config,
+                       flow_config=config,
+                       sampler_state=sampler_state(arm, train_config))
+    marker = torch.load(target, map_location="cpu", weights_only=False)["parent"]
+    with pytest.raises(FileExistsError, match="already exists"):
+        prepare_warm_start(parent, target, arm_config=arm,
+                           train_config=train_config, flow_config=config,
+                           sampler_state=sampler_state(arm, train_config))
+    # the first translation is intact
+    assert torch.load(target, map_location="cpu",
+                      weights_only=False)["parent"] == marker
+
+
+def test_the_save_is_atomic_and_leaves_no_partial_file(tmp_path):
+    parent, config = parent_checkpoint(tmp_path)
+    arm = ArmConfig(arm="prior_learned")
+    train_config = experiment_config(tmp_path)
+    target = tmp_path / "arm" / "last.pt"
+    report = prepare_warm_start(parent, target, arm_config=arm,
+                                train_config=train_config, flow_config=config,
+                                sampler_state=sampler_state(arm, train_config))
+    assert report["target"] == str(target.resolve())
+    assert target.exists()
+    leftovers = sorted(p.name for p in target.parent.glob("*.partial"))
+    assert leftovers == []
+
+
+# ===================== parent provenance in LATER checkpoints ====================
+def test_every_checkpoint_this_run_writes_carries_the_parent(monkeypatch):
+    """`last.pt` is overwritten and `best.pt` is written fresh.
+
+    Recording the parent only in the translated warm start would lose it on the first
+    overwrite, so `_state` has to re-emit it rather than relying on the initial file.
+    """
+    from zinc_gnf.experiment_arms import ArmTrainer
+    from zinc_gnf.trainer_flow import FlowTrainer
+
+    monkeypatch.setattr(FlowTrainer, "_state",
+                        lambda self, step: {"step": step}, raising=True)
+    trainer = ArmTrainer.__new__(ArmTrainer)
+    trainer.arm_config = ArmConfig(arm="prior_learned")
+    trainer.parent_provenance = {"checkpoint": "/parent/best.pt", "sha256": "b" * 64,
+                                  "step": 50000}
+    state = ArmTrainer._state(trainer, 2500)
+    assert state["step"] == 2500
+    assert state["arm"]["arm"] == "prior_learned"
+    assert state["parent"]["checkpoint"] == "/parent/best.pt"
+    assert state["parent"]["step"] == 50000
+
+
+def test_a_run_with_no_parent_omits_the_block_rather_than_writing_an_empty_one(
+        monkeypatch):
+    from zinc_gnf.experiment_arms import ArmTrainer
+    from zinc_gnf.trainer_flow import FlowTrainer
+
+    monkeypatch.setattr(FlowTrainer, "_state",
+                        lambda self, step: {"step": step}, raising=True)
+    trainer = ArmTrainer.__new__(ArmTrainer)
+    trainer.arm_config = ArmConfig(arm="control")
+    trainer.parent_provenance = {}
+    state = ArmTrainer._state(trainer, 1)
+    assert "parent" not in state
 
 
 # =============================== PATH 2, resume ==================================

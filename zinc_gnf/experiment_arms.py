@@ -28,11 +28,12 @@ OPTIMIZER STATE ACROSS ARMS
 ---------------------------
 `prior_learned` and `prior_frozen` add `prior.pre_rho` to `flow.parameters()`, so the
 optimizer has one more tensor than the checkpoint's saved state and a plain
-`load_state_dict` would fail on the index mismatch. `adapt_optimizer_state` restores the
-saved Adam moments for every parameter that already existed and leaves the new one
-unstarted, which Adam initialises lazily on its first step. Existing parameters therefore
-resume identically in all four arms; only the genuinely new tensor differs, which is the
-consistency the comparison needs.
+`load_state_dict` would fail on the index mismatch. `map_optimizer_state` restores the
+saved Adam moments for every parameter that already existed -- matched by VERIFIED
+PARAMETER NAME, not by count or position -- and leaves the new one unstarted, which Adam
+initialises lazily on its first step. Existing parameters therefore resume identically in
+all four arms; only the genuinely new tensor differs, which is the consistency the
+comparison needs.
 """
 
 from __future__ import annotations
@@ -134,54 +135,36 @@ def imbalance_report(n_node, qed, *, qed_bin_width: float = 0.1) -> dict[str, An
 
 
 # ------------------------------------------------------------ optimizer state ---
-def adapt_optimizer_state(optimizer, saved: dict[str, Any] | None) -> dict[str, Any]:
-    """Restore Adam state for pre-existing parameters; leave new ones unstarted.
-
-    Adam's `state_dict` keys its per-parameter state by POSITION, so an optimizer with
-    one extra tensor cannot load an older state directly. The extra indices are appended
-    to the first parameter group with no state attached, which Adam creates lazily on
-    the first step. Pre-existing parameters therefore resume bit-identically.
-    """
-    if not saved:
-        return {"restored": False, "reason": "no saved optimizer state"}
-    current = sum(len(group["params"]) for group in optimizer.param_groups)
-    previous = sum(len(group["params"]) for group in saved.get("param_groups", []))
-    if current == previous:
-        optimizer.load_state_dict(saved)
-        return {"restored": True, "parameters": current, "added": 0}
-    if current < previous:
-        raise ValueError(
-            f"the optimizer has FEWER parameters ({current}) than the saved state "
-            f"({previous}); refusing to guess which were dropped")
-    patched = {"state": dict(saved.get("state", {})),
-               "param_groups": [dict(group) for group in saved.get("param_groups", [])]}
-    if not patched["param_groups"]:
-        raise ValueError("saved optimizer state has no parameter groups")
-    added = list(range(previous, current))
-    patched["param_groups"][0] = dict(patched["param_groups"][0])
-    patched["param_groups"][0]["params"] = (
-        list(patched["param_groups"][0]["params"]) + added)
-    optimizer.load_state_dict(patched)
-    return {"restored": True, "parameters": current, "added": len(added),
-            "note": ("new parameters were appended with no Adam moments; Adam "
-                     "initialises them on the first step, so every pre-existing "
-                     "parameter resumes identically")}
+# `adapt_optimizer_state` was REMOVED at review. It mapped Adam state by parameter COUNT
+# and assumed `parameters()` order, which silently mismatches whenever saved parameter
+# ids are non-contiguous or the prior wrapper renames keys. Use `map_optimizer_state`,
+# which maps by verified parameter NAME. The name is left documented here so an old call
+# site fails loudly at import rather than finding a lookalike.
 
 
 # ----------------------------------------------------------------- the trainer ---
 class ArmTrainer(FlowTrainer):
     """`FlowTrainer` with one named intervention. Everything else is inherited."""
 
-    def __init__(self, *args, arm_config: ArmConfig | None = None, **kwargs) -> None:
+    def __init__(self, *args, arm_config: ArmConfig | None = None,
+                 parent_provenance: dict[str, Any] | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.arm_config = arm_config or ArmConfig()
         self.arm_config.validate()
+        self.parent_provenance = dict(parent_provenance or {})
         self.arm_report: dict[str, Any] = {"arm": self.arm_config.arm}
 
     # -- arm identity is persisted and verified on resume --------------
     def _state(self, step: int) -> dict[str, Any]:
+        """Carry the arm AND the parent identity into every checkpoint this run writes.
+
+        Recording the parent only in the translated warm start would lose it the moment
+        the first `last.pt` was overwritten, and `best.pt` would never have it at all.
+        """
         state = super()._state(step)
         state["arm"] = self.arm_config.to_dict()
+        if self.parent_provenance:
+            state["parent"] = self.parent_provenance
         return state
 
     def verify_arm(self, checkpoint: dict[str, Any]) -> None:
@@ -273,77 +256,138 @@ def parameter_order(flow_config_dict: dict[str, Any]) -> list[tuple[str, tuple]]
             for name, tensor in model.named_parameters()]
 
 
-def map_optimizer_state(parent_blob: dict[str, Any], arm_flow, *,
-                        learning_rate: float | None = None) -> dict[str, Any]:
-    """Re-index the parent's Adam moments onto the arm's parameters BY NAME.
+def wrapped_prior_name(name: str, *, wrapped: bool) -> str:
+    """Parent parameter name -> the arm's name for the same tensor.
 
-    Adam stores state positionally, so the parent's indices are meaningless against a
-    model with an extra tensor. The parent's ordering is reconstructed from its own
-    `flow_config`, turned into index -> name, then name -> the arm's index. Every parent
-    name must exist in the arm with an identical shape or this raises; a new parameter is
-    left with no moments, which Adam creates on its first step.
+    Wrapping the prior moves every one of its parameters down a level:
+    `prior.mu_head.weight` becomes `prior.base.mu_head.weight`. Without this the name
+    mapping rejects every prior parameter as "missing from the arm", which would have
+    made both prior arms fail outright. The rename is explicit and applied once.
+    """
+    if wrapped and name.startswith("prior.") and not name.startswith("prior.base."):
+        return "prior.base." + name[len("prior."):]
+    return name
+
+
+def map_optimizer_state(parent_blob: dict[str, Any], arm_flow, *,
+                        learning_rate: float | None = None,
+                        wrapped_prior: bool = False) -> dict[str, Any]:
+    """Re-index the parent's Adam moments onto the arm's parameters BY VERIFIED NAME.
+
+    Adam keys its per-parameter state by the ids listed in `param_groups[*]["params"]`,
+    which are NOT necessarily the enumeration positions. The lookup therefore goes
+    through `positional[position]`, and several things are checked rather than assumed:
+
+      * exactly ONE parameter group is supported. Multiple groups carry per-group
+        hyperparameters that flattening would silently discard, so this refuses instead.
+      * saved ids must be unique and must cover every reconstructed parent parameter.
+      * the reconstructed parent ORDER is validated against the checkpoint itself: the
+        name set must equal the parameter names in the parent's `model_state_dict`, and
+        every saved moment tensor must have the shape of the parameter it is mapped to.
+        Equal counts alone would not establish that the reconstruction matches how the
+        original optimizer was built; matching shapes position by position does.
+      * prior-wrapper renames are applied explicitly via `wrapped_prior_name`.
     """
     saved = parent_blob.get("optimizer_state_dict")
     if not saved:
         return {"optimizer_state_dict": None,
-                "mapping": {"restored": False, "reason": "parent has no optimizer state"}}
-    parent_order = parameter_order(parent_blob["flow_config"])
-    arm_order = [(name, tuple(t.shape)) for name, t in arm_flow.named_parameters()]
-    arm_index = {name: position for position, (name, _) in enumerate(arm_order)}
-    arm_shape = dict(arm_order)
-
+                "mapping": {"restored": False,
+                            "reason": "parent has no optimizer state"}}
     groups = saved.get("param_groups") or []
-    positional = [index for group in groups for index in group["params"]]
+    if len(groups) != 1:
+        raise ValueError(
+            f"only a single optimizer parameter group is supported, found "
+            f"{len(groups)}. Flattening groups would discard their per-group "
+            f"hyperparameters, so this refuses rather than merging them silently.")
+    positional = list(groups[0]["params"])
+    if len(set(positional)) != len(positional):
+        raise ValueError(f"saved optimizer parameter ids are not unique: {positional}")
+
+    parent_order = parameter_order(parent_blob["flow_config"])
     if len(positional) != len(parent_order):
         raise ValueError(
             f"parent optimizer state covers {len(positional)} parameters but its "
             f"flow_config reconstructs {len(parent_order)}; refusing to guess the "
             f"mapping")
 
-    remapped_state: dict[int, Any] = {}
-    mapped, missing, reshaped = [], [], []
-    for position, (name, shape) in enumerate(parent_order):
-        if name not in arm_index:
-            missing.append(name)
-            continue
-        if arm_shape[name] != shape:
-            reshaped.append({"name": name, "parent": list(shape),
-                             "arm": list(arm_shape[name])})
-            continue
-        entry = (saved.get("state") or {}).get(position)
-        if entry is not None:
-            remapped_state[arm_index[name]] = entry
-        mapped.append(name)
-    if missing or reshaped:
+    # validate the reconstruction against the checkpoint's own contents
+    reconstructed = {name for name, _ in parent_order}
+    state_dict = parent_blob.get("model_state_dict") or {}
+    missing_from_checkpoint = sorted(reconstructed - set(state_dict))
+    if missing_from_checkpoint:
         raise ValueError(
-            f"parameter-name mapping failed: missing from the arm {missing}; shape "
-            f"mismatches {reshaped}")
+            f"reconstructed parameter names absent from the parent's "
+            f"model_state_dict: {missing_from_checkpoint}; the flow_config does not "
+            f"describe this checkpoint")
 
-    template = dict(groups[0]) if groups else {}
+    state = saved.get("state") or {}
+    arm_order = [(name, tuple(t.shape)) for name, t in arm_flow.named_parameters()]
+    arm_index = {name: position for position, (name, _) in enumerate(arm_order)}
+    arm_shape = dict(arm_order)
+
+    remapped: dict[int, Any] = {}
+    mapped, missing, reshaped, moment_mismatch = [], [], [], []
+    for position, (name, shape) in enumerate(parent_order):
+        target = wrapped_prior_name(name, wrapped=wrapped_prior)
+        if target not in arm_index:
+            missing.append({"parent": name, "expected_arm": target})
+            continue
+        if arm_shape[target] != shape:
+            reshaped.append({"name": name, "parent": list(shape),
+                             "arm": list(arm_shape[target])})
+            continue
+        entry = state.get(positional[position])
+        if entry is not None:
+            for key in ("exp_avg", "exp_avg_sq"):
+                moment = entry.get(key)
+                if moment is not None and tuple(moment.shape) != shape:
+                    moment_mismatch.append(
+                        {"name": name, "moment": key,
+                         "moment_shape": list(moment.shape),
+                         "parameter_shape": list(shape)})
+            remapped[arm_index[target]] = entry
+        mapped.append({"parent": name, "arm": target,
+                       "saved_id": positional[position]})
+    if missing or reshaped or moment_mismatch:
+        raise ValueError(
+            f"parameter-name mapping failed: missing {missing}; shape mismatches "
+            f"{reshaped}; moment-shape mismatches {moment_mismatch}")
+
+    template = dict(groups[0])
     template["params"] = list(range(len(arm_order)))
+    previous_lr = template.get("lr")
     # Adam's state_dict carries `lr` inside param_groups, so loading the parent's state
     # would silently reinstate the PARENT's learning rate. The experiment rate is written
     # in explicitly, after the moments are mapped.
-    previous_lr = template.get("lr")
     if learning_rate is not None:
         template["lr"] = float(learning_rate)
-    added = [name for name, _ in arm_order if name not in dict(parent_order)]
+    renamed = [entry for entry in mapped if entry["parent"] != entry["arm"]]
+    parent_names = {name for name, _ in parent_order}
+    added = [name for name, _ in arm_order
+             if name not in {wrapped_prior_name(n, wrapped=wrapped_prior)
+                             for n in parent_names}]
     return {
-        "optimizer_state_dict": {"state": remapped_state, "param_groups": [template]},
+        "optimizer_state_dict": {"state": remapped, "param_groups": [template]},
         "mapping": {
             "restored": True,
+            "parameter_groups": 1,
+            "saved_ids_contiguous": positional == list(range(len(positional))),
             "parent_parameters": len(parent_order),
             "arm_parameters": len(arm_order),
-            "moments_mapped": len(remapped_state),
+            "moments_mapped": len(remapped),
             "names_mapped": len(mapped),
+            "renamed_by_prior_wrapper": len(renamed),
+            "renamed_examples": renamed[:3],
             "new_parameters_without_moments": added,
-            "method": ("parent ordering reconstructed from its own flow_config, then "
-                       "index -> name -> arm index, with shapes validated"),
+            "method": ("parent ordering reconstructed from its own flow_config and "
+                       "validated against model_state_dict names and per-position "
+                       "moment shapes; moments fetched via positional[position], then "
+                       "index -> name -> arm index with wrapper renames applied"),
             "learning_rate_in_param_groups": {
                 "parent": previous_lr, "applied": template.get("lr"),
                 "note": ("set explicitly after mapping, because Adam's state_dict "
-                         "carries lr in param_groups and would otherwise reinstate the "
-                         "parent's rate"),
+                         "carries lr in param_groups and would otherwise reinstate "
+                         "the parent's rate"),
             },
         },
     }
@@ -388,7 +432,21 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
     from zinc_gnf.flow import NodeFlow
     from zinc_gnf.trainer_flow import file_sha256, vocabulary_fingerprint
 
-    parent_path, target_path = Path(parent_path), Path(target_path)
+    import os
+
+    parent_path = Path(parent_path).resolve()
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_target = target_path.resolve()
+    if resolved_target == parent_path:
+        raise ValueError(
+            f"target and parent resolve to the same file ({parent_path}); refusing to "
+            f"overwrite the shared warm start")
+    if resolved_target.exists():
+        raise FileExistsError(
+            f"{resolved_target} already exists; refusing to clobber it. Delete it "
+            f"deliberately, or resume the interrupted experiment instead of starting a "
+            f"new one.")
     blob = _torch.load(parent_path, map_location="cpu", weights_only=False)
     if blob.get("vocabulary_fingerprint") != vocabulary_fingerprint():
         raise ResumeMismatchError("parent checkpoint uses a different atom vocabulary")
@@ -407,7 +465,8 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
     flow.to(device)
 
     optimizer = map_optimizer_state(
-        blob, flow, learning_rate=train_config.learning_rate)
+        blob, flow, learning_rate=train_config.learning_rate,
+        wrapped_prior=arm_config.uses_coupled_prior)
     record = {
         "step": 0,
         "epoch": 0,
@@ -451,9 +510,12 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
             "prior_wrapped_after_loading_weights": arm_config.uses_coupled_prior,
         },
     }
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    _torch.save(record, target_path)
-    return {"target": str(target_path), "parent": record["parent"],
+    # atomic: a crash mid-write must not leave a half-written checkpoint that the
+    # resume path would then pick up as if it were complete
+    staging = resolved_target.with_name(resolved_target.name + ".partial")
+    _torch.save(record, staging)
+    os.replace(staging, resolved_target)
+    return {"target": str(resolved_target), "parent": record["parent"],
             "warm_start": record["warm_start"]}
 
 
@@ -524,11 +586,11 @@ __all__ = [
     "MIN_POPULATION_RATIO",
     "ArmConfig",
     "ArmTrainer",
-    "adapt_optimizer_state",
     "draw_latents",
     "map_optimizer_state",
     "parameter_order",
     "prepare_warm_start",
     "imbalance_report",
     "load_arm_flow",
+    "wrapped_prior_name",
 ]

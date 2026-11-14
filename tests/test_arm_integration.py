@@ -23,7 +23,6 @@ from zinc_gnf.experiment_arms import (  # noqa: E402
     ARMS,
     ArmConfig,
     ArmTrainer,
-    adapt_optimizer_state,
     imbalance_report,
     load_arm_flow,
 )
@@ -116,45 +115,27 @@ def test_the_control_arm_adds_no_parameter():
     assert coupled.num_parameters() == plain.num_parameters() + DIM
 
 
-# ============================ optimizer-state adaptation =========================
-def test_saved_state_is_restored_and_the_new_parameter_left_unstarted():
-    plain = flow_for()
-    old = torch.optim.Adam(plain.parameters(), lr=0.05)
-    mask = torch.ones((2, 4), dtype=torch.bool)
-    old.zero_grad()
-    plain.negative_log_likelihood(torch.randn((2, 4, DIM)), mask,
-                                  torch.zeros((2, 8)))["loss"].backward()
-    old.step()
-    saved = old.state_dict()
+# ======================= the removed positional helper ===========================
+def test_the_count_based_optimizer_adapter_no_longer_exists():
+    """It mapped Adam state by COUNT and assumed `parameters()` order.
 
-    coupled = flow_for(coupled=True)
-    new = torch.optim.Adam(coupled.parameters(), lr=0.05)
-    report = adapt_optimizer_state(new, saved)
-    assert report["restored"] is True and report["added"] == 1
-    assert len(new.state_dict()["param_groups"][0]["params"]) == \
-        len(saved["param_groups"][0]["params"]) + 1
+    Keeping it importable alongside the name-based mapper is the dangerous case: a stale
+    call site would keep working and keep mismapping. Its absence is asserted so it
+    cannot quietly return. All optimizer-state behaviour is now covered by
+    `tests/test_arm_warm_start.py` against `map_optimizer_state`.
+    """
+    import zinc_gnf.experiment_arms as arms
+
+    assert not hasattr(arms, "adapt_optimizer_state")
+    assert "adapt_optimizer_state" not in arms.__all__
 
 
-def test_matching_parameter_counts_load_directly():
-    flow = flow_for()
-    first = torch.optim.Adam(flow.parameters(), lr=0.05)
-    report = adapt_optimizer_state(torch.optim.Adam(flow.parameters(), lr=0.05),
-                                   first.state_dict())
-    assert report["added"] == 0
+def test_a_parent_without_optimizer_state_is_reported_not_fatal():
+    from zinc_gnf.experiment_arms import map_optimizer_state
 
-
-def test_a_shrinking_parameter_count_is_refused_rather_than_guessed():
-    coupled = flow_for(coupled=True)
-    saved = torch.optim.Adam(coupled.parameters(), lr=0.05).state_dict()
-    plain = torch.optim.Adam(flow_for().parameters(), lr=0.05)
-    with pytest.raises(ValueError, match="FEWER parameters"):
-        adapt_optimizer_state(plain, saved)
-
-
-def test_absent_saved_state_is_reported_not_fatal():
-    flow = flow_for(coupled=True)
-    report = adapt_optimizer_state(torch.optim.Adam(flow.parameters()), None)
-    assert report["restored"] is False
+    result = map_optimizer_state({"optimizer_state_dict": None}, flow_for())
+    assert result["optimizer_state_dict"] is None
+    assert result["mapping"]["restored"] is False
 
 
 # ============================== checkpoint round-trip ============================

@@ -156,23 +156,27 @@ def main(argv=None) -> int:
         # PATH 2: an interrupted experiment already has its own last.pt; resume it as-is
         # and verify the arm configuration has not changed.
         warm_start = None
+        parent_provenance = None
         if not interrupted:
             sampler_state = _fresh_sampler_state(arm, train_set, train_config)
             warm_start = prepare_warm_start(
                 start, resume_target, arm_config=arm, train_config=train_config,
                 flow_config=flow_config, sampler_state=sampler_state)
+            parent_provenance = warm_start["parent"]
             print("PATH 1 (new experiment from parent):")
             print(json.dumps(warm_start, indent=2, default=str))
         else:
             existing = torch.load(resume_target, map_location="cpu",
                                    weights_only=False)
+            parent_provenance = existing.get("parent")
             print(f"PATH 2 (resuming interrupted experiment at step "
-                  f"{existing.get('step')})")
+                  f"{existing.get('step')}; parent "
+                  f"{(parent_provenance or {}).get('checkpoint')})")
 
         logger = JobLogger(f"arm_{arm.arm}", out_dir, filename="train.log")
         trainer = ArmTrainer(flow_config, train_config, logger=logger,
                              datasets=(train_set, val_set, fingerprint),
-                             arm_config=arm)
+                             arm_config=arm, parent_provenance=parent_provenance)
         if interrupted:
             trainer.verify_arm(torch.load(resume_target, map_location="cpu",
                                            weights_only=False))
