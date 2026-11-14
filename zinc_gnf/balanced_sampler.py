@@ -153,6 +153,13 @@ def joint_distribution(n_node, qed, *, qed_bin_width: float = DEFAULT_QED_BIN_WI
     }
 
 
+# Written into every state dict so a foreign sampler state is positively IDENTIFIED
+# rather than inferred from which keys happen to be present. A `DeterministicBatcher`
+# state is a strict SUBSET of this one's keys, with the same names and meanings, so no
+# key-presence test can distinguish them.
+STATE_KIND = "BalancedSampler"
+
+
 class BalancedSampler:
     """Deterministic, resumable, cell-reweighted sampler over real molecules."""
 
@@ -175,6 +182,10 @@ class BalancedSampler:
         self.batch_size, self.seed = int(batch_size), int(seed)
         self.alpha, self.min_cell_count = float(alpha), int(min_cell_count)
         self.max_exposure_ratio = float(max_exposure_ratio)
+        # retained as an attribute because it determines the CELLS, hence the weights;
+        # a resume that changed it would sample a different distribution under the same
+        # (epoch, position), so it has to be identifiable in the state
+        self.qed_bin_width = float(qed_bin_width)
         self.distribution = joint_distribution(n_node, qed,
                                                qed_bin_width=qed_bin_width)
         self.weights, self.diagnostics = self._weights()
@@ -298,20 +309,60 @@ class BalancedSampler:
         self.position += self.batch_size
         return [int(value) for value in chunk]
 
+    # Keys that must agree for `(epoch, position)` to mean the same thing, because each
+    # one changes the weights and therefore the drawn order.
+    IDENTIFYING = ("size", "batch_size", "seed", "alpha", "min_cell_count",
+                   "max_exposure_ratio", "qed_bin_width")
+
     def state_dict(self) -> dict[str, Any]:
-        return {"size": self.size, "batch_size": self.batch_size, "seed": self.seed,
+        return {"sampler": STATE_KIND,
+                "size": self.size, "batch_size": self.batch_size, "seed": self.seed,
                 "alpha": self.alpha, "min_cell_count": self.min_cell_count,
                 "max_exposure_ratio": self.max_exposure_ratio,
+                "qed_bin_width": self.qed_bin_width,
                 "epoch": self.epoch, "position": self.position}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        for key in ("size", "batch_size", "seed", "alpha", "min_cell_count",
-                    "max_weight_ratio"):
-            if key in state and state[key] != getattr(self, key):
+        """Resume only from a state this class wrote, with identical weighting.
+
+        Nothing is mutated until every check has passed, so a rejected state leaves the
+        sampler exactly as it was rather than half-loaded.
+
+        The previous version checked `if key in state`, which could not reject a
+        `DeterministicBatcher` state: that state carries `size`, `batch_size`, `seed`,
+        `epoch` and `position` under the same names with the same meanings, and simply
+        OMITS `alpha` and `min_cell_count`, so the presence guard skipped exactly the
+        keys that distinguish the two samplers and the foreign state loaded silently. It
+        also checked a key named `max_weight_ratio`, which `state_dict` has never
+        written, so the exposure cap went unvalidated even between two balanced states.
+        Both are fixed here: the kind is identified explicitly, and every identifying
+        key must be PRESENT and equal.
+        """
+        kind = state.get("sampler")
+        if kind != STATE_KIND:
+            raise ValueError(
+                f"this state was not written by a BalancedSampler (sampler tag "
+                f"{kind!r}); a DeterministicBatcher state carries the same size, "
+                f"batch_size, seed, epoch and position keys and would otherwise load "
+                f"silently, resuming the balanced arm at a position belonging to a "
+                f"uniform order. Refusing rather than guessing from which keys are "
+                f"present.")
+        absent = [key for key in (*self.IDENTIFYING, "epoch", "position")
+                  if key not in state]
+        if absent:
+            raise ValueError(
+                f"balanced sampler state is incomplete, missing {absent}; it cannot be "
+                f"confirmed to describe this sampler's weighting")
+        for key in self.IDENTIFYING:
+            if state[key] != getattr(self, key):
                 raise ValueError(f"sampler {key} mismatch: checkpoint {state[key]} vs "
                                  f"now {getattr(self, key)}")
-        self.epoch, self.position = int(state["epoch"]), int(state["position"])
-        self._order = self._draw(self.epoch)
+        epoch, position = int(state["epoch"]), int(state["position"])
+        if epoch < 0 or not 0 <= position <= self.size:
+            raise ValueError(f"balanced sampler state is out of range: epoch {epoch}, "
+                             f"position {position} against size {self.size}")
+        order = self._draw(epoch)
+        self.epoch, self.position, self._order = epoch, position, order
 
     def report(self) -> dict[str, Any]:
         return {"distribution": {k: v for k, v in self.distribution.items()
@@ -326,6 +377,7 @@ __all__ = [
     "DEFAULT_MIN_CELL_COUNT",
     "BOUNDARY_TOLERANCE",
     "DEFAULT_QED_BIN_WIDTH",
+    "STATE_KIND",
     "BalancedSampler",
     "cell_index",
     "joint_distribution",

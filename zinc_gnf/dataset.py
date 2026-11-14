@@ -261,10 +261,25 @@ class DeterministicBatcher:
         return indices
 
     def state_dict(self) -> dict[str, int]:
-        return {"epoch": self.epoch, "position": self.position,
+        return {"sampler": "DeterministicBatcher",
+                "epoch": self.epoch, "position": self.position,
                 "size": self.size, "batch_size": self.batch_size, "seed": self.seed}
 
     def load_state_dict(self, state: dict[str, int]) -> None:
+        # The reverse of the BalancedSampler hazard: a balanced state carries these same
+        # three keys with the same meanings, so it would load here silently and resume a
+        # UNIFORM batcher at an epoch and position belonging to a reweighted order. A
+        # state that names a different sampler is therefore rejected.
+        #
+        # An UNTAGGED state is still accepted on purpose. Every checkpoint written before
+        # this tag existed -- including the 50k flow parent all four arms start from --
+        # has no `sampler` key, and all of those are DeterministicBatcher states. Making
+        # the tag mandatory would reject them and break ordinary resumes.
+        kind = state.get("sampler")
+        if kind is not None and kind != "DeterministicBatcher":
+            raise ValueError(
+                f"this state was written by {kind!r}, not a DeterministicBatcher; "
+                f"refusing to resume a uniform batcher from another sampler's state")
         for key in ("size", "batch_size", "seed"):
             if int(state[key]) != getattr(self, key):
                 raise ValueError(f"batcher {key} mismatch: checkpoint {state[key]} vs now {getattr(self, key)}")

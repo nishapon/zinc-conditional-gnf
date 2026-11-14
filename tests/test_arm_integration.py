@@ -26,10 +26,61 @@ from zinc_gnf.experiment_arms import (  # noqa: E402
     imbalance_report,
     load_arm_flow,
 )
-from zinc_gnf.flow import FlowConfig, NodeFlow  # noqa: E402
+from zinc_gnf.flow import ActNorm, FlowConfig, NodeFlow  # noqa: E402
 from zinc_gnf.trainer_flow import FlowTrainer  # noqa: E402
 
 DIM = 8
+
+
+def uninitialized_actnorms(flow):
+    return [name for name, module in flow.named_modules()
+            if isinstance(module, ActNorm) and not bool(module.initialized)]
+
+
+def initialize_in_place(flow, *, batch=16, width=6, seed=11):
+    """Run ONE train-mode forward so every ActNorm does its data-dependent init.
+
+    `ActNorm.forward` initializes `log_scale` and `bias` from the first batch it sees,
+    but ONLY while `self.training`. A freshly constructed flow therefore carries zeros
+    in those parameters and `initialized=False`, which is a state no real checkpoint is
+    ever saved in: by the time the trainer writes `last.pt` the first step has long since
+    initialized them. Saving an uninitialized flow and then comparing it against a
+    restored one in eval mode compares two DIFFERENT models, because the original
+    initializes itself from the comparison batch on the way past.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    x = torch.randn((batch, width, DIM), generator=generator)
+    mask = torch.ones((batch, width), dtype=torch.bool)
+    flow.train()
+    with torch.no_grad():
+        flow.log_prob(x, mask, torch.zeros((batch, 8)))
+    pending = uninitialized_actnorms(flow)
+    assert pending == [], f"ActNorm still uninitialized after a train-mode pass: {pending}"
+    assert bool(flow.statistics_set), "embedding statistics must be set before saving"
+    return flow
+
+
+def divergence_by_stage(left, right, x, mask, condition):
+    """Max absolute difference between two flows at every transformation in order.
+
+    Used only to explain a failure: it names the FIRST stage at which two flows that are
+    supposed to be identical stop agreeing, instead of leaving a likelihood mismatch
+    unattributed.
+    """
+    stages = []
+    with torch.no_grad():
+        start = x * mask.unsqueeze(-1).to(x.dtype)
+        a, _ = left.whiten(start, mask)
+        b, _ = right.whiten(start, mask)
+        stages.append(("whiten", float((a - b).abs().max())))
+        for index in range(len(left.blocks)):
+            a, _ = left.blocks[index](a, mask, condition)
+            b, _ = right.blocks[index](b, mask, condition)
+            stages.append((f"block[{index}]", float((a - b).abs().max())))
+        stages.append(("prior.log_prob", float(
+            (left.prior.log_prob(a, mask, condition)
+             - right.prior.log_prob(b, mask, condition)).abs().max())))
+    return [(name, value) for name, value in stages if value != 0.0] or stages
 
 
 def flow_for(*, coupled=False, learnable=True):
@@ -141,12 +192,22 @@ def test_a_parent_without_optimizer_state_is_reported_not_fatal():
 # ============================== checkpoint round-trip ============================
 @pytest.mark.parametrize("coupled", [False, True])
 def test_a_checkpoint_round_trips_for_both_prior_types(tmp_path, coupled):
+    """Identical parameters and buffers must give identical likelihoods.
+
+    Three things make this exact rather than approximate: ActNorm is initialized before
+    saving, so the saved flow is in a state a real checkpoint can be in; both models are
+    compared in EVAL mode, so neither re-initializes itself during the comparison; and
+    the comparison runs on one shared input tensor.
+    """
     from zinc_gnf.trainer_flow import vocabulary_fingerprint
 
-    flow = flow_for(coupled=coupled)
+    flow = initialize_in_place(flow_for(coupled=coupled))
     if coupled:
         with torch.no_grad():
             flow.prior.pre_rho.fill_(0.3)
+    flow.eval()
+    saved = {name: tensor.detach().clone().cpu()
+             for name, tensor in flow.state_dict().items()}
     path = tmp_path / "ckpt.pt"
     torch.save({"model_state_dict": flow.state_dict(),
                 "flow_config": flow.config.to_dict(),
@@ -155,13 +216,34 @@ def test_a_checkpoint_round_trips_for_both_prior_types(tmp_path, coupled):
     restored, probe = load_arm_flow(path)
     assert probe["coupled_prior"] is coupled
     assert isinstance(restored.prior, CoupledNodePrior) is coupled
+    # `load_arm_flow` evals the restore; the original must be in the same mode or its
+    # ActNorm would initialize from the comparison batch
+    assert restored.training is False and flow.training is False
+
+    # every parameter AND buffer identical, bit for bit
+    produced = {name: tensor.detach().cpu()
+                for name, tensor in restored.state_dict().items()}
+    assert set(produced) == set(saved), (
+        f"state keys differ: only saved {sorted(set(saved) - set(produced))}, "
+        f"only restored {sorted(set(produced) - set(saved))}")
+    differing = {name: float((produced[name].to(torch.float64)
+                              - saved[name].to(torch.float64)).abs().max())
+                 for name in saved if not torch.equal(produced[name], saved[name])}
+    assert differing == {}, f"state differs after the round trip: {differing}"
+    # the data-dependent initialization is part of what round-tripped
+    assert uninitialized_actnorms(restored) == []
     if coupled:
         assert float(restored.prior.pre_rho.mean().detach()) == pytest.approx(0.3)
+
     mask = torch.ones((2, 5), dtype=torch.bool)
-    x = torch.randn((2, 5, DIM))
+    x = torch.randn((2, 5, DIM), generator=torch.Generator().manual_seed(7))
     condition = torch.zeros((2, 8))
-    assert torch.allclose(restored.log_prob(x, mask, condition)["log_prob"],
-                          flow.log_prob(x, mask, condition)["log_prob"], atol=1e-5)
+    before = restored.log_prob(x, mask, condition)["log_prob"]
+    after = flow.log_prob(x, mask, condition)["log_prob"]
+    assert torch.equal(before, after), (
+        f"identical state gave different likelihoods ({before.tolist()} vs "
+        f"{after.tolist()}); first divergence by stage: "
+        f"{divergence_by_stage(flow, restored, x, mask, condition)}")
 
 
 def test_generation_works_without_knowing_the_arm(tmp_path):
@@ -169,7 +251,7 @@ def test_generation_works_without_knowing_the_arm(tmp_path):
     from zinc_gnf.trainer_flow import vocabulary_fingerprint
 
     for coupled in (False, True):
-        flow = flow_for(coupled=coupled)
+        flow = initialize_in_place(flow_for(coupled=coupled)).eval()
         path = tmp_path / f"ckpt_{coupled}.pt"
         torch.save({"model_state_dict": flow.state_dict(),
                     "flow_config": flow.config.to_dict(),

@@ -198,10 +198,10 @@ def test_rho_is_bounded():
     model = prior(rho=0.5)
     with torch.no_grad():
         model.pre_rho.fill_(50.0)
-    assert float(model.rho().max()) <= RHO_MAX
+    assert float(model.rho().max().detach()) <= RHO_MAX
     with torch.no_grad():
         model.pre_rho.fill_(-50.0)
-    assert float(model.rho().min()) > 0.0
+    assert float(model.rho().min().detach()) > 0.0
 
 
 def test_the_conditional_pathway_is_reused_unchanged():

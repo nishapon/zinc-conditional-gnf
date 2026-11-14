@@ -10,6 +10,8 @@ PATH 2 resumes an interrupted arm run and must reject a changed arm configuratio
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -158,6 +160,7 @@ def test_an_optimizer_built_after_warm_start_updates_the_prior(tmp_path, arm_nam
                        flow_config=config,
                        sampler_state=sampler_state(arm, train_config))
     flow, _ = load_arm_flow(target)
+    flow.train()
     flow.prior.pre_rho.requires_grad_(arm.rho_learnable)
     optimizer = torch.optim.Adam(flow.parameters(), lr=EXPERIMENT_LR)
     blob = torch.load(target, map_location="cpu", weights_only=False)
@@ -165,14 +168,69 @@ def test_an_optimizer_built_after_warm_start_updates_the_prior(tmp_path, arm_nam
     # the experiment rate must survive loading the parent's moments
     assert all(group["lr"] == EXPERIMENT_LR for group in optimizer.param_groups)
 
-    mask = torch.ones((2, 4), dtype=torch.bool)
+    # membership by tensor IDENTITY: a frozen rho must be frozen because no gradient
+    # reaches it, not because it was quietly left out of the optimizer
+    tracked = {id(parameter) for group in optimizer.param_groups
+               for parameter in group["params"]}
+    in_optimizer = id(flow.prior.pre_rho) in tracked
+
+    mask = torch.ones((8, 6), dtype=torch.bool)
+    x = torch.randn((8, 6, DIM), generator=torch.Generator().manual_seed(4))
     before = flow.prior.pre_rho.detach().clone()
+    rho_before = flow.prior.rho().detach().clone()
     optimizer.zero_grad()
-    flow.negative_log_likelihood(torch.randn((2, 4, DIM)), mask,
-                                 torch.zeros((2, 8)))["loss"].backward()
+    flow.negative_log_likelihood(x, mask, torch.zeros((8, 8)))["loss"].backward()
+    gradient = flow.prior.pre_rho.grad
     optimizer.step()
-    moved = not torch.allclose(before, flow.prior.pre_rho.detach())
-    assert moved is arm.rho_learnable
+    after = flow.prior.pre_rho.detach().clone()
+    rho_after = flow.prior.rho().detach().clone()
+
+    change = float((after - before).abs().max())
+    # the smallest change float32 can even represent at this parameter's magnitude
+    resolution = float(before.abs().max()) * float(torch.finfo(before.dtype).eps)
+    report = {
+        "arm": arm_name,
+        "rho_learnable": arm.rho_learnable,
+        "pre_rho_value": float(before.max()),
+        "pre_rho_requires_grad": bool(flow.prior.pre_rho.requires_grad),
+        "pre_rho_in_optimizer": in_optimizer,
+        "grad_is_none": gradient is None,
+        "grad_all_finite": (None if gradient is None
+                            else bool(torch.isfinite(gradient).all())),
+        "grad_abs_max": None if gradient is None else float(gradient.abs().max()),
+        "max_abs_pre_rho_change": change,
+        "max_abs_rho_change": float((rho_after - rho_before).abs().max()),
+        "learning_rate": EXPERIMENT_LR,
+        "change_over_learning_rate": change / EXPERIMENT_LR,
+        "float32_resolution_at_pre_rho": resolution,
+        # why the previous `torch.allclose(before, after)` assertion was wrong: at
+        # pre_rho ~ -4.49 its default band is rtol*|value| = 1e-5 * 4.49 = 4.5e-5, which
+        # is WIDER than a genuine first Adam step of ~lr = 1e-5. It reported "no change"
+        # for an update that had in fact happened and was representable.
+        "allclose_default_band": 1e-8 + 1e-5 * float(after.abs().max()),
+        "update_hidden_by_default_allclose": change < 1e-8 + 1e-5 * float(
+            after.abs().max()),
+    }
+    print("\npre_rho update diagnostics: " + json.dumps(report, indent=2))
+
+    assert in_optimizer is True, report
+    if arm.rho_learnable:
+        assert gradient is not None, report
+        assert report["grad_all_finite"] is True, report
+        assert report["grad_abs_max"] > 0.0, report
+        # exact inequality, no tolerance: the parameter must genuinely differ
+        assert not torch.equal(before, after), report
+        # and the difference must be representable rather than lost to rounding
+        assert change > resolution, report
+        # a single Adam step on a parameter with no inherited moments is
+        # lr * m_hat/(sqrt(v_hat)+eps), which approaches lr from below
+        assert change <= EXPERIMENT_LR * 1.001, report
+        # rho itself moves, not just its pre-activation
+        assert report["max_abs_rho_change"] > 0.0, report
+    else:
+        assert gradient is None, report
+        assert torch.equal(before, after), report
+        assert report["max_abs_rho_change"] == 0.0, report
 
 
 # ========================= optimizer mapping by NAME =============================
@@ -413,13 +471,72 @@ def test_a_run_with_no_parent_omits_the_block_rather_than_writing_an_empty_one(
 
 
 # =============================== PATH 2, resume ==================================
-def test_the_balanced_sampler_refuses_a_deterministic_batcher_state():
-    """The unconditional batcher restore must not absorb a foreign state silently."""
+def balanced_for_state_tests():
     n_node = np.asarray([15] * 300 + [23] * 90)
     qed = np.asarray([0.5] * 300 + [0.8] * 90)
-    sampler = BalancedSampler(n_node, qed, batch_size=8, seed=3, alpha=0.5)
+    return BalancedSampler(n_node, qed, batch_size=8, seed=3, alpha=0.5)
+
+
+def test_the_balanced_sampler_refuses_a_deterministic_batcher_state():
+    """The unconditional batcher restore must not absorb a foreign state silently.
+
+    `DeterministicBatcher(390, 8, 3)` matches this sampler's size, batch_size and seed
+    exactly and omits `alpha` and `min_cell_count`, which is precisely the case the old
+    `if key in state` guard skipped over.
+    """
+    sampler = balanced_for_state_tests()
+    foreign = DeterministicBatcher(390, 8, 3).state_dict()
+    assert foreign["size"] == sampler.size
+    assert foreign["batch_size"] == sampler.batch_size and foreign["seed"] == sampler.seed
+    assert "alpha" not in foreign and "min_cell_count" not in foreign
     with pytest.raises(ValueError, match="not written by a BalancedSampler"):
-        sampler.load_state_dict(DeterministicBatcher(390, 8, 3).state_dict())
+        sampler.load_state_dict(foreign)
+
+
+def test_a_rejected_state_leaves_the_sampler_untouched():
+    """Rejection must happen before any mutation, or a refused resume still corrupts."""
+    sampler = balanced_for_state_tests()
+    [sampler.next_indices() for _ in range(3)]
+    expected = sampler.state_dict()
+    following = sampler._order.copy()
+    for bad in (DeterministicBatcher(390, 8, 3).state_dict(),
+                {"epoch": 9, "position": 0},
+                sampler.state_dict() | {"alpha": 0.9},
+                sampler.state_dict() | {"qed_bin_width": 0.05},
+                sampler.state_dict() | {"max_exposure_ratio": 3.0},
+                {key: value for key, value in sampler.state_dict().items()
+                 if key != "alpha"}):
+        with pytest.raises(ValueError):
+            sampler.load_state_dict(bad)
+        assert sampler.state_dict() == expected
+        assert np.array_equal(sampler._order, following)
+
+
+def test_the_exposure_cap_and_bin_width_are_actually_validated():
+    """Both were unreachable before: the loop checked a key `state_dict` never wrote."""
+    sampler = balanced_for_state_tests()
+    assert "max_exposure_ratio" in sampler.state_dict()
+    assert "qed_bin_width" in sampler.state_dict()
+    assert "max_weight_ratio" not in sampler.state_dict()
+    for key in BalancedSampler.IDENTIFYING:
+        assert key in sampler.state_dict(), key
+        assert hasattr(sampler, key), key
+
+
+def test_a_deterministic_batcher_refuses_a_balanced_state_but_accepts_a_legacy_one():
+    """The same hazard in the other direction, plus backward compatibility.
+
+    The 50k parent's batcher state predates the tag, so an untagged state must still
+    load; otherwise every ordinary resume in the repository breaks.
+    """
+    sampler = balanced_for_state_tests()
+    batcher = DeterministicBatcher(390, 8, 3)
+    with pytest.raises(ValueError, match="not a DeterministicBatcher"):
+        batcher.load_state_dict(sampler.state_dict())
+    legacy = {key: value for key, value in DeterministicBatcher(390, 8, 3).state_dict().items()
+              if key != "sampler"}
+    batcher.load_state_dict(legacy)
+    assert batcher.epoch == 0 and batcher.position == 0
 
 
 def test_a_balanced_state_round_trips():
