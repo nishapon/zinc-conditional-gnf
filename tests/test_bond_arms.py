@@ -340,14 +340,91 @@ def test_both_loss_terms_stay_separately_visible():
                 "bond_true_degree", "bond_bridge_norm"):
         assert key in extras, key
         assert isinstance(extras[key], (int, float)), key
-    # the trainer logs `nll_per_node` next to these, so the two are never conflated
-    import inspect
-
-    source = inspect.getsource(FlowTrainer.train)
-    assert '"nll_per_node": float(parts["loss"].detach())' in source, (
-        "the trainer must log the pure likelihood separately from the total loss")
-    assert "**auxiliary" in source, "auxiliary terms must reach the metrics"
     assert extras["bond_bridge_norm"] == 0.0   # zero-initialised at step 0
+    # The hook must not shadow the keys the trainer writes itself. The cluster trainer
+    # records the likelihood with `window[-1].setdefault("nll_per_node", ...)`, which
+    # SILENTLY KEEPS an existing value, so an extras key of the same name would be
+    # ignored without any error -- and a different one would be a lie that never
+    # surfaced.
+    assert "nll_per_node" not in extras
+    assert "loss" not in extras
+
+
+def emitted_record(total, nll, extras):
+    """Reproduce the cluster trainer's record composition, in its order.
+
+    `window[-1].setdefault("nll_per_node", float(nll_loss.detach()))` followed by the
+    auxiliary metrics. Written out here rather than asserted against the trainer's source
+    text, so this holds for both the repo trainer and the cluster's local version.
+    """
+    record = {"loss": float(total.detach())}
+    record.setdefault("nll_per_node", float(nll.detach()))
+    record.update(extras)
+    return record
+
+
+def test_an_emitted_record_separates_the_likelihood_from_the_total():
+    flow, batch = small_flow(), ring_batch()
+    parts = run_step(flow, batch)
+    nll = parts["loss"]
+    total, extras = arm_trainer("pairwise_supervised", 0.1)._augment_loss(
+        nll, flow=flow, batch=batch, parts=parts)
+    record = emitted_record(total, nll, extras)
+
+    # nll_per_node IS the original likelihood, bit for bit
+    assert record["nll_per_node"] == float(nll.detach())
+    # the total is strictly larger, and larger by exactly the weighted bond term
+    assert record["loss"] > record["nll_per_node"]
+    assert record["loss"] - record["nll_per_node"] == pytest.approx(
+        record["bond_loss_weighted"], rel=1e-6)
+    assert record["bond_loss_weighted"] == pytest.approx(
+        0.1 * record["bond_loss"], rel=1e-6)
+
+
+def test_the_bond_term_is_added_exactly_once_to_whatever_loss_the_trainer_passes():
+    """The cluster trainer may already have folded a QED term in before the hook runs.
+
+    The hook's contract is that it adds ITS OWN term to the loss it is given, exactly
+    once, and leaves every other component untouched. Asserting that here keeps the
+    cluster's QED logic intact: whatever it contributes passes through unchanged, and the
+    difference between the hook's output and its input is the bond term alone.
+    """
+    flow, batch = small_flow(), ring_batch()
+    parts = run_step(flow, batch)
+    nll = parts["loss"]
+    qed_term = torch.tensor(0.25, requires_grad=True)
+    incoming = nll + qed_term               # the cluster's step loss, QED included
+    total, extras = arm_trainer("pairwise_supervised", 0.1)._augment_loss(
+        incoming, flow=flow, batch=batch, parts=parts)
+
+    added = float(total.detach()) - float(incoming.detach())
+    assert added == pytest.approx(extras["bond_loss_weighted"], rel=1e-6)
+    assert added == pytest.approx(0.1 * extras["bond_loss"], rel=1e-6)
+    # the QED contribution survives exactly once, and the likelihood is still recoverable
+    record = emitted_record(total, nll, extras)
+    assert record["nll_per_node"] == float(nll.detach())
+    assert record["loss"] - record["nll_per_node"] == pytest.approx(
+        float(qed_term) + extras["bond_loss_weighted"], rel=1e-6)
+    # the hook did not touch the QED term's own gradient path
+    total.backward()
+    assert qed_term.grad is not None and float(qed_term.grad) == pytest.approx(1.0)
+
+
+def test_a_likelihood_only_arm_emits_a_total_equal_to_the_loss_it_was_given():
+    """Arm `pairwise` must add nothing, while still reporting the bond diagnostics."""
+    flow, batch = small_flow(), ring_batch()
+    parts = run_step(flow, batch)
+    nll = parts["loss"]
+    qed_term = torch.tensor(0.4)
+    incoming = nll + qed_term
+    total, extras = arm_trainer("pairwise", 0.0)._augment_loss(
+        incoming, flow=flow, batch=batch, parts=parts)
+    assert total is incoming
+    record = emitted_record(total, nll, extras)
+    assert record["nll_per_node"] == float(nll.detach())
+    assert record["loss"] - record["nll_per_node"] == pytest.approx(float(qed_term),
+                                                                    rel=1e-6)
+    assert record["bond_loss"] > 0.0 and record["bond_loss_weighted"] == 0.0
 
 
 def test_the_default_loss_hook_is_a_no_op():

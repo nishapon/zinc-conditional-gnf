@@ -168,6 +168,34 @@ class BondPairwiseConditioner(nn.Module):
     def _pair_logits(self, hidden: torch.Tensor, pair_mask: torch.Tensor,
                      condition: torch.Tensor | None) -> torch.Tensor:
         """Symmetric `[B, N, N]` logits. Every term is invariant under swapping i and j."""
+        raw = self._raw_pair_logits(hidden, condition)
+        # Symmetrise EXPLICITLY, on the finite logits, before masking.
+        #
+        # Every term above is symmetric as a formula, but the bilinear one is not
+        # symmetric in float32: entry (i,j) is computed as sum_p (w_p * h_ip) * h_jp and
+        # entry (j,i) as sum_p (w_p * h_jp) * h_ip. Multiplication commutes but does not
+        # ASSOCIATE, so the two differ in the last bits -- measured at up to ~1e-6
+        # absolute over random float32 triples. That is roundoff, not an asymmetric term,
+        # but `b_ij != b_ji` by any amount means a pair contributes two slightly
+        # different values to the two nodes' degrees and the auxiliary loss scores one
+        # unordered pair as though direction mattered.
+        #
+        # 0.5 * (x + x^T) is bitwise symmetric: addition commutes exactly in IEEE 754 and
+        # multiplication by 0.5 is exact. Done BEFORE the mask so no -inf enters the
+        # arithmetic, and before the gate and the loss are derived, so both consume the
+        # same symmetric matrix.
+        symmetric = 0.5 * (raw + raw.transpose(1, 2))
+        # padded pairs and the diagonal are driven to a hard zero gate, so they cannot
+        # contribute to any degree or message
+        return symmetric.masked_fill(~pair_mask, float("-inf"))
+
+    def _raw_pair_logits(self, hidden: torch.Tensor,
+                         condition: torch.Tensor | None) -> torch.Tensor:
+        """The unsymmetrised, unmasked logits. Symmetric as a formula, not bitwise.
+
+        Split out so `asymmetry_report` can measure the roundoff that
+        `_pair_logits` then removes, rather than that number being unobservable.
+        """
         projected = self.sum_head(hidden)                              # [B, N, 1]
         logits = projected + projected.transpose(1, 2)                 # w.(u_i + u_j)
         weighted = hidden * self.product_weight                        # [B, N, P]
@@ -180,9 +208,43 @@ class BondPairwiseConditioner(nn.Module):
                 raise ValueError("this bond conditioner is conditional but no condition "
                                  "was given")
             logits = logits + self.condition_bias(condition).unsqueeze(-1)
-        # padded pairs and the diagonal are driven to a hard zero gate, so they cannot
-        # contribute to any degree or message
-        return logits.masked_fill(~pair_mask, float("-inf"))
+        return logits
+
+    @torch.no_grad()
+    def asymmetry_report(self, source: torch.Tensor, mask: torch.Tensor,
+                         condition: torch.Tensor | None) -> dict[str, Any]:
+        """Max asymmetry on FINITE, VALID, OFF-DIAGONAL pairs, plus NaN counts.
+
+        Diagnostic. If `raw_max_abs_asymmetry` is at float32 roundoff relative to the
+        logit scale, the formula is symmetric and `_pair_logits` has removed the
+        roundoff. If it is larger, one of the terms is genuinely asymmetric and the
+        symmetrisation is hiding a bug rather than fixing one.
+        """
+        floats = mask.unsqueeze(-1).to(source.dtype)
+        hidden = self.pair_projection(source) * floats
+        pair_mask = pair_mask_from_node_mask(mask)
+        raw = self._raw_pair_logits(hidden, condition)
+        final = self._pair_logits(hidden, pair_mask, condition)
+        valid = pair_mask & torch.isfinite(raw) & torch.isfinite(raw.transpose(1, 2))
+        if not bool(valid.any()):
+            return {"valid_pairs": 0, "note": "no finite valid off-diagonal pairs"}
+        raw_gap = (raw - raw.transpose(1, 2)).abs()[valid]
+        # mask BEFORE subtracting: outside the pair mask both sides are -inf, and
+        # -inf - -inf is NaN, which would show up as a spurious NaN in this diagnostic
+        finite = torch.where(pair_mask, final, torch.zeros_like(final))
+        final_gap = (finite - finite.transpose(1, 2)).abs()[pair_mask]
+        scale = raw.abs()[valid].max()
+        return {
+            "valid_pairs": int(valid.sum()),
+            "logit_abs_max": float(scale),
+            "raw_max_abs_asymmetry": float(raw_gap.max()),
+            "raw_relative_asymmetry": float(raw_gap.max() / scale.clamp(min=1e-12)),
+            "symmetrised_max_abs_asymmetry": float(final_gap.max()),
+            "float32_eps_at_that_scale": float(scale) * 2 ** -23,
+            "raw_nan": int(torch.isnan(raw).sum()),
+            "symmetrised_nan": int(torch.isnan(final).sum()),
+            "non_finite_on_valid_pairs": int((~torch.isfinite(final))[pair_mask].sum()),
+        }
 
     def forward(self, source: torch.Tensor, mask: torch.Tensor,
                 condition: torch.Tensor | None
@@ -292,6 +354,10 @@ def bond_loss_and_metrics(logits: Sequence[torch.Tensor], bond_types: torch.Tens
             "bond_precision": precision,
             "bond_recall": recall,
             "bond_f1": f1,
+            # SOFT degree: the expected neighbour count under the gate, averaged over
+            # real nodes. Not a thresholded count -- a confident "no bond" still carries
+            # sigmoid(-8) = 3.4e-4 per pair, so an all-negative predictor reports a small
+            # but nonzero value. Read it against bond_true_degree, not against zero.
             "bond_predicted_degree": float((symmetric_gate.sum(-1)
                                             * node_mask).sum() / nodes),
             "bond_true_degree": float(((target * pair_mask.to(target.dtype)).sum(-1)

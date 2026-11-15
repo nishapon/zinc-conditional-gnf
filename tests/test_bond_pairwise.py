@@ -173,7 +173,9 @@ def test_the_pair_gate_is_zero_on_padding_and_the_diagonal():
     source = torch.randn((2, 5, DIM), generator=torch.Generator().manual_seed(3))
     _, logits = conditioner(source * mask.unsqueeze(-1), mask,
                             torch.zeros((2, CONDITION)))
-    gate = torch.sigmoid(logits)
+    # detach before any scalar conversion: the conditioner's parameters require grad, so
+    # float() on a graph-attached tensor warns
+    gate = torch.sigmoid(logits).detach()
     pair_mask = pair_mask_from_node_mask(mask)
     assert float(gate[~pair_mask].abs().max()) == 0.0
     assert float(torch.diagonal(gate, dim1=1, dim2=2).abs().max()) == 0.0
@@ -182,14 +184,48 @@ def test_the_pair_gate_is_zero_on_padding_and_the_diagonal():
 
 
 def test_the_pair_logits_are_exactly_symmetric():
-    """A bond is a symmetric relation; Q K^T is not. This is one of the distinctions."""
+    """A bond is a symmetric relation; Q K^T is not. This is one of the distinctions.
+
+    The assertion is bitwise on purpose. `b_ij != b_ji` by ANY amount means one unordered
+    pair contributes two different values to the two nodes' degrees, and the auxiliary
+    loss scores a symmetric relation as though direction mattered.
+    """
     conditioner = BondPairwiseConditioner(DIM, pair_dim=5, condition_dim=CONDITION)
     with torch.no_grad():
         conditioner.product_weight.normal_()
     mask = torch.ones((3, 6), dtype=torch.bool)
     source = torch.randn((3, 6, DIM), generator=torch.Generator().manual_seed(4))
-    _, logits = conditioner(source, mask, torch.randn((3, CONDITION)))
+    condition = torch.randn((3, CONDITION))
+    _, logits = conditioner(source, mask, condition)
     assert torch.equal(logits, logits.transpose(1, 2))
+
+    # and the roundoff that made this fail before is measured, not assumed: the formula
+    # is symmetric, so the raw gap must sit at float32 roundoff for the logit scale
+    report = conditioner.asymmetry_report(source, mask, condition)
+    assert report["valid_pairs"] > 0
+    assert report["symmetrised_max_abs_asymmetry"] == 0.0
+    assert report["raw_nan"] == 0 and report["symmetrised_nan"] == 0
+    assert report["non_finite_on_valid_pairs"] == 0
+    assert report["raw_relative_asymmetry"] < 1e-5, (
+        f"asymmetry too large to be roundoff, trace the bilinear term first: {report}")
+
+
+def test_the_symmetrisation_survives_padding_and_a_masked_batch():
+    """-inf must never enter the symmetrisation arithmetic and produce a NaN."""
+    conditioner = BondPairwiseConditioner(DIM, pair_dim=4, condition_dim=CONDITION)
+    with torch.no_grad():
+        conditioner.product_weight.normal_()
+    mask = node_mask_from_counts((1, 3, 6), max_nodes=6)
+    source = torch.randn((3, 6, DIM), generator=torch.Generator().manual_seed(23))
+    condition = torch.randn((3, CONDITION))
+    _, logits = conditioner(source * mask.unsqueeze(-1), mask, condition)
+    assert torch.equal(logits, logits.transpose(1, 2))
+    assert not bool(torch.isnan(logits).any())
+    report = conditioner.asymmetry_report(source * mask.unsqueeze(-1), mask, condition)
+    assert report["symmetrised_nan"] == 0
+    assert report["symmetrised_max_abs_asymmetry"] == 0.0
+    # the single-atom molecule has no valid pair at all, and that is not an error
+    assert float(torch.sigmoid(logits[0]).detach().abs().max()) == 0.0
 
 
 def test_a_node_permutation_permutes_the_scores_consistently():
@@ -225,13 +261,14 @@ def test_the_soft_degree_counts_neighbours_rather_than_normalising():
     mask = node_mask_from_counts(counts, max_nodes=8)
     source = torch.randn((3, 8, DIM), generator=torch.Generator().manual_seed(7))
     features, logits = conditioner(source * mask.unsqueeze(-1), mask, None)
-    gate = torch.sigmoid(logits) * pair_mask_from_node_mask(mask).to(torch.float32)
+    gate = (torch.sigmoid(logits).detach()
+            * pair_mask_from_node_mask(mask).to(torch.float32))
     degree = gate.sum(-1)
     for row, count in enumerate(counts):
         assert float(degree[row, 0]) == pytest.approx(count - 1, abs=1e-4), count
     # and the feature the conditioner consumes carries it
     expected = torch.log1p(degree)
-    assert torch.allclose(features[..., -2], expected * mask, atol=1e-5)
+    assert torch.allclose(features.detach()[..., -2], expected * mask, atol=1e-5)
 
 
 def test_the_conditioner_never_sees_a_bond_matrix():
@@ -428,8 +465,15 @@ def test_an_empty_logit_list_is_refused_rather_than_scored_as_zero():
 
 
 # ================================ class imbalance ===============================
-def molecule_batch(counts=(10, 12), width=12, seed=13):
-    """A chain plus a ring closure, so the positive rate resembles a real molecule."""
+FIXTURE_COUNTS = (10, 12)
+
+
+def molecule_batch(counts=FIXTURE_COUNTS, width=12, seed=13):
+    """A chain plus a ring closure, so the positive rate resembles a real molecule.
+
+    Every real node therefore has EXACTLY 2 bonded neighbours and `count - 1` valid
+    neighbours, which is what makes the expected soft degree computable in closed form.
+    """
     mask = node_mask_from_counts(counts, max_nodes=width)
     bonds = torch.zeros((len(counts), width, width), dtype=torch.long)
     for row, count in enumerate(counts):
@@ -437,6 +481,36 @@ def molecule_batch(counts=(10, 12), width=12, seed=13):
             bonds[row, i, i + 1] = bonds[row, i + 1, i] = 1
         bonds[row, 0, count - 1] = bonds[row, count - 1, 0] = 1
     return bonds, mask
+
+
+def expected_soft_degree(counts, *, bonded_logit, other_logit):
+    """The soft degree `bond_loss_and_metrics` must report, derived from the fixture.
+
+    Independent of the implementation. The documented averaging rule is: average the
+    layers' logits, take the sigmoid on the counted (upper-triangle) pairs, mirror it to
+    a symmetric matrix, sum over j to get a per-node SOFT degree, then average over real
+    nodes weighted by node count. With a chain-plus-ring fixture each node has 2 bonded
+    neighbours and `count - 1 - 2` unbonded valid neighbours, so
+
+        soft degree(node) = 2*sigmoid(bonded) + (count - 3)*sigmoid(other)
+
+    This is an expected neighbour count under the gate, NOT a thresholded count: a
+    confident "no bond" still contributes sigmoid(-8) = 3.3535e-4 per pair, so the value
+    for an all-negative predictor is small but provably nonzero.
+    """
+    import math
+
+    assert all(count >= 3 for count in counts), (
+        "below 3 atoms the fixture's ring closure coincides with a chain bond, so each "
+        "node has 1 bonded neighbour rather than 2 and this formula does not apply")
+    sigmoid = lambda z: 1.0 / (1.0 + math.exp(-z))  # noqa: E731
+    nodes = sum(counts)
+    total = 0.0
+    for count in counts:
+        per_node = (2 * sigmoid(bonded_logit)
+                    + max(count - 1 - 2, 0) * sigmoid(other_logit))
+        total += count * per_node
+    return total / nodes
 
 
 def test_predicting_no_bond_everywhere_scores_zero_f1_and_a_worse_loss():
@@ -455,18 +529,67 @@ def test_predicting_no_bond_everywhere_scores_zero_f1_and_a_worse_loss():
     # ... which is why the trivial baseline is reported next to it
     assert bad["metrics"]["bond_accuracy"] == pytest.approx(
         bad["metrics"]["bond_trivial_accuracy"], abs=1e-9)
-    # F1 is zero, because recall is zero
+    # F1 is zero, because recall is zero. These are the checks that matter.
     assert bad["metrics"]["bond_recall"] == 0.0
     assert bad["metrics"]["bond_f1"] == 0.0
-    assert bad["metrics"]["bond_predicted_degree"] == pytest.approx(0.0, abs=1e-3)
+    assert bad["metrics"]["bond_precision"] == 0.0
+    # The SOFT degree is not zero and must not be asserted to be: a confident -8 still
+    # carries sigmoid(-8) = 3.3535e-4 of probability per pair. The expected value is
+    # computed from the fixture instead, so the metric is pinned exactly rather than
+    # loosely bounded.
+    assert bad["metrics"]["bond_predicted_degree"] == pytest.approx(
+        expected_soft_degree(FIXTURE_COUNTS, bonded_logit=-8.0, other_logit=-8.0),
+        rel=1e-5)
+    # what makes it useless is its size relative to the truth, not its being zero
+    assert bad["metrics"]["bond_predicted_degree"] < 0.01 * bad["metrics"][
+        "bond_true_degree"]
     # and the reweighted loss is strictly worse than getting the bonds right
     assert float(bad["loss"]) > float(good["loss"])
     assert good["metrics"]["bond_f1"] == pytest.approx(1.0)
     assert good["metrics"]["bond_predicted_degree"] == pytest.approx(
-        good["metrics"]["bond_true_degree"], rel=1e-3)
+        expected_soft_degree(FIXTURE_COUNTS, bonded_logit=8.0, other_logit=-8.0),
+        rel=1e-5)
     # the imbalance is real in this fixture (a real N=23 molecule is near 0.10)
     positives = float((target * counted.to(target.dtype)).sum())
     assert positives / float(counted.sum()) < 0.25
+
+
+@pytest.mark.parametrize("counts,width", [((10, 12), 12), ((4,), 4), ((3, 9, 12), 12),
+                                          ((5, 5), 9)])
+def test_the_soft_degree_matches_an_independent_calculation(counts, width):
+    """Pins the metric's masking AND its denominator, not just its magnitude.
+
+    Padded rows must be excluded from both the sum and the node count, so the varied
+    widths here would catch a denominator of `batch * width` instead of real nodes, and
+    the single-molecule and ragged cases would catch a per-molecule average being passed
+    off as a per-node one.
+    """
+    bonds, mask = molecule_batch(counts=counts, width=width)
+    target = bond_targets(bonds)
+    for bonded, other in ((-8.0, -8.0), (8.0, -8.0), (2.0, -1.0)):
+        logits = torch.where(target > 0.5, bonded, other)
+        metrics = bond_loss_and_metrics([logits], bonds, mask)["metrics"]
+        assert metrics["bond_predicted_degree"] == pytest.approx(
+            expected_soft_degree(counts, bonded_logit=bonded, other_logit=other),
+            rel=1e-5), (counts, bonded, other)
+    # the true degree is 2 everywhere in this fixture, by construction
+    assert bond_loss_and_metrics([torch.zeros_like(target)], bonds,
+                                 mask)["metrics"]["bond_true_degree"] == \
+        pytest.approx(2.0, rel=1e-6)
+
+
+def test_the_soft_degree_is_unchanged_by_padding_width():
+    """Same molecules, more padding: a degree that moved would prove a masking bug."""
+    counts = (6, 9)
+    narrow = bond_loss_and_metrics(
+        [torch.zeros((2, 9, 9))], *molecule_batch(counts=counts, width=9))["metrics"]
+    bonds, mask = molecule_batch(counts=counts, width=14)
+    wide = bond_loss_and_metrics([torch.zeros((2, 14, 14))], bonds, mask)["metrics"]
+    assert wide["bond_predicted_degree"] == pytest.approx(
+        narrow["bond_predicted_degree"], rel=1e-6)
+    assert wide["bond_pos_rate"] == pytest.approx(narrow["bond_pos_rate"], rel=1e-6)
+    assert wide["bond_true_degree"] == pytest.approx(narrow["bond_true_degree"],
+                                                     rel=1e-6)
 
 
 def test_the_positive_weight_is_the_measured_ratio_not_a_constant():
