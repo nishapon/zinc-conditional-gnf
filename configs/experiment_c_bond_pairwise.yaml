@@ -1,0 +1,75 @@
+# ============================================================================
+# EXPERIMENT C, ARM 2 of 3: pairwise, LIKELIHOOD TRAINING ALONE.
+#
+# The bond-aware pairwise pathway is present and trainable, but there is NO bond
+# supervision. This arm is what separates the architecture from the training signal:
+#
+#   pairwise vs control             = what the architecture buys on likelihood alone
+#   pairwise_supervised vs pairwise = what the bond target buys on top
+#
+# Architecturally identical to experiment_c_bond_supervised.yaml - same parameters,
+# same initialisation, same seed. The ONLY difference is bond_loss_weight = 0.
+#
+# WHAT THE PATHWAY IS (zinc_gnf/bond_pairwise.py)
+# Each affine coupling's conditioner scores every real pair from the coupling's
+# PASS-THROUGH half, b_ij = sigmoid(l_ij) with l_ij == l_ji exactly, and aggregates
+# the result WITHOUT a softmax:
+#
+#     degree_i  = sum_j b_ij                       (a soft neighbour COUNT)
+#     message_i = sum_j b_ij v_j / (1 + degree_i)
+#
+# The existing MaskedSelfAttention already computes a learned pair score, so the
+# scoring itself is not new. What is new is that softmax attention produces a convex
+# combination - its weights sum to 1 however many neighbours are active - and so
+# cannot represent absolute degree. Valence is precisely degree plus bond order, and
+# valence is what decides whether a decoded molecule parses.
+#
+# FLOW MATHEMATICS: the conditioner reads only the pass-through half, the condition
+# and the node mask, all identical in the forward and inverse directions, so the map
+# stays a bijection and log|det J| is unchanged. The true bond matrix is never an
+# input, which is what keeps the layer usable at generation time.
+#
+# Driven by scripts/45_train_bond_arm.py --arm pairwise.
+# ============================================================================
+
+experiment: C_bond_pairwise
+arm: pairwise
+
+parent:
+  checkpoint: outputs/checkpoints/flow_nqed_ae128_qedcontrast/seed_3/best.pt
+  autoencoder: outputs/ablation/ae_degree_128d/seed_3/last.pt
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+
+architecture:
+  bond_aware_coupling: true
+  bond_pair_dim: 16              # pair scorer width; dominates the activation memory
+  # measured on the built flow by --inspect-only, at batch 128 and N=38:
+  #   24 conditioners (2 per block x 12 blocks)
+  #   144,840 new parameters (1,427 scorer + 4,608 bridge each)
+  #   ~355 MB extra activation memory, dominated by |h_i - h_j| of shape
+  #   [B, N, N, bond_pair_dim] which autograd keeps for the backward pass
+  # levers if it does not fit: bond_pair_dim 8 -> ~213 MB, batch_size 64 -> ~177 MB.
+
+objective:
+  bond_loss_weight: 0.0          # MEASURED in the logs, never optimised
+  note: >
+    bond_loss, bond_f1, bond_recall and the rest are still logged for this arm, so the
+    two pairwise arms are comparable on the same diagnostic. The gradient is simply
+    absent. Watch bond_bridge_norm: the bridge is zero-initialised, so the likelihood
+    gradient reaching the scorer is zero at step 0 and only becomes nonzero once the
+    bridge itself has moved. If bond_bridge_norm stays at 0 this arm never engaged its
+    pathway and its result says nothing about the architecture.
+
+training:
+  screening_steps: 3000
+  learning_rate: 1.0e-5
+  warmup_steps: 100
+  batch_size: 128
+  seed: 3
+  eval_every: 500
+  save_every: 500
+  val_molecules: 5000
+  early_stopping_patience: null
+
+selection:
+  criterion: validation likelihood

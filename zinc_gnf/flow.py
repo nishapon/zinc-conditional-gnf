@@ -91,6 +91,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from zinc_gnf.bond_pairwise import BOND_PAIR_DIM, BondPairwiseConditioner
+
 CONDITION_FEATURES = ("n", "qed")       # order is fixed; a config names a prefix-free subset
 
 
@@ -110,6 +112,11 @@ class FlowConfig:
     actnorm: bool = True
     invertible_linear: bool = True
     node_autoregressive: bool = False       # ARM B: add one node-autoregressive coupling per block
+    # Experiment C: a bond-aware pairwise pathway inside each affine coupling's
+    # conditioner. Reads only the pass-through half, so the bijection and the
+    # log-determinant are unchanged; see zinc_gnf/bond_pairwise.py.
+    bond_aware_coupling: bool = False
+    bond_pair_dim: int = 16                 # width of the pair scorer's projection
     prior_min_sigma: float = 0.1            # [teammates] softplus floor
     prior_init_sigma: float = 1.0           # [teammates] sigma at initialization
     prior_hidden_dim: int = 64              # [teammates] conditional prior MLP width
@@ -137,6 +144,8 @@ class FlowConfig:
             raise ValueError("max_log_scale must be > 0")
         if self.noise_sigma < 0:
             raise ValueError("noise_sigma must be >= 0")
+        if self.bond_aware_coupling and self.bond_pair_dim < 1:
+            raise ValueError("bond_pair_dim must be >= 1 when bond_aware_coupling is on")
 
     @property
     def conditional(self) -> bool:
@@ -290,7 +299,8 @@ class CouplingNetwork(nn.Module):
     """
 
     def __init__(self, in_dim: int, out_dim: int, *, attention_dim: int, num_heads: int,
-                 hidden_dim: int, condition_dim: int) -> None:
+                 hidden_dim: int, condition_dim: int, bond_aware: bool = False,
+                 bond_pair_dim: int = BOND_PAIR_DIM) -> None:
         super().__init__()
         self.input_projection = nn.Linear(in_dim, attention_dim)
         self.attention = MaskedSelfAttention(attention_dim, num_heads)
@@ -298,6 +308,15 @@ class CouplingNetwork(nn.Module):
         self.film = nn.Linear(condition_dim, 2 * hidden_dim) if condition_dim else None
         self.scale_head = nn.Linear(hidden_dim, out_dim)
         self.translation_head = nn.Linear(hidden_dim, out_dim)
+        # Experiment C. A SEPARATE additive bridge rather than a wider `self.hidden`, so
+        # the pretrained weight keeps its exact shape and values and the warm start needs
+        # no state-dict surgery: the parent's `hidden.weight` loads unchanged and the new
+        # keys are simply absent from the parent.
+        self.bond = (BondPairwiseConditioner(in_dim, pair_dim=bond_pair_dim,
+                                              condition_dim=condition_dim)
+                     if bond_aware else None)
+        self.pair_to_hidden = (nn.Linear(self.bond.output_dim, hidden_dim, bias=False)
+                               if bond_aware else None)
         nn.init.xavier_uniform_(self.input_projection.weight)
         nn.init.zeros_(self.input_projection.bias)
         nn.init.xavier_uniform_(self.hidden.weight)
@@ -308,12 +327,20 @@ class CouplingNetwork(nn.Module):
         if self.film is not None:
             nn.init.zeros_(self.film.weight)
             nn.init.zeros_(self.film.bias)
+        if self.pair_to_hidden is not None:
+            # zero: the augmented flow starts as the exact parent density
+            nn.init.zeros_(self.pair_to_hidden.weight)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 condition: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         projected = self.input_projection(x) * mask.unsqueeze(-1).to(x.dtype)
         attended = self.attention(projected, mask)
         hidden = self.hidden(torch.cat([x, attended], dim=-1))
+        if self.bond is not None:
+            # `x` here is the coupling's pass-through half: identical in the forward and
+            # inverse directions, so the scale and translation stay reproducible
+            pair_features, _ = self.bond(x, mask, condition)
+            hidden = hidden + self.pair_to_hidden(pair_features)
         if self.film is not None:
             if condition is None:
                 raise ValueError("this coupling network is conditional but no condition was given")
@@ -334,7 +361,9 @@ class AffineCoupling(nn.Module):
         half = config.node_embedding_dim // 2
         self.network = CouplingNetwork(
             half, half, attention_dim=config.attention_dim, num_heads=config.num_heads,
-            hidden_dim=config.hidden_dim, condition_dim=config.condition_dim)
+            hidden_dim=config.hidden_dim, condition_dim=config.condition_dim,
+            bond_aware=config.bond_aware_coupling,
+            bond_pair_dim=config.bond_pair_dim)
 
     def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         first, second = x.chunk(2, dim=-1)

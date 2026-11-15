@@ -1,0 +1,76 @@
+# ============================================================================
+# EXPERIMENT C, ARM 3 of 3: pairwise_supervised.
+#
+# Architecturally IDENTICAL to experiment_c_bond_pairwise.yaml. The only difference is
+# bond_loss_weight > 0, so the pair scores are trained against the real bonds of the
+# training molecules in addition to the likelihood.
+#
+# THE SUPERVISION
+# Target: 1 where the molecule has a bond of any order, 0 otherwise, taken from
+# MolecularBatch.bond_types - which the flow trainer already carries into every step,
+# aligned row by row with the embeddings it encodes from the same batch. Scored on
+# each unordered real pair exactly once (upper triangle of the pair mask).
+#
+# CLASS IMBALANCE, HANDLED EXPLICITLY
+# A molecule with N heavy atoms and R rings has N-1+R bonds among N(N-1)/2 pairs. At
+# three ring systems the positive rate is 0.152 at N=15, 0.099 at N=23 and 0.074 at
+# N=30 - so "predict no bond anywhere" scores 84.8%, 90.1% and 92.6% accuracy, and the
+# imbalance is WORST exactly where validity is worst. Two measures:
+#
+#   * the loss carries pos_weight = negatives/positives measured per batch (about 5.6,
+#     9.1 and 12.6 at those three sizes), capped at 50 so a near-bond-free batch cannot
+#     produce a gradient spike;
+#   * the logs report bond_precision, bond_recall and bond_f1 for the positive class
+#     next to bond_trivial_accuracy, the all-negative predictor's accuracy on the same
+#     batch, so bond_accuracy can never be read on its own. The trivial predictor has
+#     bond_f1 = 0 and bond_predicted_degree = 0 by construction.
+#
+# BOND ACCURACY IS NOT THE RESULT. It is a debugging signal. The claim this arm has to
+# support is on generated molecules: native QED MAE, valid target-hit yield over all
+# attempts, and raw validity by N, judged against the control's 0.1922 / 30.4% / 13.8%.
+#
+# Driven by scripts/45_train_bond_arm.py --arm pairwise_supervised.
+# ============================================================================
+
+experiment: C_bond_pairwise
+arm: pairwise_supervised
+
+parent:
+  checkpoint: outputs/checkpoints/flow_nqed_ae128_qedcontrast/seed_3/best.pt
+  autoencoder: outputs/ablation/ae_degree_128d/seed_3/last.pt
+  data_dir: data/processed/zinc250k_charge_aware_moflow_fixed
+
+architecture:
+  bond_aware_coupling: true
+  bond_pair_dim: 16              # must match the pairwise arm for the comparison
+  # identical cost to arm 2: 24 conditioners, 144,840 new parameters, ~355 MB extra
+  # activation memory at batch 128, N=38.
+
+objective:
+  bond_loss_weight: 0.1
+  weight_rationale: >
+    The likelihood term is a per-node NLL in nats (order 1-10 for this model); the bond
+    term is a pos-weighted BCE over pairs (order 0.1-1 at initialisation). 0.1 keeps the
+    auxiliary term a regulariser rather than the objective. Both terms are logged
+    separately every window - nll_per_node, bond_loss and bond_loss_weighted - so the
+    balance is auditable after the fact rather than assumed. ONE weight is screened; if
+    this arm wins, the weight is worth a sweep, and if it loses at 0.1 that is one
+    setting, not a refutation of supervision.
+
+training:
+  screening_steps: 3000
+  learning_rate: 1.0e-5
+  warmup_steps: 100
+  batch_size: 128
+  seed: 3
+  eval_every: 500
+  save_every: 500
+  val_molecules: 5000
+  early_stopping_patience: null
+
+selection:
+  criterion: validation likelihood
+  note: >
+    Deliberately NOT the total loss. Selecting on likelihood + bond loss would let this
+    arm pick checkpoints the other two could never pick, and the comparison would stop
+    being about generation quality.

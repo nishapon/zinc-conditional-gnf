@@ -407,6 +407,20 @@ class FlowTrainer:
         return DeterministicBatcher(len(self.train_set), self.config.batch_size,
                                     self.config.seed)
 
+    def _augment_loss(self, loss, *, flow, batch, parts):
+        """Hook: add auxiliary terms to the TRAINING loss. Default: no-op.
+
+        Returns `(loss, extras)`. Every key in `extras` must be a plain float and must be
+        the same set on every step; they are averaged over the logging window and written
+        to `metrics.jsonl` next to the likelihood terms, so an auxiliary objective stays
+        separately visible instead of being hidden inside a single total.
+
+        Model SELECTION is deliberately untouched: `validate()` and therefore `best.pt`
+        still rank on the pure validation likelihood, so an auxiliary term cannot buy a
+        better checkpoint by changing the selection criterion.
+        """
+        return loss, {}
+
     # ------------------------------------------------------------------
     def train(self, resume: str | Path | None = "auto", stop_flag: StopFlag | None = None) -> dict[str, Any]:
         cfg, log = self.config, self.logger
@@ -515,7 +529,10 @@ class FlowTrainer:
                                                   generator=self.noise_generator)
             parts = flow.negative_log_likelihood(embeddings, batch.node_mask,
                                                  self._condition(flow, batch))
-            loss = parts["loss"]
+            # Hook: an arm may add auxiliary terms here. The likelihood stays available
+            # separately as parts["loss"], and both are logged.
+            loss, auxiliary = self._augment_loss(parts["loss"], flow=flow, batch=batch,
+                                                 parts=parts)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None
@@ -531,6 +548,8 @@ class FlowTrainer:
             step += 1
 
             window.append({"loss": float(loss.detach()),
+                           "nll_per_node": float(parts["loss"].detach()),
+                           **auxiliary,
                            "log_det_per_node": float(parts["log_det_per_node"].detach()),
                            "log_prob_z_per_node": float(parts["log_prob_z_per_node"].detach()),
                            "z_norm": float(parts["z_norm"].detach()),

@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -167,6 +167,10 @@ class ArmTrainer(FlowTrainer):
             state["parent"] = self.parent_provenance
         return state
 
+    # the arm-configuration keys a resume must agree on; subclasses override
+    VERIFY_KEYS = ("arm", "balanced_alpha", "coupled_init_rho", "min_cell_count",
+                   "max_exposure_ratio", "qed_bin_width")
+
     def verify_arm(self, checkpoint: dict[str, Any]) -> None:
         """Reject resuming an interrupted run under a DIFFERENT arm."""
         saved = checkpoint.get("arm")
@@ -176,9 +180,7 @@ class ArmTrainer(FlowTrainer):
                 "run; start a new experiment with prepare_warm_start instead of "
                 "resuming")
         current = self.arm_config.to_dict()
-        differing = [key for key in ("arm", "balanced_alpha", "coupled_init_rho",
-                                      "min_cell_count", "max_exposure_ratio",
-                                      "qed_bin_width")
+        differing = [key for key in self.VERIFY_KEYS
                      if saved.get(key) != current.get(key)]
         if differing:
             raise ResumeMismatchError(
@@ -393,9 +395,66 @@ def map_optimizer_state(parent_blob: dict[str, Any], arm_flow, *,
     }
 
 
+def architecture_differences(parent: dict[str, Any], arm: dict[str, Any]
+                             ) -> dict[str, tuple[Any, Any]]:
+    """Flow-config keys whose values differ, as `key -> (parent, arm)`.
+
+    A key MISSING from either side is normalised to the `FlowConfig` default, because a
+    checkpoint written before a field existed is a model that had that field's default.
+    Without this, every pre-existing parent would appear to differ from every arm on every
+    newly added setting, and the additive-architecture gate would be meaningless.
+    """
+    from zinc_gnf.flow import FlowConfig
+
+    fields = FlowConfig.__dataclass_fields__
+
+    def value(side: dict[str, Any], key: str) -> Any:
+        if key in side:
+            return side[key]
+        return fields[key].default if key in fields else None
+
+    keys = (set(parent) | set(arm)) & set(fields) | ((set(parent) | set(arm))
+                                                     - set(fields))
+    return {key: (value(parent, key), value(arm, key)) for key in sorted(keys)
+            if str(value(parent, key)) != str(value(arm, key))}
+
+
+def verify_additive_architecture(differences: dict[str, tuple[Any, Any]],
+                                 allowed: Sequence[str]) -> dict[str, Any]:
+    """Every difference must be an ALLOWED key on which the parent sits at the default.
+
+    An architecture change is "additive" only if the parent is a model that did not have
+    the feature at all. If the parent had it on and the arm turns it off, that is a
+    REMOVAL: the parent's weights for the removed pathway would be silently dropped, so
+    this refuses rather than quietly shrinking the model.
+    """
+    from zinc_gnf.flow import FlowConfig
+
+    allowed = tuple(allowed)
+    fields = FlowConfig.__dataclass_fields__
+    unexpected = {key: value for key, value in differences.items() if key not in allowed}
+    if unexpected:
+        raise ResumeMismatchError(
+            f"parent flow configuration differs from the arm's on {sorted(unexpected)} "
+            f"(parent vs arm: {unexpected}); the architecture must be identical apart "
+            f"from the explicitly declared additive keys {list(allowed)}, or the "
+            f"comparison measures two things at once")
+    report = {}
+    for key, (parent_value, arm_value) in differences.items():
+        default = fields[key].default if key in fields else None
+        if str(parent_value) not in (str(default), str(None)):
+            raise ResumeMismatchError(
+                f"flow config key {key!r} is {parent_value!r} in the parent, not the "
+                f"default {default!r}; this is a CHANGE to an existing pathway, not an "
+                f"addition, so warm-starting from it would drop trained weights")
+        report[key] = {"parent": parent_value, "arm": arm_value, "default": default}
+    return report
+
+
 def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
                        train_config, flow_config, sampler_state: dict[str, Any],
-                       device: str = "cpu") -> dict[str, Any]:
+                       device: str = "cpu",
+                       architecture_exceptions: Sequence[str] = ()) -> dict[str, Any]:
     """Translate the common parent into an ARM-COMPATIBLE `last.pt`. PATH 1.
 
     `FlowTrainer._restore` is strict, and deliberately so: it compares the checkpoint's
@@ -450,14 +509,28 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
     blob = _torch.load(parent_path, map_location="cpu", weights_only=False)
     if blob.get("vocabulary_fingerprint") != vocabulary_fingerprint():
         raise ResumeMismatchError("parent checkpoint uses a different atom vocabulary")
-    if FlowConfigLike(blob["flow_config"]) != FlowConfigLike(flow_config.to_dict()):
-        raise ResumeMismatchError(
-            "parent flow configuration differs from the arm's; the architecture must be "
-            "identical for the comparison to mean anything")
+    differences = architecture_differences(dict(blob["flow_config"]),
+                                           flow_config.to_dict())
+    added_architecture = verify_additive_architecture(differences,
+                                                      architecture_exceptions)
 
     flow = NodeFlow(flow_config, init_seed=train_config.seed)
-    # weights FIRST, wrapping SECOND: no model-key remapping is ever required
-    flow.load_state_dict(blob["model_state_dict"])
+    # weights FIRST, wrapping SECOND: no model-key remapping is ever required.
+    # strict=False only when the arm ADDS a pathway, and the missing keys are then
+    # checked to be exactly the new ones, so a typo cannot pass as "new".
+    if added_architecture:
+        incompatible = flow.load_state_dict(blob["model_state_dict"], strict=False)
+        if incompatible.unexpected_keys:
+            raise ResumeMismatchError(
+                f"the parent carries weights this arm has no home for: "
+                f"{sorted(incompatible.unexpected_keys)[:8]}")
+        parent_names = set(blob["model_state_dict"])
+        surprises = [key for key in incompatible.missing_keys if key in parent_names]
+        if surprises:
+            raise ResumeMismatchError(
+                f"these parameters exist in the parent but did not load: {surprises[:8]}")
+    else:
+        flow.load_state_dict(blob["model_state_dict"])
     if arm_config.uses_coupled_prior:
         flow.prior = CoupledNodePrior.from_node_prior(
             flow.prior, init_rho=arm_config.coupled_init_rho,
@@ -508,6 +581,11 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
             "reset": ["step", "best_loss", "best_step", "bad_evals", "history",
                       "batcher", "torch_rng_state", "noise_generator_state"],
             "prior_wrapped_after_loading_weights": arm_config.uses_coupled_prior,
+            "architecture_added": added_architecture,
+            "architecture_note": (
+                "empty means the arm's architecture is byte-identical to the parent's. "
+                "Any entry is a key the parent held at its default, i.e. a pathway this "
+                "arm ADDS; the parent's own weights all loaded unchanged."),
         },
     }
     # atomic: a crash mid-write must not leave a half-written checkpoint that the
@@ -517,11 +595,6 @@ def prepare_warm_start(parent_path, target_path, *, arm_config: ArmConfig,
     os.replace(staging, resolved_target)
     return {"target": str(resolved_target), "parent": record["parent"],
             "warm_start": record["warm_start"]}
-
-
-def FlowConfigLike(value):            # noqa: N802 - tiny normaliser, not a class
-    """Compare flow configs as plain dicts without caring about key order."""
-    return tuple(sorted((str(k), str(v)) for k, v in dict(value).items()))
 
 
 # ------------------------------------------------- prior-agnostic latent draw ---
@@ -577,7 +650,10 @@ def load_arm_flow(checkpoint_path: str | Path, *, device: str | torch.device = "
     flow.to(device).eval()
     if not bool(flow.statistics_set):
         raise ResumeMismatchError("checkpoint carries no embedding statistics")
-    return flow, probe | {"coupled_prior": coupled}
+    # the bond-aware pathway needs no special handling here: it is declared in the
+    # checkpoint's own flow_config, so NodeFlow already built it before the strict load
+    bond_aware = bool(probe["flow_config"].get("bond_aware_coupling", False))
+    return flow, probe | {"coupled_prior": coupled, "bond_aware": bond_aware}
 
 
 __all__ = [
@@ -593,4 +669,6 @@ __all__ = [
     "imbalance_report",
     "load_arm_flow",
     "wrapped_prior_name",
+    "architecture_differences",
+    "verify_additive_architecture",
 ]
