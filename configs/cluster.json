@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "SINGLE configuration file for the cluster pipeline (scripts 47, 48, 49, 46).",
+    "Edit the paths block to match your cluster, then every script reads it with",
+    "--config configs/cluster.json. Command-line flags override individual values.",
+    "",
+    "results_dir must be a PERSISTENT directory. Large artefacts (samples.jsonl,",
+    "checkpoints, figures) are written there and are excluded from git by",
+    "outputs/* in .gitignore - keep results_dir inside outputs/ or outside the repo.",
+    "",
+    "Nothing here is a model architecture setting. Architecture comes from each",
+    "checkpoint's own stored flow_config, read by scripts/47_cluster_preflight.py."
+  ],
+
+  "paths": {
+    "data_dir": "data/processed/zinc250k_charge_aware_moflow_fixed",
+    "ae_checkpoint": "outputs/ablation/ae_degree_128d/seed_3/last.pt",
+    "conditional_checkpoint": "outputs/checkpoints/flow_nqed_ae128_qedcontrast/seed_3/best.pt",
+    "baseline_checkpoint": "outputs/checkpoints/flow_n_only/seed_3/best.pt",
+    "baseline_output_dir": "outputs/checkpoints/flow_n_only",
+    "results_dir": "outputs/metrics/qed_comparison"
+  },
+
+  "baseline_search_dirs": [
+    "outputs/checkpoints",
+    "outputs/ablation"
+  ],
+
+  "run": {
+    "_comment": [
+      "sampling_seed is the BASE seed. Script 48 uses base + 1000*repetition +",
+      "target_position; script 46 uses base + run. Both are deterministic, so a",
+      "rerun reproduces the same molecules.",
+      "repetitions are SAMPLING repetitions of ONE trained checkpoint. They are not",
+      "independently trained seeds and must never be reported as such."
+    ],
+    "sampling_seed": 20261124,
+    "batch_size": 250,
+    "headline_decoder": "degree",
+    "tolerances": [0.1, 0.01],
+
+    "conditional_temperature": 0.2,
+    "attempts": 2000,
+    "repetitions": 5,
+
+    "comparison_temperature": 0.85,
+    "comparison_attempts": 10000,
+    "comparison_runs": 5
+  }
+}

@@ -63,6 +63,12 @@ import numpy as np  # noqa: E402
 
 from zinc_gnf.conditioning import load_condition_scaler, standardise_condition  # noqa: E402
 from zinc_gnf.dataset import load_training_splits  # noqa: E402
+from zinc_gnf.eval_support import (  # noqa: E402
+    MOFLOW_DIFFERENCES,
+    MOFLOW_SETTINGS,
+    FixedCounts,
+    aggregate_runs,
+)
 from zinc_gnf.generation import (  # noqa: E402
     DECODERS,
     generate_molecules,
@@ -78,105 +84,8 @@ from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 CONDITIONING_KEYS = ("condition_features", "condition_embedding_dim",
                      "condition_hidden_dim")
 
-# MoFlow paper section 5.1, verified against the paper and mflow/generate.py.
-MOFLOW_SETTINGS = {"count": 10000, "runs": 5, "temperature": 0.85}
-
-# Printed and stored whenever --moflow-protocol is used, so no table of ours can be
-# labelled "exactly MoFlow" while these remain true.
-MOFLOW_DIFFERENCES = [
-    "data representation: we model the density of a FROZEN autoencoder's per-node "
-    "embeddings; MoFlow models one-shot atom and bond tensors directly",
-    "decoder: ours is a learned decoder plus a bond assembler; MoFlow takes argmax over "
-    "its own bond tensor",
-    "correction: our 'degree' assembler is an exact degree-constrained MILP that requires "
-    "a single fragment and DELETES NOTHING; MoFlow reduces bond orders on over-valent "
-    "atoms and then keeps the largest fragment, which can drop atoms and change N",
-    "prior: ours is a conditional per-dimension sigma(c) over node embeddings; MoFlow "
-    "uses N(0, (t*sigma)^2 I) with a single learned scalar sigma, so the same numeric "
-    "temperature does NOT describe the same sampling distribution",
-    "atom vocabulary: 17 charge-aware (element, formal charge) types vs MoFlow's 9",
-    "novelty reference: we use the training split's stored SMILES; MoFlow rebuilds the "
-    "reference by round-tripping its own dataset tensors through construct_mol",
-    "runs: 5 runs is SAMPLING repetition from one checkpoint in both cases, so the "
-    "reported sd contains no training-seed variability",
-]
-
-
-def run_level_summary(values: list[float]) -> dict:
-    """Mean and population sd of one metric across runs. Pure Python, no numpy."""
-    if not values:
-        return {"mean": float("nan"), "sd": float("nan"), "runs": 0}
-    mean = sum(values) / len(values)
-    if len(values) == 1:
-        return {"mean": mean, "sd": 0.0, "runs": 1, "values": list(values)}
-    variance = sum((v - mean) ** 2 for v in values) / len(values)
-    return {"mean": mean, "sd": variance ** 0.5, "runs": len(values),
-            "values": list(values)}
-
-
-def aggregate_runs(runs: list[dict], headline: str) -> dict:
-    """Run-level mean and sd for the metrics that go in the table.
-
-    MoFlow reports mean and sd over 5 runs; this reproduces that shape. `sd` is the
-    POPULATION sd over runs, matching `np.std`'s default, which is what MoFlow's
-    generate.py prints.
-    """
-    def collect(path):
-        out = []
-        for entry in runs:
-            node = entry["metrics"]["decoders"]
-            for key in path:
-                node = node[key]
-            out.append(float(node))
-        return out
-
-    summary = {}
-    for label, path in (("raw_validity", ("raw", "strict_validity")),
-                        (f"{headline}_validity", (headline, "strict_validity")),
-                        ("uniqueness", (headline, "uniqueness")),
-                        ("novelty_vs_train", (headline, "novelty_vs_train")),
-                        ("nuv", (headline, "nuv"))):
-        try:
-            summary[label] = run_level_summary(collect(path))
-        except KeyError:
-            continue
-    summary["atom_count_match_over_all_attempts"] = run_level_summary(
-        [float(e["sizes"]["atom_count_match_over_all_attempts"]) for e in runs])
-    return summary
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--unconditional-checkpoint", required=True)
-    parser.add_argument("--conditional-checkpoint", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--data-dir",
-                        default="data/processed/zinc250k_charge_aware_moflow_fixed")
-    parser.add_argument("--ae-checkpoint", required=True,
-                        help="ONE frozen decoder for both arms; a mismatch against "
-                             "either flow is refused")
-    parser.add_argument("--count", type=int, default=10000,
-                        help="attempts per run per arm (the shared sample budget)")
-    parser.add_argument("--runs", type=int, default=1,
-                        help="generation runs per arm. >1 reports run-level mean and sd. "
-                             "These are SAMPLING repetitions from one checkpoint, not "
-                             "independently trained seeds")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="one temperature for both arms; 1.0 is the model's own "
-                             "density. Report any other value as a deliberate setting")
-    parser.add_argument("--moflow-protocol", action="store_true",
-                        help="set count=10000, runs=5, temperature=0.85 (MoFlow paper "
-                             "section 5.1) and print the differences that remain, so the "
-                             "result is never labelled 'exactly MoFlow'")
-    parser.add_argument("--headline", default="degree", choices=list(DECODERS))
-    parser.add_argument("--seed", type=int, default=20261124)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--inspect-only", action="store_true",
-                        help="print the checkpoint diff and the request joint, then exit")
-    return parser.parse_args(argv)
-
+# MoFlow protocol constants, the shared size stand-in and the run-level aggregation
+# all live in zinc_gnf/eval_support.py so scripts 46, 48 and 49 cannot drift apart.
 
 # ---------------------------------------------------------------- the requests ---
 def sample_requests(train_records, count: int, seed: int) -> dict:
@@ -317,6 +226,37 @@ def architecture_diff(unconditional: dict, conditional: dict) -> dict:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.config:
+        import json as _json
+
+        try:
+            _cfg = _json.loads(Path(args.config).read_text())
+        except (OSError, ValueError) as error:
+            print(f"FATAL: cannot read --config {args.config}: {error}", file=sys.stderr)
+            return 4
+        _paths, _run = _cfg.get("paths", {}), _cfg.get("run", {})
+        args.data_dir = args.data_dir or _paths.get("data_dir")
+        args.ae_checkpoint = args.ae_checkpoint or _paths.get("ae_checkpoint")
+        args.conditional_checkpoint = (args.conditional_checkpoint
+                                       or _paths.get("conditional_checkpoint"))
+        args.unconditional_checkpoint = (args.unconditional_checkpoint
+                                         or _paths.get("baseline_checkpoint"))
+        args.output_dir = args.output_dir or (
+            str(Path(_paths.get("results_dir", "outputs")) / "uncond_vs_cond"))
+        if not args.moflow_protocol:
+            args.count = _run.get("comparison_attempts", args.count)
+            args.runs = _run.get("comparison_runs", args.runs)
+            args.temperature = _run.get("comparison_temperature", args.temperature)
+        args.batch_size = _run.get("batch_size", args.batch_size)
+        args.headline = _run.get("headline_decoder", args.headline)
+        args.seed = _run.get("sampling_seed", args.seed)
+    missing = [name for name in ("unconditional_checkpoint", "conditional_checkpoint",
+                                 "ae_checkpoint", "output_dir", "data_dir")
+               if not getattr(args, name)]
+    if missing:
+        print(f"FATAL: missing {missing}; supply them as flags or via --config",
+              file=sys.stderr)
+        return 4
     try:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -331,6 +271,10 @@ def main(argv=None) -> int:
                 print(f"  - {item}")
         if args.count < 1:
             raise ValueError("--count must be >= 1")
+        done = out_dir / "uncond_vs_cond.json"
+        if done.is_file() and done.stat().st_size > 0 and not args.force:
+            print(f"{done} already exists; nothing recomputed. Use --force to redo it.")
+            return 0
         if args.runs < 1:
             raise ValueError("--runs must be >= 1")
     except (OSError, ValueError) as error:
@@ -455,7 +399,7 @@ def main(argv=None) -> int:
                 # `_FixedCounts` is stateful, so each call gets its own instance
                 drawn = generate_molecules(
                     flow, autoencoder, count=args.count,
-                    node_counts=_FixedCounts(run_sizes),
+                    node_counts=FixedCounts(run_sizes),
                     temperature=args.temperature, seed=args.seed + run,
                     batch_size=args.batch_size,
                     condition_values=None if values is None
@@ -514,29 +458,6 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         print("FATAL: unexpected\n" + traceback.format_exc(), file=sys.stderr)
         return 1
-
-
-class _FixedCounts:
-    """A `NodeCountSampler`-shaped object that returns a PRE-DRAWN size sequence.
-
-    `generate_molecules` samples sizes from the histogram, which would give the two arms
-    different size vectors from the same seed only if the draw order changed -- but it
-    also makes the conditional arm's QED request impossible to align with its own size.
-    Returning the fixed sequence guarantees row i of both arms has the same N and the
-    same (N, QED) request.
-    """
-
-    def __init__(self, counts) -> None:
-        self._counts = np.asarray([int(c) for c in counts], dtype=np.int64)
-        self.values = np.unique(self._counts)
-        self.position = 0
-
-    def sample(self, size: int, rng) -> np.ndarray:    # noqa: ARG002 - rng unused
-        if self.position + size > self._counts.shape[0]:
-            raise ValueError("requested more sizes than were pre-drawn")
-        chunk = self._counts[self.position:self.position + size]
-        self.position += size
-        return chunk
 
 
 if __name__ == "__main__":
