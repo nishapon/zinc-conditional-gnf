@@ -46,7 +46,10 @@ from zinc_gnf.eval_support import (  # noqa: E402
     GRID_TARGETS,
     STRUCTURAL_SIZE_NOTE,
     FixedCounts,
-    already_done,
+    ARM_LABELS,
+    COMPLETE,
+    artefact_fingerprint,
+    completed_artefact,
     grid_target_support,
     joint_association,
     macro_and_pooled,
@@ -149,8 +152,15 @@ def main(argv=None) -> int:
         from zinc_gnf.trainer_flow import file_sha256, load_flow
 
         device = resolve_device(args.device)
-        out_root = Path(paths["results_dir"]) / "conditional" / args.target_set
+        # A smoke run writes to its own directory. Mixing a 25-attempt check into the
+        # 2000-attempt results would silently corrupt the aggregates.
+        suffix = "_smoke" if args.preset == "smoke" else ""
+        out_root = (Path(paths["results_dir"]) / "conditional"
+                    / f"{args.target_set}{suffix}")
         out_root.mkdir(parents=True, exist_ok=True)
+        if suffix:
+            print(f"SMOKE RUN: results isolated under {out_root}; they are a pipeline "
+                  f"check and must never be summarised as full results.")
 
         train_records, _, fingerprint = load_training_splits(paths["data_dir"])
         train_set = MolecularGraphDataset(train_records)
@@ -192,7 +202,10 @@ def main(argv=None) -> int:
                   f"scripts/47_cluster_preflight.py, then re-run (completed cells are "
                   f"skipped).", file=sys.stderr)
 
-        manifest = {"target_set": args.target_set, "targets": target_definition,
+        manifest = {"target_set": args.target_set, "preset": args.preset or "custom",
+                    "is_smoke": bool(suffix),
+                    "comparison_label": ARM_LABELS["comparison"],
+                    "targets": target_definition,
                     "n_qed_association": association,
                     "structural_size_note": STRUCTURAL_SIZE_NOTE,
                     "tolerance_note": ("tolerances are EVALUATOR acceptance windows "
@@ -229,9 +242,21 @@ def main(argv=None) -> int:
                     samples_path = directory / "samples.jsonl"
                     metrics_path = directory / "metrics.json"
                     seed = cell_seed(base_seed, repetition, position)
-                    if already_done(metrics_path, force=args.force):
-                        reps.append(json.loads(metrics_path.read_text()))
+                    fingerprint = artefact_fingerprint(
+                        flow_sha256=manifest["models"][label]["flow_sha256"],
+                        decoder_sha256=manifest["models"][label]["decoder_sha256"],
+                        temperature=temperature, seed=seed, decoder=decoder,
+                        attempts=attempts, n=n_target, qed=qed_target,
+                        condition_features=list(features))
+                    decision = completed_artefact(
+                        metrics_path, expected_attempts=attempts,
+                        fingerprint=fingerprint, samples_path=samples_path,
+                        force=args.force)
+                    if decision["reuse"]:
+                        reps.append(decision["payload"])
                         continue
+                    print(f"  {label:12s} {tag} rep{repetition}: generating "
+                          f"({decision['reason']})")
                     # QED is supplied ONLY to a model trained with it
                     if not features:
                         values = None
@@ -258,7 +283,11 @@ def main(argv=None) -> int:
                         records, requested_qed=qed_target, requested_n=n_target,
                         decoder=decoder, tolerances=tolerances,
                         train_smiles=train_smiles)
-                    metrics.update({"model": label, "cell": tag, "repetition": repetition,
+                    metrics.update({"status": COMPLETE,
+                                    "artefact_fingerprint": fingerprint,
+                                    "arm_label": ARM_LABELS.get(label, label),
+                                    "preset": args.preset or "custom",
+                                    "model": label, "cell": tag, "repetition": repetition,
                                     "sampling_seed": seed, "temperature": temperature,
                                     "support": cell.get("support"),
                                     "extrapolation": cell.get("extrapolation"),

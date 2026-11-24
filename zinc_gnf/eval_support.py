@@ -70,9 +70,17 @@ class FixedCounts:
         self._counts = [int(c) for c in counts]
         self.values = sorted(set(self._counts))
         self.position = 0
+        # `NodeCountSampler` exposes `.mean`, and generation.py reports it in its
+        # settings block. Omitting it made every call site that logs the sampler fail
+        # with AttributeError only AFTER generation had finished.
+        self.mean = (sum(self._counts) / len(self._counts)) if self._counts else 0.0
 
     def __len__(self) -> int:
         return len(self._counts)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"sampler": "FixedCounts", "position": self.position,
+                "size": len(self._counts), "mean": self.mean}
 
     def sample(self, size: int, rng=None):      # noqa: ARG002 - rng deliberately unused
         if self.position + size > len(self._counts):
@@ -479,8 +487,76 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
+COMPLETE = "complete"
+
+
+def artefact_fingerprint(**fields: Any) -> str:
+    """Stable digest of the settings an artefact was produced under."""
+    import hashlib
+
+    payload = json.dumps({k: fields[k] for k in sorted(fields)}, sort_keys=True,
+                         default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def completed_artefact(metrics_path: str | Path, *, expected_attempts: int,
+                       fingerprint: str, samples_path: str | Path | None = None,
+                       force: bool = False) -> dict[str, Any]:
+    """Is this cell genuinely finished, under THESE settings?
+
+    The previous rule - "samples.jsonl exists" - skipped a cell that had been written by
+    a crashed job, by a smaller budget, or by a different checkpoint. Four conditions are
+    now required, and the reason for a miss is reported so a resume is auditable:
+
+      1. the metrics file parses as JSON,
+      2. it records `status == "complete"`,
+      3. its `attempted` equals the budget now requested,
+      4. its `artefact_fingerprint` matches the current checkpoint/decoder/temperature/
+         seed/decoder-name settings.
+
+    A completed cell that satisfies all four is PRESERVED and reused. Anything else is
+    recomputed, which cannot destroy a valid result because the recomputation writes the
+    same path only after it finishes.
+    """
+    metrics_path = Path(metrics_path)
+    if force:
+        return {"reuse": False, "reason": "forced"}
+    if not metrics_path.is_file() or metrics_path.stat().st_size == 0:
+        return {"reuse": False, "reason": "no metrics file"}
+    try:
+        payload = json.loads(metrics_path.read_text())
+    except ValueError:
+        return {"reuse": False, "reason": "metrics file is not valid JSON"}
+    if payload.get("status") != COMPLETE:
+        return {"reuse": False,
+                "reason": f"status={payload.get('status')!r}, not {COMPLETE!r}"}
+    if int(payload.get("attempted", -1)) != int(expected_attempts):
+        return {"reuse": False,
+                "reason": f"attempted={payload.get('attempted')} but "
+                          f"{expected_attempts} requested"}
+    if payload.get("artefact_fingerprint") != fingerprint:
+        return {"reuse": False,
+                "reason": f"settings fingerprint {payload.get('artefact_fingerprint')} "
+                          f"!= {fingerprint}"}
+    if samples_path is not None:
+        samples_path = Path(samples_path)
+        if not samples_path.is_file():
+            return {"reuse": False, "reason": "metrics present but samples.jsonl missing"}
+        rows = sum(1 for line in samples_path.open() if line.strip())
+        if rows != int(expected_attempts):
+            return {"reuse": False,
+                    "reason": f"samples.jsonl holds {rows} rows, expected "
+                              f"{expected_attempts}"}
+    return {"reuse": True, "reason": "complete, budget and settings match",
+            "payload": payload}
+
+
 def already_done(path: str | Path, *, force: bool = False) -> bool:
-    """Resumability: a completed artefact is never regenerated unless forced."""
+    """DEPRECATED existence-only check. Kept only so old callers keep importing.
+
+    Do not use for resume decisions: file presence does not mean the cell finished, nor
+    that it used this budget or this checkpoint. Use `completed_artefact`.
+    """
     path = Path(path)
     return bool(path.is_file() and path.stat().st_size > 0 and not force)
 
@@ -499,9 +575,21 @@ def manifest_entry(**fields: Any) -> dict[str, Any]:
     return dict(fields)
 
 
+ARM_LABELS = {
+    "baseline": "N-only, NLL training only",
+    "conditional": "N+QED, with QED contrastive training",
+    "comparison": ("N-only NLL versus N+QED with contrastive training. NOT a FiLM-only "
+                   "contrast: the conditional checkpoint was trained with an additional "
+                   "QED contrastive objective that the baseline did not have, so any "
+                   "difference is conditioning PLUS that objective."),
+}
+
+
 __all__ = [
-    "DEFAULT_TOLERANCES", "GRID_TARGETS", "MOFLOW_DIFFERENCES", "MOFLOW_SETTINGS",
-    "STRUCTURAL_SIZE_NOTE", "FixedCounts", "aggregate_runs", "already_done",
+    "ARM_LABELS", "COMPLETE", "DEFAULT_TOLERANCES", "GRID_TARGETS",
+    "MOFLOW_DIFFERENCES", "MOFLOW_SETTINGS", "STRUCTURAL_SIZE_NOTE",
+    "FixedCounts", "aggregate_runs", "already_done", "artefact_fingerprint",
+    "completed_artefact",
     "constant_reference", "grid_target_support", "joint_association", "macro_and_pooled",
     "manifest_entry", "percentile_targets", "qed_cell_metrics", "read_jsonl",
     "response_fit", "run_level_summary", "write_jsonl",

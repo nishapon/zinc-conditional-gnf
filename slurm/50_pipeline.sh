@@ -31,7 +31,7 @@
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
-STEP="${STEP:?set STEP=preflight|smoke|conditional|percentile|compare|summarize}"
+STEP="${STEP:?set STEP=audit|numerical|preflight|smoke|conditional|percentile|compare|summarize|report|bundle}"
 WORKDIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "${WORKDIR}"
 
@@ -46,10 +46,15 @@ fi
 [[ -n "${PYTHON}" && -x "${PYTHON}" ]] || { echo "ERROR: set ZINC_GNF_PYTHON=/path/to/python" >&2; exit 65; }
 
 export PYTHONUNBUFFERED=1 PYTHONPATH="${WORKDIR}${PYTHONPATH:+:${PYTHONPATH}}"
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+# Split exports: under `set -u` a single `export A=x B="$A"` does not see A yet.
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+export NUMEXPR_NUM_THREADS="${OMP_NUM_THREADS}"
 export MPLBACKEND=Agg
 
 CONFIG="${CONFIG:-configs/cluster.json}"
+# log directories must exist BEFORE sbatch writes into them, or the job dies silently
+mkdir -p outputs/logs
 FORCE_FLAG=""; [[ "${FORCE:-0}" == "1" ]] && FORCE_FLAG="--force"
 RUNNER=""; command -v srun >/dev/null 2>&1 && [[ -n "${SLURM_JOB_ID:-}" ]] && RUNNER="srun"
 mkdir -p outputs/logs
@@ -62,6 +67,51 @@ echo "python=${PYTHON}"
 echo "=============================================="
 
 case "${STEP}" in
+  audit)
+    # existing artefacts only: no generation, no GPU needed
+    ${RUNNER} "${PYTHON}" -u scripts/51_audit_artifacts.py \
+        --config "${CONFIG}" --target-set "${TARGET_SET:-grid}" \
+        ${SEARCH_DIRS:+--search-dirs ${SEARCH_DIRS}}
+    ;;
+  numerical)
+    ${RUNNER} "${PYTHON}" -u scripts/52_numerical_check.py \
+        --config "${CONFIG}" --molecules "${MOLECULES:-256}" \
+        --latents "${LATENTS:-256}"
+    ;;
+  report)
+    ${RUNNER} "${PYTHON}" -u scripts/53_final_report.py --config "${CONFIG}"
+    ;;
+  bundle)
+    RESULTS=$("${PYTHON}" - "${CONFIG}" <<'EOF'
+import json, sys
+print(json.load(open(sys.argv[1]))["paths"]["results_dir"])
+EOF
+)
+    STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+    ARCHIVE="${HOME}/zinc_qed_reports_${STAMP}.tar.gz"
+    # Small text and plot artefacts only. samples.jsonl, checkpoints and arrays are
+    # excluded, so the archive stays a few megabytes and is safe to download.
+    PARENT=$(dirname "${RESULTS}")
+    BASE=$(basename "${RESULTS}")
+    INCLUDE=()
+    for sub in report summary audit numerical uncond_vs_cond; do
+        [[ -d "${RESULTS}/${sub}" ]] && INCLUDE+=("${BASE}/${sub}")
+    done
+    for sub in conditional conditional_smoke; do
+        [[ -d "${RESULTS}/${sub}" ]] && INCLUDE+=("${BASE}/${sub}")
+    done
+    if [[ ${#INCLUDE[@]} -eq 0 ]]; then
+        echo "ERROR: nothing to bundle under ${RESULTS}" >&2; exit 2
+    fi
+    tar -czf "${ARCHIVE}" \
+        --exclude='*.jsonl' --exclude='*.pt' --exclude='*.pth' \
+        --exclude='*.npz' --exclude='*.pkl' --exclude='*.partial' \
+        -C "${PARENT}" "${INCLUDE[@]}"
+    echo "bundle written: ${ARCHIVE}"
+    du -h "${ARCHIVE}"
+    tar -tzf "${ARCHIVE}" | head -40
+    echo "... ($(tar -tzf "${ARCHIVE}" | wc -l) entries)"
+    ;;
   preflight)
     ${RUNNER} "${PYTHON}" -u scripts/47_cluster_preflight.py --config "${CONFIG}"
     ;;

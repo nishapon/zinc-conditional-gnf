@@ -18,7 +18,10 @@ import json
 import pytest
 
 from zinc_gnf.eval_support import (
+    COMPLETE,
     FixedCounts,
+    artefact_fingerprint,
+    completed_artefact,
     aggregate_runs,
     already_done,
     constant_reference,
@@ -241,3 +244,78 @@ def test_target_support_marks_thin_corners():
     association = joint_association(counts, qed)
     assert association["spearman_n_qed"] > 0.0           # not independent
     assert "eight components" in association["note"]
+
+
+# ===================== the two fixes from the cluster run =====================
+def test_fixed_counts_exposes_mean_like_the_real_sampler():
+    """generation.py logs `node_counts.mean`, so its absence crashed AFTER generating."""
+    sampler = FixedCounts([15, 23, 30, 23])
+    assert sampler.mean == pytest.approx((15 + 23 + 30 + 23) / 4)
+    assert FixedCounts([]).mean == 0.0
+    assert sampler.state_dict()["sampler"] == "FixedCounts"
+    # the attribute the real NodeCountSampler also exposes
+    assert sampler.values == [15, 23, 30]
+
+
+def _write(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def test_resume_requires_completion_budget_and_matching_settings(tmp_path):
+    """File presence alone must NOT count as done."""
+    metrics = tmp_path / "metrics.json"
+    samples = tmp_path / "samples.jsonl"
+    fingerprint = artefact_fingerprint(flow_sha256="a", temperature=0.2, seed=1)
+    write_jsonl(samples, [attempt(valid=False) for _ in range(10)])
+
+    # 1. a crashed job left no status
+    _write(metrics, {"attempted": 10})
+    assert completed_artefact(metrics, expected_attempts=10,
+                              fingerprint=fingerprint, samples_path=samples
+                              )["reuse"] is False
+
+    # 2. complete and matching -> reused
+    _write(metrics, {"status": COMPLETE, "attempted": 10,
+                     "artefact_fingerprint": fingerprint})
+    good = completed_artefact(metrics, expected_attempts=10, fingerprint=fingerprint,
+                              samples_path=samples)
+    assert good["reuse"] is True and good["payload"]["attempted"] == 10
+
+    # 3. a bigger budget is now requested -> recompute
+    assert completed_artefact(metrics, expected_attempts=2000,
+                              fingerprint=fingerprint,
+                              samples_path=samples)["reuse"] is False
+
+    # 4. a different checkpoint or temperature -> recompute
+    other = artefact_fingerprint(flow_sha256="b", temperature=0.2, seed=1)
+    decision = completed_artefact(metrics, expected_attempts=10, fingerprint=other,
+                                  samples_path=samples)
+    assert decision["reuse"] is False and "fingerprint" in decision["reason"]
+
+    # 5. metrics say 10 but samples.jsonl holds fewer -> recompute
+    write_jsonl(samples, [attempt(valid=False) for _ in range(4)])
+    decision = completed_artefact(metrics, expected_attempts=10,
+                                  fingerprint=fingerprint, samples_path=samples)
+    assert decision["reuse"] is False and "4 rows" in decision["reason"]
+
+    # 6. --force always recomputes
+    assert completed_artefact(metrics, expected_attempts=10, fingerprint=fingerprint,
+                              force=True)["reuse"] is False
+
+
+def test_fingerprint_changes_with_any_setting_and_is_order_independent():
+    base = dict(flow_sha256="a", temperature=0.2, seed=1, decoder="degree")
+    assert artefact_fingerprint(**base) == artefact_fingerprint(
+        **{k: base[k] for k in reversed(list(base))})
+    for key, value in (("temperature", 0.85), ("seed", 2), ("decoder", "raw"),
+                       ("flow_sha256", "b")):
+        assert artefact_fingerprint(**{**base, key: value}) != artefact_fingerprint(**base)
+
+
+def test_arm_labels_name_the_contrastive_objective():
+    from zinc_gnf.eval_support import ARM_LABELS
+
+    assert "contrastive" in ARM_LABELS["conditional"]
+    assert "NLL" in ARM_LABELS["baseline"]
+    assert "NOT a FiLM-only contrast" in ARM_LABELS["comparison"]
