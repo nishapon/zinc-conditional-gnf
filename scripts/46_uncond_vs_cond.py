@@ -78,6 +78,72 @@ from zinc_gnf.utils.runtime import atomic_write_json  # noqa: E402
 CONDITIONING_KEYS = ("condition_features", "condition_embedding_dim",
                      "condition_hidden_dim")
 
+# MoFlow paper section 5.1, verified against the paper and mflow/generate.py.
+MOFLOW_SETTINGS = {"count": 10000, "runs": 5, "temperature": 0.85}
+
+# Printed and stored whenever --moflow-protocol is used, so no table of ours can be
+# labelled "exactly MoFlow" while these remain true.
+MOFLOW_DIFFERENCES = [
+    "data representation: we model the density of a FROZEN autoencoder's per-node "
+    "embeddings; MoFlow models one-shot atom and bond tensors directly",
+    "decoder: ours is a learned decoder plus a bond assembler; MoFlow takes argmax over "
+    "its own bond tensor",
+    "correction: our 'degree' assembler is an exact degree-constrained MILP that requires "
+    "a single fragment and DELETES NOTHING; MoFlow reduces bond orders on over-valent "
+    "atoms and then keeps the largest fragment, which can drop atoms and change N",
+    "prior: ours is a conditional per-dimension sigma(c) over node embeddings; MoFlow "
+    "uses N(0, (t*sigma)^2 I) with a single learned scalar sigma, so the same numeric "
+    "temperature does NOT describe the same sampling distribution",
+    "atom vocabulary: 17 charge-aware (element, formal charge) types vs MoFlow's 9",
+    "novelty reference: we use the training split's stored SMILES; MoFlow rebuilds the "
+    "reference by round-tripping its own dataset tensors through construct_mol",
+    "runs: 5 runs is SAMPLING repetition from one checkpoint in both cases, so the "
+    "reported sd contains no training-seed variability",
+]
+
+
+def run_level_summary(values: list[float]) -> dict:
+    """Mean and population sd of one metric across runs. Pure Python, no numpy."""
+    if not values:
+        return {"mean": float("nan"), "sd": float("nan"), "runs": 0}
+    mean = sum(values) / len(values)
+    if len(values) == 1:
+        return {"mean": mean, "sd": 0.0, "runs": 1, "values": list(values)}
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return {"mean": mean, "sd": variance ** 0.5, "runs": len(values),
+            "values": list(values)}
+
+
+def aggregate_runs(runs: list[dict], headline: str) -> dict:
+    """Run-level mean and sd for the metrics that go in the table.
+
+    MoFlow reports mean and sd over 5 runs; this reproduces that shape. `sd` is the
+    POPULATION sd over runs, matching `np.std`'s default, which is what MoFlow's
+    generate.py prints.
+    """
+    def collect(path):
+        out = []
+        for entry in runs:
+            node = entry["metrics"]["decoders"]
+            for key in path:
+                node = node[key]
+            out.append(float(node))
+        return out
+
+    summary = {}
+    for label, path in (("raw_validity", ("raw", "strict_validity")),
+                        (f"{headline}_validity", (headline, "strict_validity")),
+                        ("uniqueness", (headline, "uniqueness")),
+                        ("novelty_vs_train", (headline, "novelty_vs_train")),
+                        ("nuv", (headline, "nuv"))):
+        try:
+            summary[label] = run_level_summary(collect(path))
+        except KeyError:
+            continue
+    summary["atom_count_match_over_all_attempts"] = run_level_summary(
+        [float(e["sizes"]["atom_count_match_over_all_attempts"]) for e in runs])
+    return summary
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -91,10 +157,18 @@ def parse_args(argv=None):
                         help="ONE frozen decoder for both arms; a mismatch against "
                              "either flow is refused")
     parser.add_argument("--count", type=int, default=10000,
-                        help="attempts per arm (the shared sample budget)")
+                        help="attempts per run per arm (the shared sample budget)")
+    parser.add_argument("--runs", type=int, default=1,
+                        help="generation runs per arm. >1 reports run-level mean and sd. "
+                             "These are SAMPLING repetitions from one checkpoint, not "
+                             "independently trained seeds")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="one temperature for both arms; 1.0 is the model's own "
                              "density. Report any other value as a deliberate setting")
+    parser.add_argument("--moflow-protocol", action="store_true",
+                        help="set count=10000, runs=5, temperature=0.85 (MoFlow paper "
+                             "section 5.1) and print the differences that remain, so the "
+                             "result is never labelled 'exactly MoFlow'")
     parser.add_argument("--headline", default="degree", choices=list(DECODERS))
     parser.add_argument("--seed", type=int, default=20261124)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -246,8 +320,19 @@ def main(argv=None) -> int:
     try:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        if args.moflow_protocol:
+            args.count = MOFLOW_SETTINGS["count"]
+            args.runs = MOFLOW_SETTINGS["runs"]
+            args.temperature = MOFLOW_SETTINGS["temperature"]
+            print("MoFlow protocol: 10,000 attempts x 5 runs at temperature 0.85 "
+                  "(paper section 5.1).")
+            print("This is NOT 'exactly MoFlow'. Differences that remain:")
+            for item in MOFLOW_DIFFERENCES:
+                print(f"  - {item}")
         if args.count < 1:
             raise ValueError("--count must be >= 1")
+        if args.runs < 1:
+            raise ValueError("--runs must be >= 1")
     except (OSError, ValueError) as error:
         print(f"FATAL: {error}", file=sys.stderr)
         return 4
@@ -313,8 +398,14 @@ def main(argv=None) -> int:
                         "degree_head": bool(autoencoder.config.degree_head),
                         "node_embedding_dim": autoencoder.config.node_embedding_dim},
             "architecture_diff": diff,
-            "shared_settings": {"count": args.count, "temperature": args.temperature,
-                                "headline_decoder": args.headline, "seed": args.seed,
+            "shared_settings": {"count_per_run": args.count, "runs": args.runs,
+                                "temperature": args.temperature,
+                                "headline_decoder": args.headline,
+                                "base_seed": args.seed,
+                                "seed_kind": ("sampling seeds only; one trained "
+                                              "checkpoint per arm, so run-level sd is "
+                                              "sampling variability, NOT training-seed "
+                                              "variability"),
                                 "novelty_reference": "train split canonical SMILES",
                                 "train_reference_molecules": len(train_smiles)},
             "request_joint": joint,
@@ -343,39 +434,68 @@ def main(argv=None) -> int:
             conditional.config.condition_features, scaler=scaler,
             n=list(int(v) for v in sizes), qed=list(float(v) for v in requests["qed"]))
 
-        arms = {}
-        for name, flow, values in (("unconditional", unconditional, None),
-                                   ("conditional", conditional, condition_values)):
-            print(f"\ngenerating {args.count:,} attempts, arm {name} ...")
-            # node_counts is required by the signature but unused when target_n is None
-            # and sizes are supplied per sample, so the requested vector is injected by
-            # generating in one call per distinct size group would change the noise
-            # stream; instead the sampler is replaced by a fixed-sequence stand-in.
-            fixed = _FixedCounts(sizes)
-            drawn = generate_molecules(
-                flow, autoencoder, count=args.count, node_counts=fixed,
-                temperature=args.temperature, seed=args.seed,
-                batch_size=args.batch_size,
-                condition_values=None if values is None else torch.from_numpy(values),
-                device=device)
-            metrics = generation_metrics(drawn["records"], train_smiles=train_smiles,
-                                         headline=args.headline)
-            arms[name] = {
-                "settings": drawn["settings"],
-                "metrics": metrics,
-                "sizes": achieved_sizes(drawn["records"], args.headline),
-                "node_count_agreement": node_count_agreement(drawn["records"],
-                                                             args.headline),
-            }
-            head = metrics["decoders"][args.headline]
-            print(f"  raw validity      "
-                  f"{metrics['decoders']['raw']['strict_validity']:.4f}")
-            print(f"  corrected ({args.headline}) validity {head['strict_validity']:.4f}")
-            print(f"  uniqueness        {head['uniqueness']:.4f}")
-            print(f"  novelty           {head['novelty_vs_train']:.4f}")
-            print(f"  NUV (of attempts) {head['nuv']:.4f}")
+        arms: dict = {"unconditional": {"runs": []}, "conditional": {"runs": []}}
+        for run in range(args.runs):
+            # Fresh requests per run, SHARED by both arms, so within a run the two arms
+            # answer identical (N, QED) requests with identical sizes.
+            if run == 0:
+                run_sizes, run_values = sizes, condition_values
+            else:
+                run_requests = sample_requests(train_records, args.count,
+                                               args.seed + run)
+                run_sizes = run_requests["n"]
+                run_values = standardise_condition(
+                    conditional.config.condition_features, scaler=scaler,
+                    n=list(int(v) for v in run_sizes),
+                    qed=list(float(v) for v in run_requests["qed"]))
+            for name, flow, values in (("unconditional", unconditional, None),
+                                       ("conditional", conditional, run_values)):
+                print(f"\nrun {run + 1}/{args.runs}, arm {name}: "
+                      f"{args.count:,} attempts ...")
+                # `_FixedCounts` is stateful, so each call gets its own instance
+                drawn = generate_molecules(
+                    flow, autoencoder, count=args.count,
+                    node_counts=_FixedCounts(run_sizes),
+                    temperature=args.temperature, seed=args.seed + run,
+                    batch_size=args.batch_size,
+                    condition_values=None if values is None
+                    else torch.from_numpy(values),
+                    device=device)
+                metrics = generation_metrics(drawn["records"],
+                                             train_smiles=train_smiles,
+                                             headline=args.headline)
+                head = metrics["decoders"][args.headline]
+                arms[name]["runs"].append({
+                    "run": run,
+                    "sampling_seed": args.seed + run,
+                    "settings": drawn["settings"],
+                    "metrics": metrics,
+                    "sizes": achieved_sizes(drawn["records"], args.headline),
+                    "node_count_agreement": node_count_agreement(drawn["records"],
+                                                                 args.headline),
+                })
+                print(f"  raw validity      "
+                      f"{metrics['decoders']['raw']['strict_validity']:.4f}")
+                print(f"  corrected ({args.headline}) validity "
+                      f"{head['strict_validity']:.4f}")
+                print(f"  uniqueness        {head['uniqueness']:.4f}")
+                print(f"  novelty           {head['novelty_vs_train']:.4f}")
+                print(f"  NUV (of attempts) {head['nuv']:.4f}")
+
+        for name in arms:
+            arms[name]["summary"] = aggregate_runs(arms[name]["runs"], args.headline)
+        if args.runs > 1:
+            print(f"\nrun-level summary over {args.runs} runs "
+                  f"(mean +/- sd; SAMPLING variability from ONE checkpoint, "
+                  f"not training-seed variability):")
+            for name in ("unconditional", "conditional"):
+                print(f"  {name}:")
+                for key, value in arms[name]["summary"].items():
+                    print(f"    {key:28s} {value['mean']:.4f} +/- {value['sd']:.4f}")
 
         payload = {**header, "arms": arms,
+                   "moflow_protocol_differences": MOFLOW_DIFFERENCES
+                   if args.moflow_protocol else None,
                    "elapsed_seconds": time.perf_counter() - started}
         atomic_write_json(payload, out_dir / "uncond_vs_cond.json")
         print(f"\nwrote {out_dir / 'uncond_vs_cond.json'}")
